@@ -12,8 +12,9 @@ from ..churn_log import log_lines
 from ..errors import ConfigError, CrapkitError
 from ..gitio import ls_files
 from ..invocation import _self
-from ._shared import (_load_repo_config, _load_sources, _open_store, _positive_top,
-                      _print_json, _repo_relative)
+from ._shared import (_command_root, _file_sizer, _load_repo_config, _load_sources, _open_store,
+                      _stand,
+                      _positive_top, _print_json, _repo_relative)
 
 
 def _at_default_thresholds(args: argparse.Namespace) -> bool:
@@ -48,7 +49,7 @@ def cmd_coupling(args: argparse.Namespace) -> int:
     """Ranked over the tracked set: a pair naming a path git no longer has is a
     recommendation to open a file that is not there."""
     _positive_top("coupling", args.top)
-    root = Path(args.repo).resolve()
+    root = _command_root(args.repo)
     cfg = _load_repo_config(root)
     pairs = _coupling_pairs(root, cfg, args)
     if args.json:
@@ -67,18 +68,36 @@ def _range_lines(ranges: list) -> set[int]:
     return {line for start, end in ranges for line in range(start, end + 1)}
 
 
-def _mutation_targets(root: Path, files: list | None) -> dict:
+def _mutation_targets(root: Path, files: list | None, cwd: Path | None = None) -> dict:
     """path -> changed line set (None = whole file). Default is diff-scoped:
-    only the working tree's changes vs HEAD grow mutants."""
+    only the working tree's changes vs HEAD grow mutants; `--files` are said
+    from `cwd`, where the user stands."""
     from ..diffparse import changed_ranges
     from ..gitio import diff_since
 
     if files:
-        return {_repo_relative(f, root): None for f in files}
+        return {_repo_relative(f, root, cwd): None for f in files}
     targets = {p: _range_lines(rs) for p, rs in changed_ranges(diff_since(root, "HEAD")).items()}
     if not targets:
         raise CrapkitError("no changes vs HEAD to mutate — name files with --files")
     return targets
+
+
+def _corpus_targets(root: Path, cfg, targets: dict) -> tuple[dict, list[str]]:
+    """The targets scoring would score, each dropped path named on stderr.
+
+    `mutate` never mutates a test: the diff's files, and the ones `--files`
+    names, pass through the predicate `coverage` scores with before a mutant is
+    placed, or a survivor in an assertion reads as a hole in the suite. Each
+    drop is said, for the reason `_file_mutants` says its refusal: a score built
+    on fewer files than the diff holds must say so.
+    """
+    from ..mutate import OUTSIDE_CORPUS, partition_by_corpus
+
+    kept, outside = partition_by_corpus(targets, cfg, size_of=_file_sizer(root))
+    for rel in outside:
+        print(f"crapkit: not mutating {rel}: {OUTSIDE_CORPUS}", file=sys.stderr)
+    return kept, outside
 
 
 def _file_mutants(root: Path, rel: str, lines) -> list:
@@ -112,20 +131,36 @@ def _collect_mutants(root: Path, targets: dict, max_mutants: int) -> list:
     return out
 
 
-def _print_mutation(as_json: bool, survivors: list, total: int) -> None:
+def _mutation_payload(survivors: list, total: int, outside: list[str]) -> dict:
+    return {"mutants": total, "killed": total - len(survivors), "survived": len(survivors),
+            "survivors": [m._asdict() for m in survivors], "outside_corpus": outside}
+
+
+def _print_mutation_text(survivors: list, total: int) -> None:
     killed = total - len(survivors)
-    if as_json:
-        _print_json({"mutants": total, "killed": killed, "survived": len(survivors),
-                          "survivors": [m._asdict() for m in survivors]})
-        return
     rate = f"{killed / total:.0%}" if total else "n/a"
     print(f"mutation: {killed}/{total} killed ({rate})")
     for m in survivors:
         print(f"  SURVIVED  {m.path}:{m.line}  [{m.op}]  {m.mutated.strip()}")
 
 
+def _print_mutation(as_json: bool, survivors: list, total: int, outside: list[str]) -> None:
+    """A zero-mutant run whose files the corpus cut dropped says so on stdout:
+    `0/0 killed` over a diff that held a test file read as a suite with nothing
+    to prove, when it was a diff with nothing crapkit would mutate."""
+    from ..mutate import OUTSIDE_CORPUS
+
+    if as_json:
+        _print_json(_mutation_payload(survivors, total, outside))
+    elif outside and not total:
+        print(f"mutation: nothing to mutate; {OUTSIDE_CORPUS}: {', '.join(outside)}")
+    else:
+        _print_mutation_text(survivors, total)
+
+
 def cmd_mcp(args: argparse.Namespace) -> int:
-    """Serve stdio from `--repo`, or from the directory the client started in.
+    """Serve stdio from `--repo`, an exact root, or from the nearest crapkit.toml
+    at or above the directory the client started in (ADR 0002).
 
     A client registered globally opens the server in every project, most of
     which have no crapkit.toml. Refusing to start there gave the client a server
@@ -135,14 +170,14 @@ def cmd_mcp(args: argparse.Namespace) -> int:
     """
     from ..mcp_server import serve
 
-    root = Path(args.repo).resolve()
+    root = _command_root(args.repo)
     if (root / "crapkit.toml").is_file():
         _load_repo_config(root)
     return serve(root)
 
 
 def _drop_mutate_pool(root: Path) -> int:
-    """`--drop-pool`: the worktrees `mutation_workers > 1` keeps between runs,
+    """`--drop-pool`: the worktrees mutation workers keep between runs,
     gone. No config is read first, because the reason to reach for this is a
     repo whose pool outlived whatever built it, and a crapkit.toml that no
     longer parses must not stand between a user and four checkouts of their own
@@ -158,16 +193,18 @@ def _drop_mutate_pool(root: Path) -> int:
 def cmd_mutate(args: argparse.Namespace) -> int:
     from ..mutate_pool import reporter, run_mutants
 
-    root = Path(args.repo).resolve()
+    root = _command_root(args.repo)
     if args.drop_pool:
         return _drop_mutate_pool(root)
     cfg = _load_repo_config(root)
     if not cfg.mutation_command:
         raise ConfigError("mutate needs [crapkit] mutation_command — the suite run once per mutant")
-    mutants = _collect_mutants(root, _mutation_targets(root, args.files), args.max_mutants)
+    targets, outside = _corpus_targets(root, cfg,
+                                       _mutation_targets(root, args.files, cwd=_stand(args.repo)))
+    mutants = _collect_mutants(root, targets, args.max_mutants)
     verdicts = run_mutants(root, cfg, mutants, reporter(len(mutants), sys.stderr))
     survivors = [m for m, killed in zip(mutants, verdicts) if not killed]
-    _print_mutation(args.json, survivors, len(mutants))
+    _print_mutation(args.json, survivors, len(mutants), outside)
     return 0
 
 
@@ -189,7 +226,7 @@ def cmd_duplication(args: argparse.Namespace) -> int:
     from ..store import rowful_runs
 
     _positive_top("duplication", args.top)
-    root = Path(args.repo).resolve()
+    root = _command_root(args.repo)
     _load_repo_config(root)  # config errors first, like every command
     store = _open_store(root, first_command="inventory")
     runs = rowful_runs(store)

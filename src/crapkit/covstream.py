@@ -1,10 +1,9 @@
 """Coverage artifacts read off the file instead of out of a string.
 
-The whole-document parsers take `text`, so the caller must already hold the
-artifact: `read_bytes()` plus its UTF-8 decode put two copies of a 150 MB
-artifact on the heap before a single function is attributed. The splitter in
-coverage_istanbul already decodes one member at a time; this module gives it a
-window that refills from a handle instead of a string that holds everything.
+Reading an entire artifact with `read_bytes()` plus its UTF-8 decode puts two
+copies of a 150 MB artifact on the heap before a function is attributed. This
+module owns the JSON walk and refills a window from a handle. The format
+modules project each decoded file into coverage, missing lines or contexts.
 
 Peak becomes O(chunk + largest member) rather than O(artifact): 322.6 -> 52.1 MB
 on a 150 MB istanbul artifact, for byte-identical output and the same sha256.
@@ -18,20 +17,38 @@ from __future__ import annotations
 import codecs
 import hashlib
 import json
+import math
 import re
+import sys
 from pathlib import Path
 from typing import IO, Iterator
 
-from .coverage_istanbul import (_CLOSE_RE, _DECODER, _MEMBER_RE, _OPEN_RE,
-                                FnCoverage, _dead_lines, _file_coverage, _rel_path)
+from .coverage_istanbul import (FnCoverage, _dead_lines, _file_coverage, _rel_path)
 from .errors import ToolError
 
 CHUNK = 1 << 20
 
+_WS = r"[ \t\r\n]*"
+_MEMBER = r'("(?:[^"\\]|\\.)*")' + _WS + ':' + _WS
+_FIRST_MEMBER = re.compile(_WS + _MEMBER, re.DOTALL)
+_NEXT_MEMBER = re.compile(_WS + ',' + _WS + _MEMBER, re.DOTALL)
+_OPEN_RE = re.compile(_WS + r"\{")
+_CLOSE_RE = re.compile(_WS + r"\}" + _WS + r"\Z")
+
+
+def _finite_number(token: str) -> float:
+    number = float(token)
+    if not math.isfinite(number):
+        raise ToolError(f"unparseable coverage artifact: non-finite JSON number {token}")
+    return number
+
+
+_DECODER = json.JSONDecoder(parse_float=_finite_number, parse_constant=_finite_number)
+
 # The inner close: one object ending inside a larger document, with no claim
 # about what follows. _CLOSE_RE anchors at the end of the text and is the outer
 # document's business.
-_CLOSE_INNER = re.compile(r"\s*\}")
+_CLOSE_INNER = re.compile(_WS + r"\}")
 
 
 class _Window:
@@ -80,12 +97,13 @@ def _usable(w: _Window, member) -> bool:
     return member is not None and (member.end() < len(w.buf) or w.eof)
 
 
-def _next_member(w: _Window):
+def _next_member(w: _Window, first: bool):
     """The next member header, or None once the object closed or the stream ran
     out. Refills only while the window can neither produce a header nor prove
     the object ended, so a closing brace does not drag the rest of the file in."""
+    pattern = _FIRST_MEMBER if first else _NEXT_MEMBER
     while True:
-        member = _MEMBER_RE.match(w.buf, w.pos)
+        member = pattern.match(w.buf, w.pos)
         if _usable(w, member):
             return member
         if _CLOSE_INNER.match(w.buf, w.pos) is not None:
@@ -94,25 +112,87 @@ def _next_member(w: _Window):
             return None
 
 
-def _whole_value(w: _Window, start: int):
-    """The decoded value and its end offset, or None while the window may still
-    be hiding more of it. A value ending exactly at the edge is not whole: a
-    bare number would otherwise decode as its own truncated prefix."""
+_STRUCTURAL = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"|[{}\[\]"]', re.DOTALL)
+_STRING_TOKEN = re.compile(r'["\\]')
+_SCALAR_END = re.compile(r'[ \t\r\n,}\]]')
+
+
+class _ValueFrame:
+    """Advance through each chunk once; JSONDecoder still judges the grammar."""
+
+    def __init__(self, text: str, start: int):
+        first = text[start:start + 1]
+        self.depth = int(first in ("{", "["))
+        self.quoted = first == '"'
+        self.scalar = first not in ('{', '[', '"')
+        self.pos = start if self.scalar else start + 1
+
+    def _string(self, token: str) -> bool:
+        if token == "\\":
+            self.pos += 1  # also skips the escaped character in the next refill
+            return False
+        self.quoted = False
+        return self.depth == 0
+
+    def _container(self, token: str) -> bool:
+        if token.startswith('"'):
+            self.quoted = len(token) == 1
+        elif token in "{[":
+            self.depth += 1
+        else:
+            self.depth -= 1
+        return self.depth == 0
+
+    def _scalar(self, text: str) -> bool:
+        end = _SCALAR_END.search(text, self.pos)
+        self.pos = len(text)
+        return end is not None
+
+    def _token(self, text: str) -> str | None:
+        pattern = _STRING_TOKEN if self.quoted else _STRUCTURAL
+        token = pattern.search(text, self.pos)
+        if token is None:
+            self.pos = max(self.pos, len(text))
+            return None
+        self.pos = token.end()
+        return token.group()
+
+    def advance(self, text: str) -> bool:
+        if self.scalar:
+            return self._scalar(text)
+        while True:
+            token = self._token(text)
+            if token is None:
+                return False
+            consume = self._string if self.quoted else self._container
+            if consume(token):
+                return True
+
+
+def _value_ended(w: _Window, end: int) -> bool:
+    if end == len(w.buf):
+        return w.eof or w.buf[end - 1] in '"}]'
+    return w.buf[end] in " \t\r\n,}]"
+
+
+def _available_value(w: _Window, start: int):
+    """Keep the C decoder fast path when the current window holds the value."""
     try:
         value, end = _DECODER.raw_decode(w.buf, start)
     except ValueError:
         return None
-    return (value, end) if end < len(w.buf) or w.eof else None
+    return (value, end) if _value_ended(w, end) else None
 
 
 def _decode_value(w: _Window, start: int):
-    """raw_decode at `start`, growing the window until the value is whole."""
-    while True:
-        whole = _whole_value(w, start)
-        if whole is not None:
-            return whole
-        if not w.refill():
-            return _DECODER.raw_decode(w.buf, start)
+    """Try the current window once; frame incomplete values before retrying."""
+    whole = _available_value(w, start)
+    if whole is not None:
+        return whole
+    frame = _ValueFrame(w.buf, start)
+    while not frame.advance(w.buf) and w.refill():
+        pass
+    return _DECODER.raw_decode(w.buf, start)
 
 
 def _enter_object(w: _Window, what: str) -> None:
@@ -141,14 +221,16 @@ def _take_member(w: _Window, member) -> tuple[str, object]:
 
 def split_window(w: _Window) -> Iterator[tuple[str, object]]:
     """(key, value) per member of the outer object, one value live at a time.
-    The same pairs in the same order as coverage_istanbul.split_top_level."""
+    The same pairs in the same order as a whole-document JSON decode."""
     _enter_object(w, "istanbul artifact")
+    first = True
     while True:
-        member = _next_member(w)
+        member = _next_member(w, first)
         if member is None:
             _expect_document_end(w)
             return
         yield _take_member(w, member)
+        first = False
 
 
 # --- coverage.py: the same walk, one level down ---------------------------
@@ -164,13 +246,15 @@ def _walk_nested(w: _Window, start: int) -> Iterator[tuple[str, object, str]]:
     """The members of the object at `start`, one at a time."""
     w.pos = start
     _enter_object(w, "coverage.py report: 'files'")
+    first = True
     while True:
-        member = _next_member(w)
+        member = _next_member(w, first)
         if member is None:
             _leave_object(w, "coverage.py report: 'files' object")
             return
         key, value = _take_member(w, member)
         yield key, value, "sub"
+        first = False
 
 
 def walk_report(w: _Window, target: str) -> Iterator[tuple[str, object, str]]:
@@ -178,13 +262,15 @@ def walk_report(w: _Window, target: str) -> Iterator[tuple[str, object, str]]:
     decoded value and "sub" for one member of the `target` object, so meta and
     totals arrive whole and "files" arrives one file at a time."""
     _enter_object(w, "coverage.py report")
+    first = True
     while True:
-        member = _next_member(w)
+        member = _next_member(w, first)
         if member is None:
             # A walk that just stops at the first unreadable byte reports zero
             # dark lines, which is indistinguishable from a fully covered repo.
             _expect_document_end(w)
             return
+        first = False
         if json.loads(member.group(1)) == target:
             yield from _walk_nested(w, member.end())
             continue
@@ -222,6 +308,34 @@ def _istanbul_map(w: _Window, repo_root: str, per_file) -> dict:
     return out
 
 
+_CLAMPED_NAMED = 3
+
+
+def _loudest_clamped(counts: dict[str, int]) -> list[tuple[str, int]]:
+    """The files worth naming: most counters clamped first, ties by path."""
+    return sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))[:_CLAMPED_NAMED]
+
+
+def _note_clamped_branches(per_file: dict) -> None:
+    """Name the derived branch counters this artifact needed clamped.
+
+    Loud but not fatal, the shape _note_unanalyzable settled for reader
+    refusals: one underflowed counter degrades one branch measurement, and
+    ending the run over it blocks every commit in the repo.
+    """
+    counts = {path: rows.clamped for path, rows in per_file.items()
+              if getattr(rows, "clamped", 0)}
+    if not counts:
+        return
+    print(f"crapkit: {sum(counts.values())} negative derived branch count(s) in "
+          f"{len(counts)} file(s) clamped to 0; the producer's else-path subtraction "
+          "underflowed and each such branch reads as uncovered:", file=sys.stderr)
+    for path, count in _loudest_clamped(counts):
+        print(f"crapkit:   {path}: {count}", file=sys.stderr)
+    if len(counts) > _CLAMPED_NAMED:
+        print(f"crapkit:   ... and {len(counts) - _CLAMPED_NAMED} more", file=sys.stderr)
+
+
 def _require_files(per_file: dict) -> None:
     """A zero-file artifact scores as full coverage if it is let through, so
     both istanbul readers refuse one in the same words."""
@@ -233,13 +347,14 @@ def _require_files(per_file: dict) -> None:
 def parse_istanbul_file(path: Path | str, *, repo_root: str, chunk: int = CHUNK
                         ) -> tuple[dict[str, list[FnCoverage]], str]:
     """Per-file function coverage plus the sha256 of the artifact's own bytes.
-    Same result as parse_istanbul(path.read_text(), ...), same digest as
-    sha256(path.read_bytes()), without either whole copy ever existing."""
+    The whole-document records and sha256(path.read_bytes()) digest, without
+    either whole copy ever existing."""
     w, handle = _window(path, chunk)
     with handle:
         per_file = _guarded(lambda: _istanbul_map(w, repo_root, _file_coverage),
-                            _BAD_ISTANBUL)
+                            f"{_BAD_ISTANBUL} {path}")
     _require_files(per_file)
+    _note_clamped_branches(per_file)
     return per_file, w.hasher.hexdigest()
 
 
@@ -267,8 +382,9 @@ def parse_istanbul_both_file(path: Path | str, *, repo_root: str, chunk: int = C
     """
     w, handle = _window(path, chunk)
     with handle:
-        per_file, dead = _guarded(lambda: _istanbul_both(w, repo_root), _BAD_ISTANBUL)
+        per_file, dead = _guarded(lambda: _istanbul_both(w, repo_root), f"{_BAD_ISTANBUL} {path}")
     _require_files(per_file)
+    _note_clamped_branches(per_file)
     return per_file, dead, w.hasher.hexdigest()
 
 
@@ -308,6 +424,7 @@ class _Files:
 
     def __init__(self) -> None:
         self.per_file: dict[str, list[FnCoverage]] = {}
+        self.dead: dict[str, set[int]] = {}
         self.regionless: list[str] = []
         self.total = 0
 
@@ -315,13 +432,15 @@ class _Files:
         from .coverage_py import _file_functions, has_regions
 
         self.total += 1
+        path = prefix + raw_path.replace("\\", "/")
+        self.dead[path] = set(data.get("missing_lines", ()))
         if not has_regions(data):
             self.regionless.append(raw_path)
             return
-        self.per_file[prefix + raw_path.replace("\\", "/")] = _file_functions(data)
+        self.per_file[path] = _file_functions(data)
 
 
-def _coveragepy_functions(w: _Window, prefix: str, label: str) -> dict:
+def _coveragepy_both(w: _Window, prefix: str, label: str) -> tuple[dict, dict]:
     """path -> function coverage, salvaging the same way the whole-document
     parser does: a statement-based downgrade with no branch data, and files with
     no regions skipped rather than fatal."""
@@ -337,17 +456,25 @@ def _coveragepy_functions(w: _Window, prefix: str, label: str) -> dict:
     # cannot answer one report differently.
     judge_regions(files.regionless, files.total, label)
     judge_branch(branch, files.per_file, label)
-    return files.per_file
+    return files.per_file, files.dead
 
 
 def parse_coveragepy_file(path: Path | str, *, path_prefix: str, chunk: int = CHUNK,
                           label: str = "") -> tuple[dict[str, list[FnCoverage]], str]:
     """Per-file function coverage plus the sha256 of the report's own bytes."""
+    per_file, _, digest = parse_coveragepy_both_file(
+        path, path_prefix=path_prefix, chunk=chunk, label=label)
+    return per_file, digest
+
+
+def parse_coveragepy_both_file(path: Path | str, *, path_prefix: str, chunk: int = CHUNK,
+                              label: str = "") -> tuple[dict, dict, str]:
+    """Function coverage, missing lines, and byte digest from one report walk."""
     w, handle = _window(path, chunk)
     with handle:
-        per_file = _guarded(lambda: _coveragepy_functions(w, lane_prefix(path_prefix), label),
-                            _BAD_REPORT)
-    return per_file, w.hasher.hexdigest()
+        per_file, dead = _guarded(lambda: _coveragepy_both(w, lane_prefix(path_prefix), label),
+                                  f"{_BAD_REPORT} {path}")
+    return per_file, dead, w.hasher.hexdigest()
 
 
 def _coveragepy_missing(w: _Window, prefix: str) -> dict[str, set[int]]:
@@ -364,3 +491,22 @@ def parse_coveragepy_missing_file(path: Path | str, *, path_prefix: str,
     w, handle = _window(path, chunk)
     with handle:
         return _guarded(lambda: _coveragepy_missing(w, lane_prefix(path_prefix)), _BAD_REPORT)
+
+
+def _coveragepy_contexts(w: _Window, prefix: str, source_path: str) -> dict:
+    from .coverage_py import _line_contexts
+
+    selected = {}
+    for key, value, kind in walk_report(w, "files"):
+        if kind == "sub" and prefix + key.replace("\\", "/") == source_path:
+            selected = _line_contexts(value.get("contexts", {}))
+    return selected
+
+
+def parse_coveragepy_contexts_file(path: Path | str, *, path_prefix: str,
+                                  source_path: str, chunk: int = CHUNK) -> dict[int, list[str]]:
+    """One repository path's line contexts, after validating the whole report."""
+    w, handle = _window(path, chunk)
+    with handle:
+        return _guarded(lambda: _coveragepy_contexts(w, lane_prefix(path_prefix), source_path),
+                        _BAD_REPORT)

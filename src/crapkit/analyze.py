@@ -11,45 +11,69 @@ import json
 import os
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 
 from ._pygdefer import deferred_pygments
 
 with deferred_pygments():  # lizard's Erlang reader would load pygments here
     import lizard
+    from lizard_languages import get_reader_for as _lizard_reader_for
+    from lizard_languages.python import PythonReader as _PythonReader
 
     from .lizardpowershell import register as _register_powershell
+    from .lizardpython import register as _register_python
     from .lizardrust import register as _register_rust
     from .lizardshell import register as _register_shell
+    from .lizardtypescript import LizardExtension as _TypeScriptExpressions
+    from .lizardtypescript import uses_type_syntax
 
 from .cache import partition_by_cache, updated_cache
 from .errors import ToolError
 from .lizardcognitive import LizardExtension as _Cognitive
-from .merge import FunctionRecord
+from .merge import FunctionRecord, UnanalyzableFile
 from .packet import bare_name
 
 # lizard picks a reader by extension off a hardcoded list, and none of these is
 # on it: `.rs` resolves to a reader that counts no `match` arm (lizard #494),
-# and `.sh` and `.ps1` resolve to nothing at all, which lizard answers with
-# CLikeReader rather than a failure. All three belong HERE, at the module scope
-# of the module a ProcessPoolExecutor child imports, or spawned workers measure
-# with the readers lizard shipped and report plausible wrong numbers.
+# `.py` to one that ends a def inside a signature that runs past its first `)`
+# (crapkit #72), and `.sh` and `.ps1` resolve to nothing at all, which lizard
+# answers with CLikeReader rather than a failure. All four belong HERE, at the
+# module scope of the module a ProcessPoolExecutor child imports, or spawned
+# workers measure with the readers lizard shipped and report plausible wrong
+# numbers.
 #
-# lizardshell and lizardpowershell already register themselves on import and
-# lizardrust deliberately does not (rebinding a name in another package's
-# namespace is not something an import should do quietly). Calling all three
-# keeps the wiring readable in one place and costs nothing: each is idempotent.
+# lizardshell and lizardpowershell already register themselves on import, and
+# lizardrust and lizardpython deliberately do not (rebinding a name in another
+# package's namespace is not something an import should do quietly). Calling
+# all four keeps the wiring readable in one place and costs nothing: each is
+# idempotent.
 _register_rust()
 _register_shell()
 _register_powershell()
+_register_python()
 
 _POOL_THRESHOLD = 16
 
 # Bump whenever analysis semantics change (merge rules, extension set, record
 # extraction): the fingerprint must invalidate cached records produced by older
 # logic even when file content and tool versions are identical.
-ANALYSIS_VERSION = 8  # 8: shell blocks nest. `fi`, `done` and `esac` close what
+ANALYSIS_VERSION = 10  # Separate sibling JavaScript/TypeScript expression arrows.
+# 9: a Python row's nesting is the depth the cognitive
+#                          pass measured, not lizard's ND count of structures,
+#                          so every cached .py record carries a count under the
+#                          depth's name (a flat seven-`if` function read 7).
+#                          The pass also reads a Python token's owner after
+#                          lizard has, so the first token of the line that
+#                          dedents out of a function is no longer charged to
+#                          it: `cognitive` moves too for an outer function
+#                          resuming after a nested `def`, for a last function
+#                          followed by a module-level `if __name__`, and for
+#                          one called at import right after its `def` (read as
+#                          recursion). Measured on crapkit's own tree: 6 of
+#                          5,258 rows. Python is the only language whose
+#                          stored values move; ccn is untouched everywhere.
+#                       8: shell blocks nest. `fi`, `done` and `esac` close what
 #                          `if`, a loop keyword or `case` opened, `do`/`then`/`in`
 #                          are free, and a bare `break` is not a labeled one, so
 #                          every cached .sh and .bash record carries a cognitive
@@ -106,6 +130,88 @@ class _ModifiedDelta:
             yield token
 
 
+class _CreationOrder:
+    """Keep declaration order when nested functions finish before their parents."""
+
+    def __call__(self, tokens, reader):
+        context = reader.context
+        original = context.try_new_function
+        sequence = 0
+
+        def create(name):
+            nonlocal sequence
+            original(name)
+            sequence += 1
+            context.current_function.crapkit_creation = sequence
+
+        context.try_new_function = create
+        try:
+            yield from tokens
+        finally:
+            context.try_new_function = original
+
+
+# --- a Python def no reader finished (#72) -----------------------------------------
+#
+# lizard 1.24.0's PythonReader ended a def inside its own signature when the
+# signature ran past its first `)`: a return annotation opened on the def line,
+# or a line break after a default such as `()`. The def read as two lines at ccn
+# 1 whatever its body held and passed every gate on that reading.
+# crapkit.lizardpython reads those signatures to the body's colon. Measured on
+# 6,866 stdlib, site-packages and openclaw files: all 59 defs lizard cut off read
+# their full span, and of the defs lizard read whole only the 20 nested inside a
+# cut-off def changed, each gaining its parent's name as a prefix (one of them
+# also scores 1 lower on cognitive).
+#
+# This check stays as the net under that reader. A def read to its body has a
+# `:` at bracket depth 0 with a token after it; one cut off in its signature has
+# not. A def the reader still cannot finish is refused, never scored at ccn 1.
+_OPENERS = frozenset("([{")
+_CLOSERS = frozenset(")]}")
+
+
+def _step_body(fn, token: str) -> None:
+    """Advance one function's signature reading by one of its own tokens.
+
+    `crapkit_body` is False from the name token on and True from the first
+    token after the body colon. A function some other reader produced never
+    gets the attribute, which is what keeps `_unread_defs` to Python.
+    """
+    if getattr(fn, "crapkit_colon", False):
+        fn.crapkit_body = True
+        return
+    fn.crapkit_body = False
+    depth = getattr(fn, "crapkit_depth", 0)
+    if token in _OPENERS:
+        fn.crapkit_depth = depth + 1
+    elif token in _CLOSERS:
+        fn.crapkit_depth = depth - 1
+    elif token == ":" and depth == 0:
+        fn.crapkit_colon = True
+
+
+class _PythonBodies:
+    """Mark every Python function whose body lizard reached.
+
+    Reads a token's owner after lizard has, the way the cognitive pass does:
+    the name token is what creates the function, and the line that ends one
+    was charged to its parent by `preprocess`, upstream of here, before the
+    token arrived. Sits behind `line_counter`, so no whitespace or newline
+    token reaches it and any token after the body colon is body.
+    """
+
+    def __call__(self, tokens, reader):
+        if not isinstance(reader, _PythonReader):
+            yield from tokens
+            return
+        context = reader.context
+        for token in tokens:
+            yield token
+            fn = context.current_function
+            if fn is not context.global_pseudo_function:
+                _step_body(fn, token)
+
+
 def _chain(cognitive_index: int) -> list:
     """lizard's standard extensions with cognitive spliced in at one index.
 
@@ -116,7 +222,7 @@ def _chain(cognitive_index: int) -> list:
     """
     extensions = lizard.get_extensions(["ND"])
     extensions.insert(cognitive_index, _Cognitive())
-    return extensions + [_ModifiedDelta()]
+    return [_TypeScriptExpressions(), *extensions, _ModifiedDelta(), _PythonBodies(), _CreationOrder()]
 
 
 # Two chains, built once per process each, not once per file: 14k files paid 14k
@@ -141,7 +247,23 @@ def _extensions_for(rel_path: str) -> list:
     return _EXTENSIONS
 
 
-def _record(rel_path: str, fn) -> FunctionRecord:
+# The suffix lizard routes to PythonReader (`PythonReader.ext`), and the one
+# language whose `nesting` is not lizard's. lizard's ND extension counts
+# nesting STRUCTURES for Python rather than depth: a flat function of seven
+# `if`s read 7 and a three-deep one read 3, the same number for opposite
+# shapes. The cognitive pass keeps a per-function stack of open blocks for the
+# Sonar nesting increment, and the deepest it gets is the depth. Brace
+# languages keep lizard's column, which reads their braces.
+_PYTHON_SUFFIXES = (".py",)
+
+
+def _nesting_depth(rel_path: str, fn) -> int:
+    if rel_path.lower().endswith(_PYTHON_SUFFIXES):
+        return getattr(fn, "cognitive_nesting", 0) or 0
+    return getattr(fn, "max_nesting_depth", 0) or 0
+
+
+def _record(rel_path: str, fn, occurrence: int = 0) -> FunctionRecord:
     std = fn.cyclomatic_complexity
     mod = std + (getattr(fn, "modified_delta", 0) or 0)
     return FunctionRecord(
@@ -154,8 +276,9 @@ def _record(rel_path: str, fn) -> FunctionRecord:
         ccn=min(std, mod),
         nloc=fn.nloc,
         params=len(fn.parameters),
-        nesting=getattr(fn, "max_nesting_depth", 0) or 0,
+        nesting=_nesting_depth(rel_path, fn),
         cognitive=getattr(fn, "cognitive_complexity", 0) or 0,
+        occurrence=occurrence,
     )
 
 
@@ -216,7 +339,40 @@ def _listed(names: list[str]) -> str:
 def _file_records(rel_path: str, functions) -> list[FunctionRecord]:
     """Pure, and silent: this runs inside pool workers, whose stderr is not the
     parent's. The twin-key note is the caller's to print."""
-    return [_record(rel_path, fn) for fn in functions]
+    counts, occurrences = {}, {}
+    for fn in sorted(functions, key=lambda fn: fn.crapkit_creation):
+        counts[fn.start_line] = counts.get(fn.start_line, 0) + 1
+        occurrences[id(fn)] = counts[fn.start_line]
+    return [_record(rel_path, fn, occurrences[id(fn)]) for fn in functions]
+
+
+def _unread_defs(functions) -> list:
+    """The Python functions `_PythonBodies` never saw a body token for."""
+    return [fn for fn in functions if getattr(fn, "crapkit_body", True) is False]
+
+
+def _unread_reason(rel_path: str, unread: list) -> str:
+    named = ", ".join(f"{rel_path}:{fn.start_line} {fn.long_name}" for fn in unread)
+    return (f"{rel_path}: the Python reader reached no body for {len(unread)} def(s): {named}; "
+            f"a def read no further than its signature would score ccn 1 whatever its body "
+            f"holds, so the file is not scored. Check that the file parses (a signature cut "
+            f"off at the end of the file reads this way); if it does, report the signature at "
+            f"https://github.com/JeanFrancoisGagne/crapkit/issues")
+
+
+def _trusted_records(rel_path: str, functions) -> list[FunctionRecord]:
+    """Records for a file every function of which was read to its body.
+
+    A file with a def the reader never finished takes the unanalyzable road,
+    named on every run and scored as zero functions, not a ccn-1 reading of
+    that def: scoring it would pass the gate on a number that means nothing,
+    and ending the run over one file is what 0.7.1 stopped (_note_unanalyzable).
+    Every such def in the file is named at once.
+    """
+    unread = _unread_defs(functions)
+    if unread:
+        return UnanalyzableFile(_unread_reason(rel_path, unread))
+    return _file_records(rel_path, functions)
 
 
 # --- how a source file's bytes become text -------------------------------------
@@ -297,16 +453,26 @@ def _install_decoder() -> None:
     lizard.auto_read = read_source
 
 
+def _reader_for(path: str):
+    """Lizard's extension regex cannot cross LF; only its selector needs an alias.
+
+    File reads, parser context and returned records retain the original path.
+    The reader class also owns cache identity, so prior fallback rows miss.
+    """
+    return _lizard_reader_for(path.replace("\n", "\ufffd"))
+
+
 _install_decoder()
+lizard.get_reader_for = _reader_for
 
 
 def analyze_one(args: tuple[str, str]) -> tuple[str, list[FunctionRecord]]:
     abs_path, rel_path = args
     try:
         analysis = lizard.FileAnalyzer(_extensions_for(rel_path))(abs_path)
-        return rel_path, _file_records(rel_path, analysis.function_list)
-    except Exception as exc:  # loud, with the file named
-        raise ToolError(f"lizard failed on {rel_path}: {exc}") from exc
+        return rel_path, _trusted_records(rel_path, analysis.function_list)
+    except Exception as exc:  # loud and counted, never fatal: see _note_unanalyzable
+        return rel_path, UnanalyzableFile(f"lizard failed on {rel_path}: {exc}")
 
 
 def analyze_source(rel_path: str, code: str) -> list[FunctionRecord]:
@@ -320,9 +486,12 @@ def analyze_source(rel_path: str, code: str) -> list[FunctionRecord]:
     try:
         analyzer = lizard.FileAnalyzer(_extensions_for(rel_path))
         analysis = analyzer.analyze_source_code(rel_path, code)
-        records = _file_records(rel_path, analysis.function_list)
-    except Exception as exc:  # loud, with the file named
-        raise ToolError(f"lizard failed on {rel_path}: {exc}") from exc
+        records = _trusted_records(rel_path, analysis.function_list)
+    except Exception as exc:  # per-file, exactly as in analyze_one; the hook keeps going
+        records = UnanalyzableFile(f"lizard failed on {rel_path}: {exc}")
+    if isinstance(records, UnanalyzableFile):
+        _note_unanalyzable({rel_path: records})
+        return records
     _note_twin_keys(rel_path, records)
     return records
 
@@ -333,7 +502,31 @@ def content_hash(path: Path) -> str:
 
 def fingerprint() -> str:
     from . import __version__
-    return f"crapkit={__version__};analysis={ANALYSIS_VERSION};lizard={lizard.version}"
+    return f"crapkit={__version__};analysis={ANALYSIS_VERSION};lizard={lizard.version};cache=4"
+
+
+def _analysis_key(path: str, digest: str) -> str:
+    """Bytes are reusable only under the same reader and extension chain."""
+    reader = lizard.get_reader_for(path) or lizard.get_reader_for("fallback.c")
+    chain = int(_extensions_for(path) is _PREPROCESSED_EXTENSIONS)
+    return f"{reader.__module__}.{reader.__qualname__}:{chain}:{int(uses_type_syntax(path))}:{digest}"
+
+
+def _cached_record(values) -> FunctionRecord:
+    if not isinstance(values, list) or len(values) != 12:
+        raise ValueError("cached function fields must be a record list")
+    types = (str, str) + (int,) * 10
+    if any(type(value) is not expected for value, expected in zip(values, types)):
+        raise ValueError("cached function fields have invalid types")
+    if values[-1] < 0:
+        raise ValueError("cached function occurrence must be nonnegative")
+    return FunctionRecord(*values)
+
+
+def _cached_rows(rows) -> list[FunctionRecord]:
+    if not isinstance(rows, list):
+        raise ValueError("cached functions must be a list")
+    return [_cached_record(values) for values in rows]
 
 
 def _drained_records(entries: dict) -> dict[str, list[FunctionRecord]]:
@@ -344,10 +537,12 @@ def _drained_records(entries: dict) -> dict[str, list[FunctionRecord]]:
     of MB for no reason. Draining leaves the caller's parsed dict empty, which is
     fine: nothing reads it afterwards.
     """
+    if not isinstance(entries, dict):
+        raise ValueError("cached entries must be an object")
     records: dict[str, list[FunctionRecord]] = {}
     while entries:
         h, rows = entries.popitem()
-        records[h] = [FunctionRecord(*vals) for vals in rows]
+        records[h] = _cached_rows(rows)
     return records
 
 
@@ -363,7 +558,7 @@ def load_cache(path: Path) -> dict:
         with path.open(encoding="utf-8") as fh:
             raw = json.load(fh)
         return {"fp": raw.get("fp"), "entries": _drained_records(raw.get("entries", {}))}
-    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+    except (OSError, TypeError, ValueError, AttributeError):
         return {}
 
 
@@ -422,9 +617,23 @@ def _load_stamps(path: Path) -> dict:
     try:
         with path.open(encoding="utf-8") as fh:
             raw = json.load(fh)
-        return raw["stamps"] if raw.get("v") == 1 else {}
+        return _stamp_entries(raw["stamps"]) if raw.get("v") == 1 else {}
     except (json.JSONDecodeError, OSError, TypeError, ValueError, KeyError, AttributeError):
         return {}
+
+
+def _valid_stamp(stamp) -> bool:
+    if not isinstance(stamp, list) or len(stamp) != 3:
+        return False
+    return (type(stamp[0]) is int and type(stamp[1]) is int
+            and isinstance(stamp[2], str))
+
+
+def _stamp_entries(stamps) -> dict:
+    if not isinstance(stamps, dict):
+        return {}
+    return {path: stamp for path, stamp in stamps.items()
+            if isinstance(path, str) and _valid_stamp(stamp)}
 
 
 def _save_stamps(path: Path, stamps: dict, prior: dict) -> None:
@@ -455,11 +664,19 @@ def _stamp(fresh: dict, rel: str, stat: tuple[int, int] | None, digest: str, now
         fresh[rel] = [stat[0], stat[1], digest]
 
 
+def _path_hash(path: Path, prior) -> tuple[str, tuple[int, int] | None]:
+    stat = _stat_of(path)
+    if _unmoved(stat, prior):
+        return prior[2], stat
+    digest = content_hash(path)
+    return digest, stat if stat == _stat_of(path) else None
+
+
 def _hash_paths(root: Path, rel_paths: list[str], stamps: dict) -> tuple[dict[str, str], dict]:
     """Content hash per path, plus the stat index the next run should keep.
 
-    The cache keys are content hashes and stay content hashes; (mtime_ns, size)
-    only decides whether a hash has to be recomputed. A file that has not moved
+    The cache identity includes the content hash; (mtime_ns, size) only decides
+    whether that hash has to be recomputed. A file that has not moved
     since the run that hashed it keeps that hash without being opened, which is
     the difference between reading 14k files and stat-ing them.
 
@@ -471,9 +688,7 @@ def _hash_paths(root: Path, rel_paths: list[str], stamps: dict) -> tuple[dict[st
     hashes: dict[str, str] = {}
     fresh: dict = {}
     for rel in rel_paths:
-        stat = _stat_of(root / rel)
-        prior = stamps.get(rel)
-        hashes[rel] = prior[2] if _unmoved(stat, prior) else content_hash(root / rel)
+        hashes[rel], stat = _path_hash(root / rel, stamps.get(rel))
         _stamp(fresh, rel, stat, hashes[rel], now)
     return hashes, fresh
 
@@ -489,7 +704,7 @@ def _kept_stamps(prior: dict, fresh: dict, visited: set) -> dict:
 
 
 def _restamped(hits: dict[str, list[FunctionRecord]]) -> dict[str, list[FunctionRecord]]:
-    # A cache entry keys on content only; re-stamp the path so a moved file cannot
+    # An entry keys on reader and content; re-stamp the path so a moved file cannot
     # carry its old location into the snapshot. Almost nothing moves between two
     # runs, and rebuilding 140k namedtuples to write back the path they already
     # hold is the most expensive thing a fully-warm run does.
@@ -499,42 +714,38 @@ def _restamped(hits: dict[str, list[FunctionRecord]]) -> dict[str, list[Function
 def _rows_for(path: str, rows: list[FunctionRecord]) -> list[FunctionRecord]:
     """One entry's rows all carry one path, because analyze_one stamps every
     record it emits with the single path it was handed. The first row answers
-    for all of them."""
-    if rows and rows[0].path == path:
+    for all of them.
+
+    An empty list comes back as it went in: there is no path to re-key, and
+    rebuilding it drops the UnanalyzableFile a refusal travels in, which is what
+    keeps that file out of the cache and names it again on the next run.
+    """
+    if not rows or rows[0].path == path:
         return rows
     return [r._replace(path=path) for r in rows]
 
 
-_MEMORY_BUDGET_ENV = "CRAPKIT_ANALYSIS_MEMORY_MB"
+def _analyze_verified(job: tuple[str, str, str]) -> tuple[str, list[FunctionRecord]]:
+    """Read one worker-owned input, verify its identity, then parse those bytes."""
+    absolute, relative, expected = job
+    try:
+        raw = Path(absolute).read_bytes()
+    except OSError as exc:
+        raise ToolError(f"{relative}: source cannot be read; rerun analysis: {exc}") from exc
+    if hashlib.sha256(raw).hexdigest() != expected:
+        raise ToolError(f"{relative}: source changed during analysis; rerun analysis")
+    try:
+        analyzer = lizard.FileAnalyzer(_extensions_for(relative))
+        analysis = analyzer.analyze_source_code(relative, decode_source(raw))
+        return relative, _trusted_records(relative, analysis.function_list)
+    except Exception as exc:  # a parse refusal, unlike the read and hash above, is per-file
+        return relative, UnanalyzableFile(f"lizard failed on {relative}: {exc}")
 
-# Measured peak RSS of one analysis worker over the consumer repo: 24 workers reached
-# 807 MB of tree RSS, the biggest child 47 MB, the median child 35 MB.
-_WORKER_PEAK_MB = 35
 
-
-def _memory_budget_mb() -> int | None:
-    """The budget in MB, or None when it is unset or not a positive whole number.
-
-    A mistyped knob must not silently serialize a run: unreadable reads as absent.
-    """
-    raw = os.environ.get(_MEMORY_BUDGET_ENV, "").strip()
-    if not raw.isdigit() or raw == "0":
-        return None
-    return int(raw)
-
-
-def _memory_bounded(workers: int | None) -> int | None:
-    """The worker count, capped by CRAPKIT_ANALYSIS_MEMORY_MB when it is set.
-
-    Off by default: no budget means one worker per core, as before. Cold over
-    the consumer repo, 24 workers peak at 807 MB in 11.8 s and 16 at 565 MB in 14.2 s, so
-    a box short of memory can buy 242 MB back for 2.4 s. Never returns zero
-    workers: a budget smaller than one worker still gets one.
-    """
-    budget = _memory_budget_mb()
-    if budget is None:
-        return workers
-    return min(workers or os.cpu_count() or 1, max(1, budget // _WORKER_PEAK_MB))
+def _job_inputs(jobs: list, hashes: dict[str, str] | None):
+    if hashes is None:
+        return analyze_one, jobs
+    return _analyze_verified, [(absolute, relative, hashes[relative]) for absolute, relative in jobs]
 
 
 def analyze_jobs(
@@ -543,6 +754,8 @@ def analyze_jobs(
     workers: int | None = None,
     pool_threshold: int = _POOL_THRESHOLD,
     chunksize: int = 32,
+    hashes: dict[str, str] | None = None,
+    worker_budget: int = 0,
 ) -> dict[str, list[FunctionRecord]]:
     """Run lizard over (abs_path, rel_path) jobs, pooled once there are enough.
 
@@ -552,25 +765,103 @@ def analyze_jobs(
     different worker (a chunksize above the job count leaves one worker doing
     all of them, serially, after paying for the pool).
     """
-    fresh: dict[str, list[FunctionRecord]] = {}
-    if len(jobs) >= pool_threshold:
-        with ProcessPoolExecutor(max_workers=_memory_bounded(workers)) as pool:
-            for rel_path, records in pool.map(analyze_one, jobs, chunksize=chunksize):
-                fresh[rel_path] = records
-    else:
-        for job in jobs:
-            rel_path, records = analyze_one(job)
-            fresh[rel_path] = records
+    worker, inputs = _job_inputs(jobs, hashes)
+    with _pool_for(jobs, pool_threshold, workers, worker_budget, chunksize) as pool:
+        rows = pool.map(worker, inputs, chunksize=chunksize) if pool else map(worker, inputs)
+        fresh = dict(rows)
     # The parent says things; a worker only measures. A spawned child's stderr
     # never saw `_reconfigure_streams`, so a note printed from analyze_one
     # reached a UTF-8 reader in the legacy codepage on Windows (#31).
     for rel_path, records in fresh.items():
         _note_twin_keys(rel_path, records)
+    _note_unanalyzable(fresh)
     return fresh
 
 
+_UNANALYZABLE_NAMED = 5
+
+
+def _note_unanalyzable(fresh: dict[str, list[FunctionRecord]]) -> None:
+    """Name the files no reader could tokenize, and let the run continue.
+
+    Through 0.7.0 the first refusal in a corpus raised, so one ambiguous arrow
+    among 21,327 files failed `coverage`, which left the ratchet unseeded, which
+    refused every commit in the repo in every language. Refusing an ambiguous
+    arrow is specified, tested behaviour; ending the run over it was not. The
+    file is now scored as zero functions, which is what an unreadable file
+    honestly holds, and stays uncached so every run names it again.
+    """
+    refused = [(path, rows.reason) for path, rows in sorted(fresh.items())
+               if isinstance(rows, UnanalyzableFile)]
+    if not refused:
+        return
+    print(f"crapkit: {len(refused)} file(s) could not be tokenized; "
+          f"each is scored as zero functions and stays unranked:", file=sys.stderr)
+    for path, reason in refused[:_UNANALYZABLE_NAMED]:
+        print(f"crapkit:   {reason}", file=sys.stderr)
+    if len(refused) > _UNANALYZABLE_NAMED:
+        print(f"crapkit:   ... and {len(refused) - _UNANALYZABLE_NAMED} more", file=sys.stderr)
+
+
+def _pool_for(jobs: list, threshold: int, workers, worker_budget: int, chunksize: int):
+    if len(jobs) < threshold or workers == 1:
+        return nullcontext(None)
+    if chunksize < 1:
+        raise ValueError("chunksize must be >=1.")
+    chunks = (len(jobs) + chunksize - 1) // chunksize
+    if chunks <= 1:
+        return nullcontext(None)
+    requested = _requested_workers(workers, chunks, jobs)
+    if requested == 1:
+        return nullcontext(None)
+    from ._analysis_pool import analysis_pool
+    return analysis_pool(workers=requested, worker_budget=worker_budget)
+
+
+def _requested_workers(workers, chunks: int, jobs: list) -> int:
+    if workers:
+        return min(workers, chunks)
+    from .resources import DEFAULT_SOURCE_BYTES_PER_WORKER, default_chunks_per_worker
+    quantum = default_chunks_per_worker()
+    requested = (chunks + quantum - 1) // quantum
+    if quantum > 1:
+        work = _source_bytes(jobs)
+        requested = max(requested, (work + DEFAULT_SOURCE_BYTES_PER_WORKER - 1) // DEFAULT_SOURCE_BYTES_PER_WORKER)
+    return max(1, min(requested, chunks))
+
+
+def _source_bytes(jobs: list) -> int:
+    return sum(_job_size(path) for path, _ in jobs)
+
+
+def _job_size(path: str) -> int:
+    try:
+        return os.stat(path).st_size
+    except OSError:
+        return 0  # The reader retains responsibility for its exact path refusal.
+
+
+def _miss_origins(misses: list[str], identities: dict[str, str]) -> dict[str, str]:
+    """Each cold path's first equivalent reader/content input, in path order."""
+    origins: dict[str, str] = {}
+    return {path: origins.setdefault(identities[path], path) for path in misses}
+
+
+def _analyze_misses(root: Path, misses: list[str], identities: dict, hashes: dict,
+                    workers, worker_budget: int) -> dict:
+    origins = _miss_origins(misses, identities)
+    jobs = [(str(root / path), path) for path in dict.fromkeys(origins.values())]
+    parsed = analyze_jobs(jobs, workers=workers, hashes=hashes, worker_budget=worker_budget)
+    records = {path: _rows_for(path, parsed[origin]) for path, origin in origins.items()}
+    for path, origin in origins.items():
+        if path != origin:
+            _note_twin_keys(path, records[path])
+    return records
+
+
 def analyze_files(
-    root: Path, rel_paths: list[str], *, cache: dict, workers: int | None = None
+    root: Path, rel_paths: list[str], *, cache: dict, workers: int | None = None,
+    worker_budget: int = 0,
 ) -> tuple[dict[str, list[FunctionRecord]], int, dict]:
     fp = fingerprint()
     stamps_path = _stamps_path(root)
@@ -578,11 +869,12 @@ def analyze_files(
     hashes, fresh_stamps = _hash_paths(root, rel_paths, prior_stamps)
     kept = _kept_stamps(prior_stamps, fresh_stamps, set(rel_paths))
     _save_stamps(stamps_path, kept, prior_stamps)
-    hits, misses = partition_by_cache(hashes, cache, fingerprint=fp)
+    identities = {rel: _analysis_key(rel, digest) for rel, digest in hashes.items()}
+    hits, misses = partition_by_cache(identities, cache, fingerprint=fp)
     hits = _restamped(hits)
 
-    fresh = analyze_jobs([(str(root / rel), rel) for rel in misses], workers=workers)
+    fresh = _analyze_misses(root, misses, identities, hashes, workers, worker_budget)
 
     all_records = {**hits, **fresh}
-    new_cache = updated_cache(hashes, all_records, fingerprint=fp)
+    new_cache = updated_cache(identities, all_records, fingerprint=fp)
     return all_records, len(hits), new_cache

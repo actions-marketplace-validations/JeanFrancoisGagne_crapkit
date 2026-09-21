@@ -11,15 +11,17 @@ that matter are the ones saying the reused tree is not a cheaper LIE: the last
 run's mutant is gone, the last suite's artifacts are gone, and a commit made
 between two runs is there.
 """
-import os
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
 
 from crapkit import mutate_pool
 from crapkit.errors import GitError
-from crapkit.mutate_pool import _take_lock, _worktrees, drop_pool, pool_dir
+from crapkit.locks import exclusive_lock
+from crapkit.mutate_pool import _worktrees, drop_pool, pool_dir
 
 
 def git(repo: Path, *args: str) -> str:
@@ -50,9 +52,9 @@ def adds(monkeypatch) -> list:
     made: list = []
     real = mutate_pool.worktree_add
 
-    def counted(root: Path, path: Path) -> None:
+    def counted(root: Path, path: Path, *, owner=None) -> None:
         made.append(path)
-        real(root, path)
+        real(root, path, owner=owner)
 
     monkeypatch.setattr(mutate_pool, "worktree_add", counted)
     return made
@@ -175,10 +177,10 @@ def test_a_build_that_fails_leaves_no_pool_to_be_reused_blind(repo, monkeypatch)
     """Half a pool reused is silent, where a fresh add that dies is loud."""
     real = mutate_pool.worktree_add
 
-    def refuse_the_second(root: Path, path: Path) -> None:
+    def refuse_the_second(root: Path, path: Path, *, owner=None) -> None:
         if path.name == "w1":
             raise GitError("checkout refused")
-        real(root, path)
+        real(root, path, owner=owner)
 
     monkeypatch.setattr(mutate_pool, "worktree_add", refuse_the_second)
 
@@ -207,16 +209,13 @@ def test_a_second_run_finding_the_pool_held_works_outside_it(repo):
     loser of the lock gets today's throwaway set: slower, never the first run's
     tree with a second run's mutant in it."""
     pool_dir(repo).mkdir(parents=True, exist_ok=True)
-    handle = os.open(pool_dir(repo) / ".lock", os.O_CREAT | os.O_RDWR)
-    assert _take_lock(handle), "the peer's lock"
-    try:
+    lease = pool_dir(repo).parent / "mutate-pool.lock"
+    with exclusive_lock(lease, label="peer mutation pool"):
         with _worktrees(repo, 1) as (tree,):
             assert pool_dir(repo) not in tree.parents
             assert tree.is_dir()
         assert not tree.exists(), "the throwaway set is still removed on the way out"
         assert sorted(pool_dir(repo).glob("w*")) == [], "the pool was left alone"
-    finally:
-        os.close(handle)
 
 
 def test_the_lock_is_released_so_the_next_run_gets_the_pool(repo, adds):
@@ -250,14 +249,73 @@ def test_drop_pool_on_a_repo_that_never_pooled_says_nothing_was_there(repo):
 
 # --- one worker still touches nothing ----------------------------------------
 
-def test_one_worker_builds_no_pool_at_all(repo, monkeypatch):
-    """`mutation_workers = 1` mutates the live tree, exactly as it always has:
-    the saving is 0 s there and so is the cost."""
-    monkeypatch.setattr(mutate_pool, "run_one", lambda tree, cfg, mutant: True)
-    cfg = type("Cfg", (), {"mutation_workers": 1, "mutation_command": "true",
+def test_one_worker_uses_a_private_pool(repo, monkeypatch):
+    """One worker has the same isolation contract as several workers."""
+    monkeypatch.setattr(mutate_pool, "run_one", lambda tree, cfg, mutant, owner=None: True)
+    cfg = type("Cfg", (), {"mutation_workers": 1, "mutation_command": f'"{sys.executable}" -c "pass"',
                            "mutation_timeout_seconds": 5})()
     mutant = type("M", (), {"path": "m.py", "line": 1, "op": "x"})()
 
     assert mutate_pool.run_mutants(repo, cfg, [mutant], lambda *a: None) == [True]
 
-    assert not (repo / ".crapkit").exists()
+    assert (pool_dir(repo) / 'w0').is_dir()
+
+
+@pytest.mark.parametrize('workers', [1, 2])
+def test_every_worker_measures_dirty_tests_config_dependencies_and_deletions(repo, workers):
+    from types import SimpleNamespace
+    from crapkit.mutate import file_mutants
+
+    source = 'def enabled():\n    return True\n'
+    (repo / 'm.py').write_text(source, encoding='utf-8')
+    (repo / 'tests.txt').write_text('old tests', encoding='utf-8')
+    (repo / 'settings.txt').write_text('old config', encoding='utf-8')
+    (repo / 'dependency.py').write_text('VALUE = 1\n', encoding='utf-8')
+    (repo / 'runner.py').write_text(
+        'from pathlib import Path\nimport m, dependency\n'
+        'assert Path("tests.txt").read_text() == "new tests"\n'
+        'assert Path("settings.txt").read_text() == "new config"\n'
+        'assert Path("new_fixture.txt").read_text() == "untracked input"\n'
+        'assert dependency.VALUE == 2\n'
+        'assert not Path("gone.py").exists()\n'
+        'Path("runner-wrote.txt").write_text("private")\n'
+        'assert m.enabled()\n', encoding='utf-8')
+    commit(repo, 'runner')
+    (repo / 'tests.txt').write_text('new tests', encoding='utf-8')
+    (repo / 'settings.txt').write_text('new config', encoding='utf-8')
+    (repo / 'dependency.py').write_text('VALUE = 2\n', encoding='utf-8')
+    (repo / 'new_fixture.txt').write_text('untracked input', encoding='utf-8')
+    (repo / 'gone.py').unlink()
+    mutant = file_mutants(source, None, 'python')[0]._replace(path='m.py')
+    cfg = SimpleNamespace(mutation_workers=workers, mutation_timeout_seconds=5,
+                          mutation_command=f'"{sys.executable}" runner.py')
+
+    assert mutate_pool.run_mutants(repo, cfg, [mutant, mutant], lambda *a: None) == [True, True]
+    assert not (repo / 'runner-wrote.txt').exists(), 'the suite must never write into the user checkout'
+    assert (repo / 'm.py').read_text() == source
+
+
+def test_drop_pool_refuses_while_another_process_owns_the_workers(repo):
+    from crapkit.errors import ToolError
+
+    script = repo / 'holder.py'
+    script.write_text(
+        'from pathlib import Path\nimport sys,time\n'
+        'from crapkit.mutate_pool import _worktrees\n'
+        'root = Path(sys.argv[1])\n'
+        'with _worktrees(root, 1):\n'
+        '    (root / "ready").touch()\n'
+        '    while not (root / "release").exists(): time.sleep(0.02)\n', encoding='utf-8')
+    child = subprocess.Popen([sys.executable, str(script), str(repo)])
+    try:
+        deadline = time.monotonic() + 10
+        while not (repo / 'ready').exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert (repo / 'ready').exists(), 'the other process must own a real worker'
+        with pytest.raises(ToolError, match='in use'):
+            drop_pool(repo)
+        assert (pool_dir(repo) / 'w0' / 'm.py').is_file()
+    finally:
+        (repo / 'release').touch()
+        child.wait(timeout=10)
+    assert len(drop_pool(repo)) == 1

@@ -13,9 +13,8 @@ from pathlib import Path
 
 import pytest
 
-# Rendering needs Pillow, which the dev extra does not ship: CI installs the
-# suite's needs, and regenerating the demo is a maintainer step. Without it these
-# tests skip; the docs contract on the committed GIF still runs everywhere.
+# Rendering needs Pillow, included in the development extra. A runtime-only
+# installation can still skip this maintainer contract.
 pytest.importorskip("PIL")
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -111,3 +110,19 @@ def test_redaction_removes_a_wall_clock_stamp(tmp_path):
     text = demo_run.redact("artifact stamped 2026-08-24T16:20:00 in 12.4s", tmp_path)
 
     assert "2026" not in text and "12.4s" not in text
+
+
+def test_redaction_spells_the_module_run_as_the_console_script(tmp_path):
+    """The generator runs `python -m crapkit`, so every next-step crapkit prints
+    names the interpreter by its absolute path (`invocation._self`). The frames
+    show the spelling a reader installs, and the path check would otherwise
+    refuse the whole render."""
+    import sys
+
+    quoted = f'"{sys.executable}"' if " " in sys.executable else sys.executable
+    line = f"detected 1 lane(s): py - next: run `{quoted} -m crapkit coverage`"
+
+    text = demo_run.redact(line, tmp_path)
+
+    assert text == "detected 1 lane(s): py - next: run `crapkit coverage`"
+    assert demo_run.absolute_paths([text]) == []

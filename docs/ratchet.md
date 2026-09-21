@@ -7,9 +7,10 @@ question: *has this function got worse than the day we agreed to live with it?*
 it; it fails the build instead. New debt enters only through `ratchet seed` or an audited
 override, both of which are visible in a diff.
 
-**Changed in 0.4.0: a commit that touches a marked function is no longer refused.** The
-pre-commit gate now treats a mark as an exemption, and `crapkit verify` is what fails a mark
-that rises. [The rule, and why it moved](#the-commit-gate-skips-marked-functions).
+The pre-commit gate treats a mark as an exemption; `crapkit verify` fails a mark
+that rises. See [the commit-gate rule](#the-commit-gate-skips-marked-functions).
+When upgrading, review [function identity](#same-line-function-identity) before
+reseeding marks recorded by an older reader.
 
 Default file: `crapkit-ratchet.tsv` at the repo root, settable with `[crapkit] ratchet_file`.
 Commit it.
@@ -19,15 +20,19 @@ Commit it.
 ## What a mark is
 
 ```
-# crapkit-analysis=8 lizard=1.24.0
+# crapkit-analysis=10 lizard=1.24.0
+# crapkit-keys=1
 path	long_name	crap
 calc/grade.py	classify( score , attempts , late , bonus )	66.0714
 calc/report.py	render( rows , wide , totals , header )	56.0000
 ```
 
-A comment line carrying the metric stamp, a header, then one tab-separated row per mark:
+Comments carrying the metric and key-format stamps, a header, then one row per mark:
 path, key name, CRAP to four decimals. Rows are sorted by that pair, so the file is
 diffable and merge conflicts are local.
+
+Rows containing delimiters use the shared [portable record encoding](portable-records.md).
+Ordinary three-column rows retain their bytes.
 
 Identity is `(path, key name)`, never the line number. Spans drift on every edit; names
 survive.
@@ -53,12 +58,11 @@ The ordinal, not the start line, because a line is invalidated by any edit above
 would re-key marks nothing touched. Delete one twin and the rest renumber, which is honest:
 they really are different functions now, and `prune` drops the key that no longer names one.
 
-**Adopting it needs no migration.** Before the ordinal, all of a file's twins shared
-`(path, long_name)`. One of them owned the key and the rest were neither marked nor gated,
-so any of them could grow past every ceiling with no gate firing. Because twin #1 keeps the
-bare name, **every mark in an existing `crapkit-ratchet.tsv` already reads as twin #1** —
-there is nothing to rewrite. Run `crapkit ratchet seed` when you want the other twins'
-standing debt recorded too; it adds their marks and touches nothing else.
+Before the ordinal, all of a file's twins shared `(path, long_name)`. One owned the key
+and the rest were neither marked nor gated. For groups whose membership is unchanged,
+twin #1 keeps the bare name and existing marks keep their meaning. Same-line callbacks
+and callbacks recovered by a newer reader need the
+[identity checks below](#same-line-function-identity) before their ordinals can be reused.
 
 `analyze` prints one line per file naming the colliding names, so a `#2` in a marks diff
 has an explanation:
@@ -105,9 +109,9 @@ it moves nothing, so step 3 and step 5 both pass:
 ```
 $ crapkit rescore calc/grade.py --gate
 rescore vs run 2 @ 4a06338604a (coverage STALE, complexity fresh)
-   ccn   cov     crap  remedy     function
-    13   39%     51.6  decompose  calc/grade.py:1  classify( score , attempts , late , bonus )
-     5   62%      6.3  add-tests  calc/grade.py:25  summarize( rows , wide , totals , header )
+   ccn   cov     crap  remedy      function
+    13   39%     51.6  decompose   calc/grade.py:1  classify( score , attempts , late , bonus )
+     5   62%      6.3  add-tests   calc/grade.py:25  summarize( rows , wide , totals , header )
 EXIT=0
 
 $ crapkit verify
@@ -149,10 +153,11 @@ accepted debt, so from then on the gate judges your edit instead of the repo's h
 
 ```
 $ crapkit coverage
-run 1 @ 549e0ccdcdf: 3 functions scored — 2 measured / 1 untested / 0 no-lane / 0 cc-only, 2 over target 6, CRAP load 124.07, grade F
+run 1 @ 549e0ccdcdf: 3 functions scored: 2 measured / 1 untested, 2 over ceiling 6, CRAP load 124.07, grade F
+-> next: crapkit worklist
 
 $ crapkit ratchet seed
-crapkit-ratchet.tsv: added 2, tightened 0 — 2 mark(s) vs run 1 (549e0ccdcdf)
+crapkit-ratchet.tsv: added 2, tightened 0 - 2 mark(s) vs run 1 (549e0ccdcdf)
 ```
 
 `seed` marks every function over its scope ceiling from the latest full run, at its current
@@ -161,7 +166,12 @@ score. It is idempotent, and it can only lower: rerunning after an improvement r
 
 **Seed once, early.** Skipping it means a legacy repo's existing debt carries no marks, so
 the ratchet check has nothing to compare and coverage rot on untouched code goes unnoticed.
-`verify` still gates the diff, but the standing debt is unprotected.
+`verify` still gates the diff, but the standing debt is unprotected. Since 0.5.1 every
+verify counts that gap: `warning: N function(s) over the ceiling carry no ratchet mark, so
+a rise on them (coverage loss included) passes unseen; record them with `crapkit ratchet
+seed`` on stderr, and `unmarked_over_target` in `--json`. It fires no exit code and is
+silent at zero, which is the state of a repo with no debt and of one seeded in full: a
+header-only marks file is not a mistake, it says nothing is over the ceiling.
 
 `ratchet seed` needs a **trusted** run in the store:
 
@@ -195,10 +205,10 @@ run 3 the fresh `coverage` somebody ran to move on. Both actions walk back to ru
 
 ```
 $ crapkit ratchet seed
-crapkit-ratchet.tsv: added 0, tightened 0 — 2 mark(s) vs run 1 (964eaf2ad80), skipped failed verify run 2
+crapkit-ratchet.tsv: added 0, tightened 0 - 2 mark(s) vs run 1 (964eaf2ad80), skipped failed verify run 2
 
 $ crapkit ratchet prune
-crapkit-ratchet.tsv: pruned 0, followed 0 rename(s) — 2 mark(s) vs run 1 (964eaf2ad80), skipped failed verify run 2
+crapkit-ratchet.tsv: pruned 0, followed 0 rename(s) - 2 mark(s) vs run 1 (964eaf2ad80), skipped failed verify run 2
 ```
 
 The clause names the failed verifies only, so the ordinary line is unchanged when nothing was
@@ -239,7 +249,7 @@ Three cases:
 |---|---|
 | Matches the running metric | Compare normally. |
 | Differs | **Refused**, exit 3. |
-| Absent (a file written before stamping) | Accepted with a warning. There is nothing to disagree with. |
+| Absent (a file written before stamping) | Warn, then apply the function-identity checks below. Anonymous JavaScript/TypeScript marks need reader proof. |
 
 ```
 $ crapkit verify
@@ -254,22 +264,27 @@ verify OK @ 525a3276065 vs baseline 525a3276065 (1 changed files)
 EXIT=0
 ```
 
-`ratchet seed` and `prune` always rewrite the stamp to the running metric. The merge driver
-is the exception: it writes whatever stamp both sides already shared, so two legacy sides
-stay legacy.
+After their identity checks pass, `ratchet seed` and `prune` rewrite the stamp to the
+running metric. An upgrade that changes which functions a reader finds needs a reviewed
+mapping first; fresh coverage alone cannot supply it. See
+[same-line function identity](#same-line-function-identity). An explicit move preserves
+both stamps. The merge driver writes the stamps both sides already shared, so two legacy
+sides stay legacy.
 
-This is why `crapkit` pins its lizard dependency by lower bound and why upgrading lizard is
-a deliberate act. A new lizard changes the stamp, and every consumer's next run refuses its
-own marks until somebody re-seeds.
+Upgrading lizard changes the stamp, so the next comparison refuses existing marks.
+Reseeding can update compatible marks; changed function membership needs the identity
+review below first.
 
 ### Upgrading to 0.4.5: analysis version 8
 
-0.4.4 measured at analysis version 7 and 0.4.5 measures at 8, so the transcript above is
-the one every consumer meets on the first run after the upgrade. Re-seed and it goes away:
+This historical transition changed analysis version 7 to 8. The transcript above
+belongs to that upgrade; the current reader uses version 10. Follow
+[Upgrading](upgrading.md) for current saved-state checks. In the older transition,
+reseeding updated the stamp as follows:
 
 ```
 $ crapkit ratchet seed
-crapkit-ratchet.tsv: added 0, tightened 0 — 2 mark(s) vs run 9 (4a06338604a)
+crapkit-ratchet.tsv: added 0, tightened 0 - 2 mark(s) vs run 9 (4a06338604a)
 
 $ head -1 crapkit-ratchet.tsv
 # crapkit-analysis=8 lizard=1.24.0
@@ -296,7 +311,7 @@ only diff-visible record. Running `prune` is you confirming.
 
 ```
 $ crapkit ratchet prune
-crapkit-ratchet.tsv: pruned 0, followed 2 rename(s) — 2 mark(s) vs run 11 (7d09097ea8a)
+crapkit-ratchet.tsv: pruned 0, followed 2 rename(s) - 2 mark(s) vs run 11 (7d09097ea8a)
 ```
 
 **A rename follows instead of dropping.** Before pruning, crapkit asks git for renames since
@@ -323,7 +338,7 @@ renames like any other. Here the top holds `pkg/`, crapkit runs in `pkg`, and th
 
 ```
 $ crapkit ratchet prune
-crapkit-ratchet.tsv: pruned 0, followed 1 rename(s) — 2 mark(s) vs run 2 (db28702d61c)
+crapkit-ratchet.tsv: pruned 0, followed 1 rename(s) - 2 mark(s) vs run 2 (db28702d61c)
 ```
 
 The marks file says `calc/grade.py` before and `calc/grading.py` after, and carries the
@@ -425,9 +440,10 @@ CONFLICT (content): Merge conflict in crapkit-ratchet.tsv
 Automatic merge failed; fix conflicts and then commit the result.
 ```
 
-An upgrade puts every branch in that position for one commit: a branch cut before 0.4.5
-carries analysis 7 and the branch that upgraded carries 8. Re-seed the older side, commit
-the marks file, and the merge goes through.
+The historical example joins stamps from different reader versions. Bring both
+branches through the [upgrade checks](upgrading.md#measure-before-changing-marks)
+and review function identity before restamping. The merge driver also refuses
+different key-format versions; matching metric stamps alone are not enough.
 
 `ratchet merge` runs with no `crapkit.toml` in sight, because git invokes it from a temp
 directory. It is the one ratchet subcommand that needs no config.
@@ -455,7 +471,7 @@ have not committed yet is still debt somebody owes, and the report says so:
 
 ```
 $ crapkit ratchet seed
-crapkit-ratchet.tsv: added 1, tightened 0 — 1 mark(s) vs run 2 (d9cdcfdcb1a)
+crapkit-ratchet.tsv: added 1, tightened 0 - 1 mark(s) vs run 2 (d9cdcfdcb1a)
 
 $ crapkit ratchet report
 ratchet burn-down: 1 open mark(s), 0 repaid (0 in the last 30d, 0 in 90d)
@@ -510,6 +526,23 @@ A clean pass tightens it automatically. After a green `verify`:
   score.
 - A marked function absent from the run keeps its mark untouched. Absence is not proof the
   code is gone; that is what `prune` is for.
+
+The marks file is written only when its text would change, and never created to hold zero
+marks: a clean checkout with no marks file stays clean, and a stamped file whose marks all
+held stays byte-identical. When the run did rewrite it, the OK line says what moved and what
+to do about it:
+
+```
+$ crapkit verify
+verify OK @ 8c780bb18da vs baseline 8c780bb18da (3 changed files) ratchet: 6 dropped, 1 tightened -> git add crapkit-ratchet.tsv
+```
+
+`dropped` counts marks whose function is now at or under its ceiling; `tightened` counts
+marks that fell. The JSON receipt carries the same two numbers as `ratchet_changes`, `null`
+when the tighten wrote nothing ([agent-json.md](agent-json.md#verify)). One rewrite moves no
+mark: a file written before stamping (the one `verify` warns about on stderr) is rewritten
+once to gain its stamp line, and the OK line says `ratchet: restamped -> git add
+crapkit-ratchet.tsv` instead of two zero counts.
 
 A run that passed **because of an `--override`** does not tighten anything. The override
 already wrote the debt it granted, and letting the same run also rewrite every other mark
@@ -596,15 +629,43 @@ With it configured:
 
 ```
 $ crapkit verify --override "shipping the hotfix, ticket 412"
-verify OK @ 8c780bb18da vs baseline 8c780bb18da (2 changed files)
+verify OK @ 8c780bb18da vs baseline 8c780bb18da (2 changed files) ratchet: 1 mark granted -> git add crapkit-ratchet.tsv
   OVERRIDDEN  app/m.py:9  route( a , b , c , d )
 EXIT=0
 ```
+
+The grant is the override's own write to the marks file, so the OK line ends with the same
+`git add` a tighten's does; `ratchet_changes` stays `null` in the JSON receipt, the grant
+being listed under `overridden`.
 
 ```
 $ crapkit overrides
 run  10 @ 8c780bb18da 2026-08-23T01:36:42Z  crap 56.0  app/m.py  route( a , b , c , d )  (shipping the hotfix, ticket 412)
 ```
+
+An override grants gate violations and nothing else. A ratchet regression or a new test
+failure in the same run refuses it, and the refusal is one stderr line naming the cause and
+the escape; the exit code stays the verdict's:
+
+```
+$ crapkit verify --override "hotfix INV-412 ships tonight; decompose next sprint"
+verify FAILED @ 8c780bb18da vs baseline 8c780bb18da (1 changed files)
+  GATE  crap    380.0  ccn  19 cov 0%  app/billing/invoice.py:88  check_band( r , t )  -> decompose
+  RATCHET  app/billing/invoice.py  check_band( r , t ): 240.0 -> 380.0
+  findings: 1 committed / 0 dirty (uncommitted edits and untracked files)
+override refused: 1 ratchet regression (app/billing/invoice.py check_band( r , t ) 240.0 -> 380.0) never qualifies for an override; raise the mark by hand and commit it
+EXIT=6
+```
+
+The rule, stated once: **a mark never rises through `verify`.** A marked function the edit
+pushed past its mark carries a gate violation and a regression in one payload
+([agent-json.md](agent-json.md#verify)), so the override path never reaches it, and the only
+way to accept that debt is to raise the mark in `crapkit-ratchet.tsv` by hand and commit the
+change where a reviewer sees it. A new test failure is refused from the other side: the
+override records debt in the marks file, and a failing test is not debt a mark can carry;
+fix the test first. A run holding both causes is refused once, both on the line. A refused
+override writes no alert line, no store row and no mark. Under `--json` the line is on
+stderr and stdout stays one object.
 
 The pre-commit hook takes the same path through `CRAPKIT_OVERRIDE_REASON`:
 
@@ -644,3 +705,83 @@ crapkit verify              # should be green on the tree you just committed
 ```
 
 Then install the gate ([README](../README.md#the-gate)) and the merge driver above.
+
+## Same-line function identity
+
+Several callbacks can start on one source line. New records include `occurrence`,
+their creation order within that line. Canonical marks still use the raw name and
+`#N` ordinal, now ordered by `(start, occurrence)`.
+
+The two stamps answer different questions:
+
+| Stamp | What it records |
+| --- | --- |
+| `# crapkit-analysis=10 lizard=1.24.0` | The reader and metric rules that produced the function set and scores. |
+| `# crapkit-keys=1` | Ordinals ordered by `(start, occurrence)`. |
+
+A missing key-version comment means the old start-only rule. For unchanged groups
+whose reader identity is proved, seed, prune and a successful tightening can keep
+the keys and values and add the new key marker. Marks for absent names retain the
+old key format until their mapping can be checked. Named functions and functions
+in other languages keep compatible reseed behavior when their groups have no
+unresolved collision. An explicit move preserves both stamps; a merge refuses
+different key versions without rewriting OURS.
+
+### Same-line collisions and recovered callbacks
+
+If a legacy marked name has two functions starting on the same line, its entire
+name group needs review. A collision also shifts later ordinals: two callbacks on
+line 1 can move the old second callback on line 10 from `#2` to `#3`. Available
+historical runs participate in this check. Their commit IDs alone cannot prove
+source identity because a run may have measured uncommitted code.
+
+Analysis reader 10 also recovers JavaScript and TypeScript expression callbacks
+that older readers missed, including siblings on different lines. For example,
+old anonymous functions at lines 2 and 6 become functions at lines 2, 3 and 6.
+The old `#2` belongs to line 6; the new `#2` belongs to line 3. Neither function
+set has a same-start collision, so the key-format marker alone cannot prove the
+mapping.
+
+For anonymous groups in `.js`, `.cjs`, `.mjs`, `.ts`, `.tsx` and `.jsx` files,
+missing, malformed or pre-10 reader proof refuses comparisons, seed, prune and
+override, even when `# crapkit-keys=1` is already present. The refusal leaves marks
+unchanged; an override emits no alert or audit record. An old stored run also
+cannot supply anonymous marks that seed labels as reader 10. New runs record
+their analysis version in `tool_versions.analysis_version`.
+
+### Reconcile saved marks
+
+Fresh coverage describes the current functions. It cannot establish which
+original function owned an old mark. Reconcile the mapping before restamping:
+
+1. Run `crapkit coverage --export .crapkit/current-functions.tsv` to inspect current
+   rows, including `start` and `occurrence`, without applying the ratchet.
+2. Compare each affected old key with the source that its mark measured. Review
+   the group's whole ordinal sequence, including functions on later lines and
+   siblings the old reader missed. Keep a copy of the original ratchet.
+3. Edit only the affected keys in the ratchet. Carry each existing value to the
+   function it belongs to and retain unrelated marks. Review any mark whose
+   original function cannot be established before assigning or removing it.
+4. After every affected group has a reviewed mapping, record the current run's
+   analysis/lizard stamp and add `# crapkit-keys=1`. If only the key format changed
+   and the metric stamp already matches, retain that metric stamp. Changing either
+   comment without proving the mapping does not reconcile the marks.
+5. Run `crapkit ratchet seed` against the fresh run to record remaining measured
+   debt, review the diff, commit the focused change, then run `crapkit verify`.
+
+If an original function cannot be established, leave its mark and stamps intact
+until that mapping is resolved. A blanket seed cannot perform this review.
+
+### Claims and coverage
+
+Old claims without position proof, and anonymous claims taken from runs without
+current reader proof, hold the whole raw-name group. They remain held until
+released, expired by an explicit `runs prune` under its existing age rule, or all
+functions in the group become healthy. The existing commit-history release rule
+also applies. See the [claim lifecycle](agent-json.md#claims). Release uses the
+saved handle and leaves unrelated claims intact. Claims from current runs can
+still reserve individual callbacks.
+
+`occurrence` distinguishes parsed functions. Line-only coverage artifacts still
+cannot distinguish callbacks whose source spans are identical; it does not add
+coverage columns that the artifact did not provide.

@@ -67,7 +67,7 @@ CREATE INDEX idx_attempts_open ON attempts(closed_at);
 
 SCOPES = ("api", "ui")
 FLAGS = ("measured", "untested", "no-lane", "cc-only")
-REMEDIES = ("ok", "add-tests", "decompose")
+REMEDIES = ("ok", "add-tests", "decompose", "split-lines")
 LANES = {"unit": {"exit_code": 0, "scopes": ["api", "ui"]}}
 
 
@@ -113,7 +113,7 @@ def _insert_prev_rows(conn, run_id: int, rows: list) -> None:
         conn.execute(
             "INSERT INTO functions (run_id, identity_id, start, end, ccn_std, ccn_mod, ccn, "
             "nloc, params, nesting, cov, flag, crap, remedy, cognitive) "
-            "VALUES (?" + ",?" * 14 + ")", (run_id, ids[key], *r[3:]))
+            "VALUES (?" + ",?" * 14 + ")", (run_id, ids[key], *r[3:16]))
 
 
 def conn_of(db):
@@ -197,6 +197,35 @@ def test_the_lookup_tables_name_every_code(tmp_path):
     assert set(remedies.values()) >= set(REMEDIES)
 
 
+def remedy_codes(db) -> dict:
+    conn = conn_of(db)
+    codes = dict(conn.execute("SELECT name, id FROM remedies"))
+    conn.close()
+    return codes
+
+
+def test_every_remedy_holds_a_fixed_code_whatever_the_rows_said(tmp_path):
+    """A store is a file people copy between machines, so a remedy name means
+    the same integer in all of them, including one no row has used yet."""
+    db = tmp_path / "crap.sqlite"
+    seeded(db, scored(3))
+
+    assert remedy_codes(db) == {"ok": 1, "add-tests": 2, "decompose": 3, "split-lines": 4}
+
+
+def test_a_store_from_before_split_lines_gains_its_code_on_open(tmp_path):
+    db = tmp_path / "crap.sqlite"
+    seeded(db, scored(3))
+    conn = conn_of(db)
+    conn.execute("DELETE FROM remedies WHERE name = 'split-lines'")
+    conn.commit()
+    conn.close()
+
+    SnapshotStore(db)
+
+    assert remedy_codes(db)["split-lines"] == 4
+
+
 def test_the_reads_still_hand_back_the_strings(tmp_path):
     db = tmp_path / "crap.sqlite"
     rows = scored(40)
@@ -205,7 +234,7 @@ def test_the_reads_still_hand_back_the_strings(tmp_path):
     assert store.read_scored(run_id) == export_order(rows)
     assert store.read_rows(run_id) == export_order(inventory_of(rows))
     marks = store.read_marks(run_id)
-    assert set(marks.values()) <= {(f, r) for f in FLAGS for r in REMEDIES}
+    assert set(marks.verdicts.values()) <= {(f, r) for f in FLAGS for r in REMEDIES}
     assert {h["flag"] for h in store.function_history("src/m1.py", "f1( a )")} <= set(FLAGS)
 
 
@@ -218,8 +247,9 @@ def test_a_flag_outside_the_seeded_domain_round_trips(tmp_path):
     store, run_id = seeded(db, [odd])
 
     assert store.read_scored(run_id) == [odd]
-    assert store.read_marks(run_id) == {("src/m9.py", "g( )"): ("brand-new-flag",
-                                                               "brand-new-remedy")}
+    marks = store.read_marks(run_id)
+    assert marks.verdicts == {("src/m9.py", "g( )", 1, 0): ("brand-new-flag", "brand-new-remedy")}
+    assert marks.scores == {("src/m9.py", "g( )", 1, 0): (3.5, 0.5)}
 
 
 def test_an_inventory_run_still_stores_no_verdict(tmp_path):
@@ -370,7 +400,7 @@ def _oldest_store(db, rows: list) -> None:
     conn.executemany(
         "INSERT INTO functions (run_id, scope, path, long_name, start, end, ccn_std, ccn_mod, "
         "ccn, nloc, params, nesting, cov, flag, crap, remedy, cognitive) VALUES (?" + ",?" * 16 + ")",
-        [(cur.lastrowid, *r) for r in rows])
+        [(cur.lastrowid, *r[:16]) for r in rows])
     conn.commit()
     conn.close()
 

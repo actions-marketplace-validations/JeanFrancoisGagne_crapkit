@@ -11,9 +11,12 @@ process. Timeouts and retries are lane config (timeout_seconds, retries).
 """
 from __future__ import annotations
 
+import hashlib
+from contextlib import nullcontext
 import json
 import os
 import re
+import socket
 import sys
 import time
 from pathlib import Path, PurePath
@@ -21,11 +24,10 @@ from typing import IO, NamedTuple
 
 from .config import Lane, shell_segments, shell_words
 from .coverage_istanbul import FnCoverage
-from .covstream import lane_prefix, parse_coveragepy_file, parse_istanbul_both_file
+from .covstream import lane_prefix, parse_coveragepy_both_file, parse_istanbul_both_file
 from .errors import GitError, ToolError
-from .gitio import GitFacts
-from .procs import NoProgress, run_bounded
-from .uncovered import fold_dead_lines
+from .gitio import GitFacts, worktree_root
+from .procs import NoProgress, own_processes, run_bounded
 from .universe import ScopeMatch, owning_scope, path_matchers
 
 
@@ -173,15 +175,16 @@ def _raise_stalled(fh: IO[str], lane: Lane, log_path: Path, attempt: int,
                     f"(attempt {attempt}), so crapkit killed it; log: {log_path}")
 
 
-def _stream_command(root: Path, lane: Lane, log_path: Path, attempt: int) -> int:
-    with open(log_path, "a" if attempt > 1 else "w", encoding="utf-8", errors="replace") as fh:
+def _stream_command(root: Path, lane: Lane, log_path: Path, attempt: int, owner=None) -> int:
+    from .logs import command_log
+
+    with command_log(log_path, max_bytes=lane.log_max_bytes, append=attempt > 1) as fh:
         _log_header(fh, lane.command, attempt)
-        # The log is a file, not a pipe, so streaming costs the deadline nothing:
-        # run_bounded kills the shell's whole tree, which is where the suite is.
-        # It is also what the progress watch measures.
+        # Ownership stops descendants before the log drains. Its byte counter
+        # measures progress even when the bounded files rotate.
         try:
             code = run_bounded(lane.command, _deadline(lane), stream=fh,
-                               no_progress=_no_progress(lane), **_popen_kwargs(root, lane))
+                               no_progress=_no_progress(lane), owner=owner, **_popen_kwargs(root, lane))
         except NoProgress as stalled:
             _raise_stalled(fh, lane, log_path, attempt, stalled.seconds)
         if code is None:
@@ -192,10 +195,10 @@ def _stream_command(root: Path, lane: Lane, log_path: Path, attempt: int) -> int
     return code
 
 
-def _attempt_once(root: Path, lane: Lane, log_path: Path, attempt: int) -> int | None:
+def _attempt_once(root: Path, lane: Lane, log_path: Path, attempt: int, owner=None) -> int | None:
     """One attempt; None means it timed out but another attempt remains."""
     try:
-        return _stream_command(root, lane, log_path, attempt)
+        return _stream_command(root, lane, log_path, attempt, owner)
     except ToolError:
         if attempt > lane.retries:
             raise
@@ -314,7 +317,7 @@ def _shard_hint(root: Path, lane: Lane) -> str:
             "re-run with --reuse-artifacts, scores what that suite did measure")
 
 
-def _no_artifact_head(root: Path, lane: Lane, stale: list[str]) -> str:
+def _no_artifact_head(root: Path, lane: Lane, stale: list[str], reuse: bool = False) -> str:
     """What the lane failed to do, in the words the disk supports.
 
     An empty `.crapkit/` and a leftover file are the same failure — this run
@@ -326,27 +329,49 @@ def _no_artifact_head(root: Path, lane: Lane, stale: list[str]) -> str:
     When the artifact is not on disk at all, that path leads: it is where the
     reader has to look, and the recover skill triages on "produced no artifact
     at <path>". The leftover results file rides behind it as a second clause.
+
+    On reuse there was no run: the file is what the LAST attempt left, and the
+    sentence names the flag that reached it, so the reader knows which door
+    they came through and that a rewrite of the file opens it again.
     """
     if not stale:
         return f"produced no artifact at {lane.artifact}"
     leftover = f"the {', '.join(stale)} on disk"
+    if reuse:
+        return (f"wrote no artifact on its last attempt — {leftover} predates it and is the "
+                "previous run's, which --reuse-artifacts will not score")
     if (root / lane.artifact).is_file():
         return f"wrote no artifact this run — {leftover} predates it and is the previous run's"
     return f"produced no artifact at {lane.artifact}, and {leftover} is the previous run's"
 
 
+class UnwrittenArtifact(ToolError):
+    """The refusal a lane draws when its attempt wrote no artifact, or left a
+    declared file unwritten. `refused_mtimes` is the modification time of each
+    leftover, keyed by its declared path: what the fold persists as the
+    refusal and what reuse reads back. Empty when nothing was left behind."""
+
+    def __init__(self, message: str, refused_mtimes: dict[str, int]) -> None:
+        super().__init__(message)
+        self.refused_mtimes = refused_mtimes
+
+
 def _raise_no_artifact(root: Path, lane: Lane, log_path: Path, exit_code: int | None,
-                       stale: list[str] | None = None) -> None:
-    """The log PATH before the log's words. A tail is 500 characters of a file
-    that holds the whole story, and a reader who is not told where that file is
-    has to go looking for it — one reporter had to ask another agent to find
-    .crapkit/lane-py.log while ten collection tracebacks sat inside it."""
+                       refused: dict[str, int] | None = None, *, reuse: bool = False) -> None:
+    """Name the retained log before quoting its last 500 characters.
+
+    The current file and optional .1 backup hold the newest command output.
+
+    `refused` is the leftover files with the modification time each still
+    carries; the message names them, the error carries them."""
+    refused = refused or {}
     detail = f" (command exit {exit_code})" if exit_code is not None else ""
     tail = _log_tail(log_path)
     hint = f"; last output: {tail}" if tail else ""
-    raise ToolError(f"lane {lane.name!r} {_no_artifact_head(root, lane, stale or [])}{detail}"
-                    f"; full log: {log_path}{hint}{_missing_plugin_hint(tail, lane)}"
-                    f"{_shard_hint(root, lane)}")
+    raise UnwrittenArtifact(
+        f"lane {lane.name!r} {_no_artifact_head(root, lane, list(refused), reuse)}{detail}"
+        f"; lane log: {log_path}{hint}{_missing_plugin_hint(tail, lane)}"
+        f"{_shard_hint(root, lane)}", refused)
 
 
 def _declared_files(lane: Lane) -> tuple[str, ...]:
@@ -366,9 +391,9 @@ def _declared_mtimes(root: Path, lane: Lane) -> dict[str, int | None]:
     return {name: _mtime_ns(root / name) for name in _declared_files(lane)}
 
 
-def _unwritten(root: Path, before: dict[str, int | None]) -> list[str]:
+def _unwritten(root: Path, before: dict[str, int | None]) -> dict[str, int]:
     """The declared files that were already on disk and that this attempt did
-    not rewrite.
+    not rewrite, each with the modification time it still carries.
 
     Existence was the whole check until 0.4.12, so a lane failed loud exactly
     once — on the first run, against an empty `.crapkit/` — and scored the
@@ -379,23 +404,24 @@ def _unwritten(root: Path, before: dict[str, int | None]) -> list[str]:
     A file that is not there at all is left out: that is the refusal crapkit
     already had, and a missing results_artifact has its own sentence one layer
     up. mtime, not content, because a runner that rewrites a byte-identical
-    report still bumps it, so an unchanged rerun stays green.
+    report still bumps it, so an unchanged rerun stays green. The time rides
+    on the refusal so reuse can recognize the same leftover later.
     """
-    return [name for name, stamp in before.items()
-            if stamp is not None and _mtime_ns(root / name) == stamp]
+    return {name: stamp for name, stamp in before.items()
+            if stamp is not None and _mtime_ns(root / name) == stamp}
 
 
-def _run_attempts(root: Path, lane: Lane) -> int | None:
+def _run_attempts(root: Path, lane: Lane, owner=None) -> int | None:
     log_path = _lane_log_path(root, lane)
     exit_code: int | None = None
-    stale: list[str] = []
+    unwritten: dict[str, int] = {}
     for attempt in range(1, lane.retries + 2):
         before = _declared_mtimes(root, lane)
-        exit_code = _attempt_once(root, lane, log_path, attempt)
-        stale = _unwritten(root, before)
-        if exit_code is not None and not stale and (root / lane.artifact).is_file():
+        exit_code = _attempt_once(root, lane, log_path, attempt, owner)
+        unwritten = _unwritten(root, before)
+        if exit_code is not None and not unwritten and (root / lane.artifact).is_file():
             return exit_code
-    _raise_no_artifact(root, lane, log_path, exit_code, stale)
+    _raise_no_artifact(root, lane, log_path, exit_code, unwritten)
     return None  # unreachable; keeps the signature honest
 
 
@@ -404,8 +430,9 @@ def _stamps_path(root: Path) -> Path:
 
 
 def read_stamps(root: Path) -> dict:
-    """The recorded artifact stamps: {artifact path: {commit, lane, seconds}}.
-    A missing or hand-mangled file reads as no stamps at all."""
+    """The recorded artifact stamps: {artifact path: {commit, lane, seconds}},
+    plus `refused_mtime_ns` on an artifact the lane's last attempt failed to
+    write. A missing or hand-mangled file reads as no stamps at all."""
     path = _stamps_path(root)
     if not path.is_file():
         return {}
@@ -416,7 +443,7 @@ def read_stamps(root: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _stamp_entry(git: GitFacts, lane: Lane, seconds: float) -> dict:
+def _stamp_entry(git: GitFacts, lane: Lane, seconds: float, measured: str, provenance: dict) -> dict:
     """What produced this artifact: the commit reuse judges staleness against,
     plus the wall seconds the parallel scheduler starts the slowest lane on.
 
@@ -428,7 +455,44 @@ def _stamp_entry(git: GitFacts, lane: Lane, seconds: float) -> dict:
         commit = git.head_commit()
     except GitError:
         return {}
-    return {"commit": commit, "lane": lane.name, "seconds": round(seconds, 1)}
+    clean = bool(measured) and measured == _measurement_key(git.root, lane)
+    return {"commit": commit, "lane": lane.name, "seconds": round(seconds, 1),
+            "inputs": measured if clean else "", "artifacts": _artifact_digests(lane, provenance)}
+
+
+def _artifact_digests(lane: Lane, provenance: dict) -> dict:
+    digests = {lane.artifact: provenance["artifact_sha256"]}
+    if lane.results_artifact:
+        digests[lane.results_artifact] = provenance["results_artifact_sha256"]
+    return digests
+
+
+def _measurement_commit(root: Path) -> str:
+    """The current clean commit, or no proof that repository inputs are fixed."""
+    try:
+        facts = GitFacts(worktree_root(root))
+        return "" if facts.status_names() else facts.head_commit()
+    except GitError:
+        return ""
+
+
+def _measurement_key(root: Path, lane: Lane) -> str:
+    """Hash declared execution inputs without persisting environment values.
+
+    Only clean repository inputs qualify. Ignored or absent configuration is
+    covered separately because callers can supply a lane without a tracked
+    crapkit.toml. External files and services remain outside this proof.
+    """
+    commit = _measurement_commit(root)
+    if not commit:
+        return ""
+    payload = json.dumps((commit, lane, dict(os.environ)), sort_keys=True).encode("utf-8")
+    config = root / "crapkit.toml"
+    try:
+        content = config.read_bytes() if config.is_file() else b""
+    except OSError:
+        return ""
+    return hashlib.sha256(payload + content).hexdigest()
 
 
 def write_stamps(root: Path, entries: dict[str, dict]) -> None:
@@ -444,6 +508,52 @@ def write_stamps(root: Path, entries: dict[str, dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({**read_stamps(root), **fresh}, sort_keys=True, indent=1),
                     encoding="utf-8")
+
+
+def _stamp_dict(stamps: dict, artifact: str) -> dict:
+    """One artifact's entry, or {} when the file records none, or something
+    hand-mangled under that key."""
+    entry = stamps.get(artifact)
+    return entry if isinstance(entry, dict) else {}
+
+
+def _stamp_commit(entry: dict) -> str:
+    """The commit a stamp records, or "" for an entry that holds only a refusal
+    (a lane whose every attempt so far failed) or nothing usable."""
+    commit = entry.get("commit")
+    return commit if isinstance(commit, str) else ""
+
+
+def _refused_on_disk(entry: dict, path: Path) -> bool:
+    """Is the file at `path` the one the last attempt failed to write? Only
+    while its modification time still equals the one the refusal recorded: a
+    salvage combined by hand or a real run rewrites the file and moves it."""
+    refused = entry.get("refused_mtime_ns")
+    return refused is not None and refused == _mtime_ns(path)
+
+
+def refusal_stamp(root: Path, lane: Lane, error: object) -> dict[str, dict]:
+    """The stamp that records the lane's artifact as the one its last attempt
+    failed to write, keyed by artifact path like every stamp, or {} when
+    `error` carries no such refusal.
+
+    The refusal is the one `_run_attempts` raised, not a second reading of the
+    disk: the attempt already knew which file it left unwritten and what time
+    that file carried. A lane refused before it ran (the container guard) and a
+    lane that failed after rewriting its artifact (a file that does not parse,
+    one from another tree) raise something else and record nothing, which
+    keeps `--reuse-artifacts` the way through the guard and leaves reuse to
+    judge the rewritten file on its own terms. A refusal about the results
+    artifact alone records nothing either: the stamp is the coverage file's.
+
+    The previous stamp's fields ride along. Its commit is still where the file
+    on disk was built, and its duration still orders parallel starts.
+    """
+    refused = getattr(error, "refused_mtimes", {}).get(lane.artifact)
+    if refused is None:
+        return {}
+    entry = _stamp_dict(read_stamps(root), lane.artifact)
+    return {lane.artifact: {**entry, "lane": lane.name, "refused_mtime_ns": refused}}
 
 
 def _recorded_seconds(entry: object) -> float | None:
@@ -523,15 +633,15 @@ def _scope_changes(git: GitFacts, lane: Lane, scope_paths: dict, since_commit: s
 def _warn_stale_artifact(git: GitFacts, lane: Lane, scope_paths: dict | None) -> None:
     """On reuse: say when the artifact predates changes touching this lane's scopes.
     Uncommitted working-tree edits count — that is the most common way to go stale."""
-    stamp = read_stamps(git.root).get(lane.artifact)
-    if not stamp or not scope_paths:
+    commit = _stamp_commit(_stamp_dict(read_stamps(git.root), lane.artifact))
+    if not commit or not scope_paths:
         return
     try:
-        changed = _scope_changes(git, lane, scope_paths, stamp["commit"])
+        changed = _scope_changes(git, lane, scope_paths, commit)
     except GitError:
         return
     if changed:
-        print(f"crapkit: lane {lane.name!r} artifact was built at {stamp['commit'][:11]}; "
+        print(f"crapkit: lane {lane.name!r} artifact was built at {commit[:11]}; "
               f"{len(changed)} file(s) in its scopes changed since (their coverage is stale)",
               file=sys.stderr)
 
@@ -541,23 +651,63 @@ def _facts(root: Path, git: GitFacts | None) -> GitFacts:
     return git if git is not None else GitFacts(root)
 
 
-def lane_unchanged(root: Path, lane: Lane, scope_paths: dict, git: GitFacts | None = None) -> bool:
-    """True when the recorded artifact still describes this lane's scopes exactly:
-    the stamp commit reached HEAD and nothing under the scopes moved since."""
-    facts = _facts(root, git)
-    stamp = read_stamps(root).get(lane.artifact)
-    if not stamp or not (root / lane.artifact).is_file():
+def _artifact_commit(root: Path, lane: Lane) -> str:
+    """The recorded commit of an existing artifact with no pending write refusal."""
+    stamp = _stamp_dict(read_stamps(root), lane.artifact)
+    path = root / lane.artifact
+    if not path.is_file() or _refused_on_disk(stamp, path):
+        return ""
+    return _stamp_commit(stamp)
+
+
+def lane_sources_unchanged(root: Path, lane: Lane, scope_paths: dict,
+                           git: GitFacts | None = None) -> bool:
+    """Whether source edits made this artifact's line locations stale.
+
+    Tests, runner settings and environment changes require a new measurement
+    but leave source locations intact. This read-side check accepts legacy
+    commit stamps and shares Git facts across lanes; it cannot authorize reuse.
+    """
+    commit = _artifact_commit(root, lane)
+    if not commit:
         return False
+    facts = _facts(root, git)
     try:
-        if not facts.is_ancestor(stamp["commit"]):
-            return False
-        return not _scope_changes(facts, lane, scope_paths, stamp["commit"])
+        return facts.is_ancestor(commit) and not _scope_changes(facts, lane, scope_paths, commit)
     except GitError:
         return False
 
 
+def lane_unchanged(root: Path, lane: Lane) -> bool:
+    """Automatic reuse requires the same clean repository, not just source scopes.
+
+    A lane command can read tests, configuration or any other repository input.
+    Source ownership cannot prove that a changed path leaves its measurement
+    intact. Explicit artifact reuse remains a separate deliberate request.
+    """
+    stamp = _stamp_dict(read_stamps(root), lane.artifact)
+    if not stamp.get("inputs") or not _artifact_commit(root, lane):
+        return False
+    return stamp["inputs"] == _measurement_key(root, lane) and _same_artifacts(root, lane, stamp)
+
+
+def _same_artifacts(root: Path, lane: Lane, stamp: dict) -> bool:
+    expected = stamp.get("artifacts")
+    if not isinstance(expected, dict):
+        return False
+    return all(_file_digest(root / name) == expected.get(name) for name in _declared_files(lane))
+
+
+def _file_digest(path: Path) -> str:
+    try:
+        with path.open("rb") as source:
+            return hashlib.file_digest(source, "sha256").hexdigest()
+    except OSError:
+        return ""
+
+
 def _read_and_parse(lane: Lane, root: Path,
-                    artifact_path: Path) -> tuple[dict[str, list[FnCoverage]], str]:
+                    artifact_path: Path, dead_lines=None) -> tuple[dict[str, list[FnCoverage]], str]:
     """This lane's coverage, plus the sha256 of the artifact's own bytes.
 
     The reader takes the PATH, not the text: a whole-document parse needs the
@@ -566,19 +716,19 @@ def _read_and_parse(lane: Lane, root: Path,
     Streaming holds one chunk and one file's coverage instead, and hashes the
     bytes on the way past, so the recorded digest costs no second read.
 
-    An istanbul walk also yields the lines no statement ran, which diff coverage
-    used to get by reopening the artifact and decoding every member a second
-    time. They are folded into the run's union here and dropped, so no lane's
-    map has to stay alive next to the others'.
+    Both readers also yield uncovered lines. An optional collector combines
+    them for this command without keeping separate lane maps or global state.
     """
     if lane.parser == "istanbul":
         per_file, dead, digest = parse_istanbul_both_file(artifact_path, repo_root=str(root))
-        fold_dead_lines(artifact_path, dead)
-        return per_file, digest
-    if lane.parser == "coveragepy":
-        return parse_coveragepy_file(artifact_path, path_prefix=lane.path_prefix,
-                                     label=f"lane {lane.name!r}")
-    raise ToolError(f"lane {lane.name!r}: parser {lane.parser!r} not implemented yet")
+    elif lane.parser == "coveragepy":
+        per_file, dead, digest = parse_coveragepy_both_file(
+            artifact_path, path_prefix=lane.path_prefix, label=f"lane {lane.name!r}")
+    else:
+        raise ToolError(f"lane {lane.name!r}: parser {lane.parser!r} not implemented yet")
+    if dead_lines is not None:
+        dead_lines.add(artifact_path, dead)
+    return per_file, digest
 
 
 _SAMPLE_PATHS = 3
@@ -795,7 +945,7 @@ def _judge_artifact_scope(lane: Lane, coverage: dict, scope_paths: dict | None,
     print(f"crapkit: {_unmeasured_message(lane, coverage, declared)}", file=sys.stderr)
 
 
-def _results_summary(root: Path, lane: Lane) -> tuple[set[str], dict]:
+def _results_summary(root: Path, lane: Lane) -> tuple[set[str], dict, str]:
     """The lane junit's failing ids and counts, or a ToolError saying why the
     report cannot be read. The message names the report and not the lane: one
     caller, two paths out of it, and each supplies the lane itself. The re-raise
@@ -806,7 +956,9 @@ def _results_summary(root: Path, lane: Lane) -> tuple[set[str], dict]:
     results_path = root / lane.results_artifact
     if not results_path.is_file():
         raise ToolError(f"results_artifact {lane.results_artifact} is missing")
-    return suite_summary(results_path.read_text(encoding="utf-8"))
+    raw = results_path.read_bytes()
+    failed, counts = suite_summary(raw.decode("utf-8"))
+    return failed, counts, hashlib.sha256(raw).hexdigest()
 
 
 def _warn_unreadable_results(lane: Lane, reason: ToolError) -> None:
@@ -830,14 +982,15 @@ def _results_provenance(root: Path, lane: Lane, *, reuse_artifact: bool = False)
     instead lands the lane on the no-counts path verify already documents.
     """
     try:
-        failed, counts = _results_summary(root, lane)
+        failed, counts, digest = _results_summary(root, lane)
     except ToolError as reason:
         if not reuse_artifact:
             raise
         _warn_unreadable_results(lane, reason)
         return {}
     return {"failures": sorted(failed),
-            "tests_total": counts["tests"], "tests_skipped": counts["skipped"]}
+            "tests_total": counts["tests"], "tests_skipped": counts["skipped"],
+            "results_artifact_sha256": digest}
 
 
 SUITE_DROP_FRACTION = 0.1
@@ -870,40 +1023,54 @@ def suite_drops(previous: dict, current: dict, *,
     return notes
 
 
-def build_retest_command(template: str, tests: set[str]) -> str:
-    """Fill a retest template. {tests}: sorted quoted ids verbatim (pytest style).
-    {files}: unique quoted classnames — vitest's junit classname IS the test file.
-    {names}: re.escape'd alternation of test names, for -t style regex filters."""
-    import re
-
-    ordered = sorted(tests)
-    files = sorted({t.split("::", 1)[0] for t in ordered})
-    names = "|".join(re.escape(t.split("::", 1)[1]) for t in ordered if "::" in t)
-    return (template.replace("{tests}", " ".join(f'"{t}"' for t in ordered))
-                    .replace("{files}", " ".join(f'"{f}"' for f in files))
-                    .replace("{names}", names))
-
-
 def retest_lane(root: Path, lane: Lane, tests: set[str]) -> set[str]:
+    with measurement_owner(root, (lane,)) as owner:
+        return _retest_owned(root, lane, tests, owner)
+
+
+def _retest_owned(root: Path, lane: Lane, tests: set[str], owner) -> set[str]:
     """Run the lane's retest_command on just these ids; return the ones that
     PASS the rerun (the flakes). Any doubt — no artifact, a crash, a timeout —
     keeps everything failed."""
-    command = build_retest_command(lane.retest_command, tests)
+    from .logs import command_log
+
+    command, additions = _retest_template(lane.retest_command, tests)
+    kwargs = _popen_kwargs(root, lane)
+    kwargs["env"] = {**(kwargs.get("env") or os.environ), **additions}
     log_path = _lane_log_path(root, lane)
-    with open(log_path, "a", encoding="utf-8", errors="replace") as fh:
+    before = _mtime_ns(root / lane.results_artifact)
+    with command_log(log_path, max_bytes=lane.log_max_bytes, append=True) as fh:
         fh.write(f"\n--- flake retest ---\n$ {command}\n")
         fh.flush()
         try:
             code = run_bounded(command, _deadline(lane), stream=fh,
-                               no_progress=_no_progress(lane), **_popen_kwargs(root, lane))
+                               no_progress=_no_progress(lane), owner=owner, **kwargs)
         except NoProgress:
             return set()
-    if code is None:
+    if code not in (0, 1):
         return set()
-    still = _still_failed(root, lane)
-    if still is None:
+    return tests & _retested_passes(root, lane, before)
+
+
+def _retest_template(template: str, tests: set[str]) -> tuple[str, dict[str, str]]:
+    from .procs import prepare_template
+
+    ordered = sorted(tests)
+    files = sorted({test.split("::", 1)[0] for test in ordered})
+    names = "|".join(re.escape(test.split("::", 1)[1]) for test in ordered if "::" in test)
+    return prepare_template(template, {"tests": ordered, "files": files, "names": [names]})
+
+
+def _retested_passes(root: Path, lane: Lane, before: int | None) -> set[str]:
+    from .junitparse import passed_test_ids
+
+    path = root / lane.results_artifact
+    if _mtime_ns(path) == before:
         return set()
-    return set(tests) - still
+    try:
+        return passed_test_ids(path.read_text(encoding="utf-8"))
+    except (OSError, ToolError):
+        return set()
 
 
 def _still_failed(root: Path, lane: Lane) -> set[str] | None:
@@ -928,7 +1095,7 @@ class LaneOutcome(NamedTuple):
 
 
 def _run_or_reuse(root: Path, lane: Lane, git: GitFacts, scope_paths: dict | None,
-                  reuse_artifact: bool) -> tuple[int | None, float]:
+                  reuse_artifact: bool, owner=None) -> tuple[int | None, float]:
     """Reuse warns and costs nothing; a real run returns its exit code and wall seconds.
 
     The container guard belongs on this side of the branch. It names an OOM a
@@ -939,11 +1106,25 @@ def _run_or_reuse(root: Path, lane: Lane, git: GitFacts, scope_paths: dict | Non
     about what the lane was going to do.
     """
     if reuse_artifact:
+        _refuse_unwritten_artifact(root, lane)
         _warn_stale_artifact(git, lane, scope_paths)
         return None, 0.0
     _refuse_container_python(lane)
     started = time.monotonic()
-    return _run_attempts(root, lane), time.monotonic() - started
+    return _run_attempts(root, lane, owner), time.monotonic() - started
+
+
+def _refuse_unwritten_artifact(root: Path, lane: Lane) -> None:
+    """On reuse: the refusal the failed attempt raised, again, while the file
+    on disk is still the one that attempt left. Reuse read that file back and
+    scored it, so a dead lane's old numbers became the trusted baseline. A file
+    that is gone falls through to `_artifact_path`, whose sentence is the one
+    the recover skill triages on."""
+    path = root / lane.artifact
+    stamp = _stamp_dict(read_stamps(root), lane.artifact)
+    if path.is_file() and _refused_on_disk(stamp, path):
+        _raise_no_artifact(root, lane, _lane_log_path(root, lane), None,
+                           {lane.artifact: stamp["refused_mtime_ns"]}, reuse=True)
 
 
 def _artifact_path(root: Path, lane: Lane) -> Path:
@@ -952,7 +1133,7 @@ def _artifact_path(root: Path, lane: Lane) -> Path:
     Reuse is what reaches here — the run path refuses inside _run_attempts — and
     it was the one lane refusal that named no log, on the reading that a reused
     artifact had no run behind it. The previous run's log is usually sitting
-    there with the story, and a reader told to look for `full log:` on every
+    there with the story, and a reader told to look for `lane log:` on every
     refusal has nowhere to go when one omits it.
     """
     path = root / lane.artifact
@@ -962,10 +1143,18 @@ def _artifact_path(root: Path, lane: Lane) -> Path:
 
 
 def run_lane(root: Path, lane: Lane, *, reuse_artifact: bool = False,
-             scope_paths: dict | None = None, git: GitFacts | None = None) -> LaneOutcome:
+             scope_paths: dict | None = None, git: GitFacts | None = None,
+             dead_lines=None, owner=None) -> LaneOutcome:
+    ownership = nullcontext(owner) if owner is not None else measurement_owner(root, (lane,))
+    with ownership as held:
+        return _run_owned_lane(root, lane, reuse_artifact, scope_paths, git, dead_lines, held)
+
+
+def _run_owned_lane(root, lane, reuse_artifact, scope_paths, git, dead_lines, owner) -> LaneOutcome:
     facts = _facts(root, git)
-    exit_code, seconds = _run_or_reuse(root, lane, facts, scope_paths, reuse_artifact)
-    coverage, digest = _read_and_parse(lane, root, _artifact_path(root, lane))
+    measured = "" if reuse_artifact else _measurement_key(root, lane)
+    exit_code, seconds = _run_or_reuse(root, lane, facts, scope_paths, reuse_artifact, owner)
+    coverage, digest = _read_and_parse(lane, root, _artifact_path(root, lane), dead_lines)
     _judge_artifact_scope(lane, coverage, scope_paths, root)
     provenance = {
         "artifact_sha256": digest,
@@ -975,5 +1164,23 @@ def run_lane(root: Path, lane: Lane, *, reuse_artifact: bool = False,
     }
     if lane.results_artifact:
         provenance.update(_results_provenance(root, lane, reuse_artifact=reuse_artifact))
-    stamp = {} if reuse_artifact else _stamp_entry(facts, lane, seconds)
+    stamp = {} if reuse_artifact else _stamp_entry(facts, lane, seconds, measured, provenance)
     return LaneOutcome(coverage, provenance, stamp)
+
+
+def _output_lock(path: Path) -> Path:
+    """Coordinate local outputs outside directories their runners may replace."""
+    key = os.path.normcase(str(path.resolve())).encode("utf-8")
+    host = hashlib.sha256(socket.gethostname().encode("utf-8")).hexdigest()[:16]
+    directory = Path.home() / ".cache" / "crapkit" / "measurements" / host
+    return directory / ("measurement-" + hashlib.sha256(key).hexdigest() + ".lock")
+
+
+def measurement_owner(root: Path, lanes):
+    """Own resolved outputs, plus this checkout's shared log and stamp state."""
+    if not lanes:
+        return nullcontext(None)
+    outputs = {root / name for lane in lanes for name in _declared_files(lane)}
+    paths = {_output_lock(path) for path in outputs}
+    paths.add(root / ".crapkit" / "measurement.lock")
+    return own_processes(sorted(paths))

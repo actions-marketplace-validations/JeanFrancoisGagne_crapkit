@@ -1,5 +1,872 @@
 # Changelog
 
+## 0.7.6 — 2026-09-20
+
+### A function on a shared line is told to split it, not to add tests
+
+- 0.7.5 scores every function on a source line span it shares with another as
+  uncovered, and still labelled the ones over their ceiling `add-tests`. No test can
+  lower that score, because coverage cannot say whose is whose on such a span, so the
+  advice could not be followed. Those functions now carry a fourth remedy,
+  `split-lines`: put each definition on its own lines and measure again. The run after
+  the split says whether tests are still owed.
+- The rule covers a shared span no test reaches yet, since tests would only make it
+  measured and therefore uncovered, and it covers `rescore`, the commit gate and
+  `check_gate`, which derive the remedy on their own path. `decompose` still wins when
+  complexity alone is over the ceiling, and a scope no lane measures keeps its advice.
+- `split-lines` is stored at a fixed code like the other three, so a store copied
+  between machines reads the same. A store written by an older release gains the code
+  the first time this one opens it. Every MCP result schema that lists remedies lists
+  the new one, so a client that validates structured results accepts it.
+
+### Running it from a repo that is not Python
+
+- The README now shows the path a TypeScript, Go or Rust repo takes: `uvx crapkit init`
+  runs the tool from uv's own cache and adds nothing to the repo's manifest, and
+  `uv tool install crapkit` or `pipx install crapkit` puts the command on PATH for the
+  commit gate and the plugin.
+
+### The docs site has a new address
+
+- The handbook is served from https://www.jfgagne.com/crapkit/handbook.html over HTTPS.
+  The old github.io address redirects there. The README, the package metadata, the
+  registry manifest and the landing page's canonical link name the new address.
+
+### Running it from a repo that is not Python
+
+- The README now shows the path a TypeScript, Go or Rust repo takes: `uvx crapkit init`
+  runs the tool from uv's own cache and adds nothing to the repo's manifest, and
+  `uv tool install crapkit` or `pipx install crapkit` puts the command on PATH for the
+  commit gate and the plugin.
+
+### The docs site has a new address
+
+- The handbook is served from https://www.jfgagne.com/crapkit/handbook.html over HTTPS.
+  The old github.io address redirects there. The README, the package metadata, the
+  registry manifest and the landing page's canonical link name the new address.
+
+## 0.7.5 — 2026-09-15
+
+### A source line two functions share no longer ends the coverage run
+
+- Since 0.6.0 a `coverage` run refused, with exit 5, the moment it met two functions
+  declared on one line span, because an artifact overlapping that span cannot say
+  whose coverage is whose. One repository holds 591 such spans, 459 of them measured:
+  every run died on the first one it met, so that repository finished no coverage run
+  at all and its worklist, doctor and trend stayed as old as its last one.
+- Every function on such a span now scores `untested` with coverage 0, which is the
+  honest floor and never the number a neighbour's measurement carries. The run
+  continues and names on stderr how many spans it met, plus the path and line of
+  those holding a function its ceiling fails at zero coverage, which is what
+  splitting the definitions onto separate lines measures.
+- Only functions whose coverage was ambiguous change. A function of complexity 2 or
+  less cannot score above a ceiling of 6 even at zero coverage: of the 925 functions
+  on that repository's shared spans, 898 are in that class.
+
+### Release maintenance
+
+- The registry stage logs in with `gh auth token` and publishes straight after, so
+  it no longer waits on GitHub's device flow; the command echo never shows the token.
+- A readback of a surface that was just written waits up to 55 seconds before the
+  stage records it unconfirmed.
+
+## 0.7.4 — 2026-09-15
+
+A Python function lizard stopped reading inside its own signature is scored on its
+whole body, and three measurement defects are fixed. The twelve MCP tools, JSON
+schema version 1 and analysis version 10 remain compatible with 0.7.0; the only
+scores that move are those of the functions described in the first section.
+
+### A Python function whose signature runs past its first `)` is scored on its whole body
+
+- lizard 1.24.0 ended a Python function inside its own signature in three shapes: a
+  return annotation opened on the def line and closed on a later one (`-> tuple[`
+  then `]:`), a line break after a parameter default that holds brackets
+  (`bases=(),` or `skip=frozenset(),`), which is how black and ruff wrap a long
+  signature, and a backslash continuation before the return annotation (`) \`
+  then `-> ...:`). The function read as two lines at ccn 1 whatever its body held,
+  so the complexity ceiling, the commit hook, `rescore --gate` and `verify` passed
+  it. crapkit now reads these signatures to the colon that opens the body (#72).
+- After upgrading, the ccn, CRAP score, end line, nloc and cognitive score of those
+  functions rise to what their bodies hold, and one that now sits over the ceiling
+  fails the gate the next time its file changes. Measured over 45,000 Python files
+  from the standard library, installed packages and application code, about one
+  function in 400 read this way; every other function reads exactly as before,
+  apart from the functions nested in or enclosing them.
+- The long name of such a function stays as lizard spelled it, stopping at the
+  signature's first `)` (`make( cls_name , * , bases = ( )`), so its ratchet key does
+  not change.
+- A function nested inside one of them now carries its parent's name
+  (`outer.inner( a )` where it read `inner( a )`), and the parent's ccn falls by the
+  conditions lizard had charged to it from the nested body. A ratchet mark recorded
+  under the nested function's old name matches no function any more, and
+  `crapkit ratchet prune` drops it.
+- A Python file with a def no reader finishes, such as a nested def cut off at the
+  end of the file, is named on stderr and scored as zero functions, like any file
+  that could not be read, instead of scoring that def at ccn 1. The run goes on.
+- Cached analysis records refresh on upgrade, because the cache key includes
+  crapkit's version; the ratchet stamp is unchanged, so existing marks keep
+  comparing.
+
+### A launcher that dies at spawn fails its lane, not the whole command
+
+- On Windows a lane's launcher can exit with code 3221225794 (0xC0000142,
+  STATUS_DLL_INIT_FAILED) before it reads its start line, for example when the
+  scheduler that started crapkit has ended its console. The start line then hit a
+  dead pipe and `coverage` ended with a traceback. That lane now fails on its own
+  with a message that names the exit code and says the command never ran; it is
+  retried while it has retries left and the other lanes finish. `doctor` and
+  `init` probes answer as before.
+
+### doctor names a nearby test in the same language
+
+- The warning that a directory's functions are all flagged untested while a test
+  exists named the first same-named test anywhere in the repository, sorted by
+  path, so it could point at a test in another tree or another language, and a
+  file such as `docs/_mermaid_test.md` counted as a test. The example now comes, in
+  order, from the directory itself, the nearest test below it, a `tests/` mirror,
+  then a same-named test elsewhere, and at every step it has to be in the language
+  of the code crapkit scored there. A directory with no such test gets no warning.
+
+### Two runners in one repository no longer refuse each other's evidence
+
+- On Windows, `Path.resolve()` names a directory a sibling process is creating or
+  deleting in its extended-length form, or as the NTFS tombstone of a directory
+  whose last handle is still open. Test evidence retention read both as a
+  redirected `.crapkit/test-runs` and refused, so two direct runners sharing a
+  repository failed one run in four. A symlink or junction elsewhere is still
+  refused.
+
+### Release maintenance
+
+- `release.py run stage2b` checks the Pages build the way `release.py verify` does:
+  a build at a later commit on main that carries the release commit confirms the
+  release. A rerun after main moved past the tag used to record Pages as
+  unconfirmed.
+
+## 0.7.3 — 2026-09-11
+
+`verify` says what it forgives, and the release chain proves the machine before it
+publishes. Scoring, analysis version 10, the twelve MCP tools and JSON schema
+version 1 remain compatible with 0.7.0.
+
+### Three tool descriptions say more about their arguments
+
+- `check_gate` states the forms `path` takes (repo-relative with forward slashes,
+  or absolute inside the repo), that a path outside the repo or missing is a config
+  error, and that a file no scope claims judges 0. `list_claims` and `list_runs`
+  state how `repo` resolves (the server walks up to the nearest `crapkit.toml`)
+  and the two pointers a checkout answers when it was never initialised or never
+  scored. The other nine descriptions are unchanged.
+
+### A missing path is refused, not crashed
+
+- `rescore`, and so `check_gate`, refuse a file argument that does not exist with a
+  config error naming it, exit 3. A typo reached the analyzer and came back as a
+  `FileNotFoundError` traceback; through the MCP server that traceback was the
+  whole answer.
+
+### The verdict says what it forgives
+
+- A `verify OK` line now names the failures the verdict forgives because the
+  baseline carries them too. A regression verdict is about change, so an unchanged
+  failure does not fail the run; reporting nothing about it made a suite with three
+  failing tests read as clean.
+
+## 0.7.2 — 2026-09-09
+
+One unreadable file or one underflowed counter no longer ends a run. Scoring,
+analysis version 10, the twelve MCP tools and JSON schema version 1 remain
+compatible with 0.7.0. 0.7.1 was tagged and never published; it is contained
+here.
+
+### One bad file no longer ends the run
+
+- A file no reader can tokenize is scored as the zero functions it holds, named
+  on stderr, and left out of the analysis cache so the next run names it again.
+  Through 0.7.0 the first refusal raised, so one ambiguous TypeScript arrow in a
+  corpus ended `coverage`, which left the ratchet unseeded and refused every
+  commit in the repo, in every language. Refusing to read the arrow is still
+  correct; ending the run over it was not.
+- A negative derived branch count in an istanbul artifact clamps to 0 and is
+  counted and named, rather than refusing the artifact. `@vitest/coverage-v8`
+  takes an else-path as `parent - if`, and that subtraction underflows on
+  remapped output. Measured hit counts (`f` and `s`) stay strict, where a
+  negative is corruption rather than arithmetic.
+
+### Test schedule
+
+- Give each nested test run its own pytest cache, and name a mutation shard's
+  evidence by its writer rather than by the clock. Concurrent runners in one
+  repository staged and deleted `pytest-cache-files-*` under a peer's collector,
+  and `time.time_ns()` is a 15.625 ms tick on Windows before CPython 3.13, so two
+  shards recording inside one tick overwrote each other's evidence.
+
+## 0.7.1 — 2026-09-08
+
+This release fixes process cleanup and bounds retained resources while keeping
+small analysis calls on the serial path. Scoring, analysis version 10,
+the twelve MCP tools and JSON schema version 1 remain compatible with 0.7.0.
+
+### Process lifetime
+
+- Stop active MCP tool descendants on cancellation or client disconnect, and
+  keep protocol control messages responsive during a tool call. Admit one active
+  tool per connection and return a retry message for overlapping tool calls.
+- Close mutation admission on interruption before joining workers, preventing
+  another suite from starting after cancellation. Own Git checkout preparation
+  and cleanup commands as well as the mutation suites.
+- Apply command ownership to scoped tests, watch subprocesses and the shared
+  development test runner. A completed suite cannot leave a background writer
+  alive when the next suite starts.
+- Retain analysis pool capacity until the actual workers exit, including
+  caller and guardian failure paths.
+- Skip POSIX process-table scans when the kernel confirms an owned group is
+  already gone; retain descriptor-closure checks for groups that still exist.
+
+### Resource policies
+
+- Move measurement locks outside report directories so runners can delete and
+  recreate their output directories on Windows. Coordinate shared artifact paths
+  across repositories for the same user and host, independent of temporary and
+  analysis-resource directories. Retain small stable lease files as coordination
+  state. Cross-user or cross-host writers now need external serialization or
+  distinct artifacts; finish old-version measurements before upgrading.
+- Coordinate analysis pool slots across processes for the same user and host.
+  Respect CPU affinity, configured worker ceilings and the inherited memory
+  sizing hint. Contention takes available slots or falls back to serial work;
+  small and cached passes avoid the shared admission path.
+- Cap pools by runnable chunks so idle workers are not started. Send compact
+  slot descriptors during worker startup to avoid oversized bootstrap writes
+  on Windows. Size automatic spawn pools to amortize startup across useful work;
+  explicit worker requests retain their configured ceiling.
+- Add `analysis_worker_budget` and report effective resource settings through
+  `doctor --json`. The budget covers Crapkit pool workers; external test
+  runners retain their own worker controls.
+- Bound each lane log and its single rotated backup to 16 MiB by default.
+  Preserve byte progress across rotations and the newest failure output.
+  Set `log_max_bytes = 0` to keep unlimited logs.
+- Retain recognized default test-run evidence for seven days and ten recent
+  runs. Configure either limit or disable it with zero. Active runs, explicit
+  output directories and unrecognized evidence remain untouched.
+- Trim surplus retained mutation workers on reuse. Record ownership of new
+  temporary mutation checkouts and recover abandoned runs under exclusive
+  leases. Add `clean --dry-run --json` to preview cleanup and `clean --json`
+  to perform it. Older unmarked system-temp checkouts remain untouched.
+
+### Release maintenance
+
+- Keep cleanup fixtures inside the tested Python environment, accept an unset
+  `PYTHONPATH`, and disable automatic Git maintenance while building copyable
+  test repositories.
+- Redistribute pending tests when parallel workers finish early, keeping the
+  existing unit and end-to-end worker counts and complete coverage collection.
+- Require recorded passing tests, valid test counts and artifact digests before
+  publication, including when a regression verdict accepts unchanged failures.
+- Measure each installed wheel with its own revision's test runner and record
+  the runner hash. Linux CI stops and reaps descendants of historical runners
+  before retaining evidence or removing scratch checkouts.
+- Permit release preparation from clean local main that includes current
+  origin/main. Publication still requires the exact tagged commit and a fresh
+  passing full verification receipt, so fixes need no preliminary push.
+- Confirm the canonical MCP Registry server, repository and PyPI package across
+  all search pages. Refuse duplicate latest records and incomplete pagination.
+
+See [resource policies](https://github.com/JeanFrancoisGagne/crapkit/blob/v0.7.1/docs/resources.md)
+for defaults, opt-outs and platform scope.
+
+## 0.7.0 — 2026-09-07
+
+This release makes scoring, verification and concurrent work more reliable. It
+preserves literal file paths, separates same-line callbacks, requires complete
+measurement evidence, and bounds retained duplicate candidates. The CLI, MCP tool names
+and JSON schema version remain compatible with 0.6.0.
+
+### Upgrade notes
+
+- Analysis version 10 invalidates older analysis caches. Refresh coverage after
+  upgrading. If verification reports an older metric stamp, follow the
+  [ratchet upgrade and identity checks](https://github.com/JeanFrancoisGagne/crapkit/blob/v0.7.0/docs/ratchet.md#the-metric-stamp)
+  before reseeding; ambiguous legacy callback marks are preserved and refused,
+  never silently assigned to another function.
+- Ratchets, scored/inventory exports and portable baselines retain ordinary TSV.
+  Fields containing tabs or line separators, or a leading `#` path, use a versioned JSON
+  record. Consumers that parse these files directly must support the
+  [portable record format](https://github.com/JeanFrancoisGagne/crapkit/blob/v0.7.0/docs/portable-records.md).
+- Configuration now rejects duplicate scope or lane names, invalid numeric and
+  boolean values, and coverage/JUnit paths that refer to the same output file.
+  Coverage parsers refuse impossible counts and nonfinite values.
+- The MCP server still exposes twelve tools. They inspect scores and check edited
+  functions without claiming queue items or running verification. Calls can update
+  local caches and store metadata; documentation and listings now state that scope.
+
+### Scoring, identity and reports
+
+- Keep same-line callbacks distinct in stored rows, packets, exports, claims and
+  history. Separate JavaScript and TypeScript expression arrows that the upstream
+  reader merged. Anonymous callback migration requires reader proof; unproved
+  claims hold their name group until released, explicitly pruned, or the whole
+  group is healthy.
+- Bind analysis and cache identity to the source bytes, language reader and typed
+  expression mode. Reject ambiguous same-span coverage instead of borrowing a
+  sibling's coverage. Treat malformed disposable caches as misses.
+- Use one scope ownership rule throughout scoring, setup, packets and scoped
+  tests. A root scope (`paths = ["."]`) has lower precedence than deeper paths.
+- Preserve exact Git filenames and source line endings. Gate and advisory paths
+  share a fixed patch format, independent of user diff settings. GitHub Action
+  inputs preserve NUL-delimited changed paths, Markdown metacharacters and Unicode;
+  SARIF paths are URI-encoded and decoded once.
+- Make duplicate ranking deterministic across input order and hash seeds. Limit
+  positive `--top` rankings with a bounded heap and construct payloads only for
+  returned matches. On the recorded 600-clone fixture, top-1 time fell from
+  598 ms to 204 ms and peak memory from 147.7 MB to 0.87 MB. These are fixture
+  measurements, not a whole-project speed claim.
+- Read coverage contexts only for the requested file. Preserve debt age when a
+  committed mark changes value and audit overrides under the exact canonical key.
+
+### Verification and concurrent execution
+
+- Require complete, fresh JUnit evidence. Collection failures, crashed workers and
+  incomplete sessions cannot pass as successful coverage; retries need explicit
+  passing results before clearing a failure.
+- Use the final settled verdict for the process exit, JSON response, stored run and
+  trusted-baseline decision. Preserve failed-run evidence and identity witnesses
+  when pruning history, and leave concurrent new runs intact.
+- Reuse measurements only when the clean HEAD, configuration, environment and
+  coverage/JUnit bytes match. Keep command outputs owned until the process tree
+  has stopped and parsing has finished.
+- Own command descendants with process groups on POSIX and Job Objects on Windows.
+  Retain ownership through completion, timeout and caller termination. Untimed
+  commands remain untimed, and launch errors retain their original meaning.
+  Wait for Windows process completion before releasing output locks; a zero Job
+  accounting count can arrive before the processes finish exiting.
+- Give mutation workers one captured source, test and configuration snapshot,
+  including dirty files and deletions. Refuse linked source files before writing,
+  isolate worker copies, and preserve active workers during cleanup. Generate
+  mutants from executable tokens rather than words inside names or comments.
+- Reserve queue items atomically and preserve state across concurrent ratchet
+  writers. Current stores open without repeating migration writes.
+- Format packet and retry commands for their host shell while preserving literal
+  arguments. Emit MCP text as UTF-8. Report failed doctor probes as failures,
+  without substituting the current interpreter's version.
+
+### Development, CI and release maintenance
+
+- Share one test runner across development, coverage and CI: four unit workers and
+  eight E2E workers, with explicit serial reproduction controls. Reuse pristine
+  fixture seeds through private copies and remove a duplicate hosted source suite.
+- Require fresh JUnit artifacts and preserve logs and verdicts on failure. Compare
+  separately installed base and candidate wheels, validate their source provenance,
+  and retain historical baseline failures without excusing candidate regressions.
+- Gate CI changes against the event base and isolate each composite Action run.
+  Establish cleanup fixture readiness before measuring its deadline, while
+  keeping separate tests for startup and whole-call deadlines.
+  Release ownership test fixtures explicitly so slow competitor startup cannot
+  turn correct lock acquisition into a test failure.
+- Bind release publication to a clean tagged HEAD and a passing verification ledger
+  row. Build wheel and source archives once, record their hashes, publish only
+  missing matching artifacts, and confirm PyPI, GitHub and Pages through readback.
+  Regenerate supported-version guidance before release coverage and check it on
+  the tagged tree.
+- Document marketplace installation and upgrades for Claude Code and Codex,
+  including checks against the CLI used by each installed plugin.
+- Remove unused discovery code and production copies of reference algorithms.
+  CLI helpers live with their owning command families; `crapkit.cli.main` remains
+  the public entry point.
+- Refresh installation and upgrade guidance, command lifecycle documentation,
+  contributor workflows, security details and website navigation.
+
+The [implementation report](https://github.com/JeanFrancoisGagne/crapkit/blob/v0.7.0/docs/architecture/2026-09-07-implementation/REPORT.md)
+contains the architecture findings, measured costs and gains, test results and
+retained evidence.
+
+## 0.6.0 — 2026-09-05
+
+### The MCP tools follow one naming pattern, carry titles and output schemas, and two read tools join
+
+Every tool is renamed to `verb_noun`, where the verb says what a call returns: `get_` one
+item, `list_` a ranking or a set, `check_` a verdict. An MCP client that pinned a 0.5.x
+tool name has to be updated; the CLI subcommands do not move.
+
+| 0.5.x | 0.6.0 |
+| --- | --- |
+| `next_item` | `get_next_item` |
+| `worklist` | `list_worklist` |
+| `runs` | `list_runs` |
+| `brief` | `get_function_brief` |
+| `explain` | `get_function_history` |
+| `doctor` | `check_config` |
+| `coupling` | `list_coupled_files` |
+| `duplication` | `list_duplicate_functions` |
+| `ratchet_report` | `get_ratchet_report` |
+| `gate` | `check_gate` |
+
+Two read tools are new: `get_trend` (per-run totals for every trusted run, the CLI's
+`trend --json`) and `list_claims` (the open claims sessions hold on queue items, the CLI's
+`claims list --json`). No tool writes: `crapkit claims release` stays a CLI command.
+
+Every tool now serves a `title` and an `outputSchema` whose fields are described one by
+one, so a client reads the result shape from the definition instead of guessing it from
+prose. The descriptions are rewritten to say what a tool returns, when to call it and which
+sibling to call instead, what a call reads and costs, and what each argument means beyond
+its type. The annotations gain `destructiveHint: false` beside `readOnlyHint`,
+`idempotentHint` and `openWorldHint`, and the server's `instructions` name the four tools a
+session starts with.
+
+Contract tests pin the pattern: every name is `verb_noun` on one of the three verbs, every
+title is longer than its name, every documented output field appears in the served schema,
+every description names a sibling and stays under 560 characters.
+
+### Upgrading from 0.5.x
+
+MCP clients that call tools by name (Claude Code's `mcp__...` tool ids included) apply the
+table above. Argument names, types and result payloads are unchanged, so a renamed call
+returns what the old one did. `crapkit mcp` still serves on stdio and the plugin's
+`.mcp.json` needs no edit.
+
+## 0.5.1 — 2026-09-05
+
+### `verify` counts the standing debt no mark covers
+
+The gate judges touched functions only and the ratchet check compares marks only, so an
+over-ceiling function that carries no mark is guarded by nothing: coverage loss on it
+passes a green verify. `verify` now prints `warning: N function(s) over the ceiling carry
+no ratchet mark, so a rise on them (coverage loss included) passes unseen; record them
+with `crapkit ratchet seed`` on stderr and carries the count as `unmarked_over_target` in
+`--json`. No exit code changes. Silent at zero: a header-only marks file is the correct
+state of a repo with no debt, and crapkit's own is one. Whether an empty marks file means
+"no debt" or "seed never ran" is now one line on every run.
+
+### README answers the two questions every evaluator asks first
+
+Why the ceiling is 6 and not crap4j's conventional 30, and how a repo with existing debt
+adopts crapkit without raising it: `ratchet seed` marks today's over-ceiling functions,
+the gate then judges only the functions a change touches, and marks may only fall.
+[docs/comparison.md](docs/comparison.md) gains crap4py beside radon, xenon, wily and
+SonarQube.
+
+### The registry manifest names its repository and website
+
+`server.json` declares `repository` (GitHub) and `websiteUrl`, so the MCP Registry entry
+and every aggregator that reads it can link back to the source instead of showing no
+repository and an unknown license. Pinned by a contract test. The registry refuses a
+republish of an existing version, so the fields reach it with this release.
+
+## 0.5.0 — 2026-09-03
+
+The seventeen repairs from the seven-seat review of 0.4.15 (spec: docs/specs/2026-09-03-release-0.5.0.md, issue #58). Subsections land per slice below.
+
+### The Action says why the base run was not made, and `gate: "true"` fails a pull request that judged nothing
+
+On `actions/checkout`'s default depth-1 clone the Action's base step made no run, `verify`
+judged the checkout against its own run (an empty diff), the comment said `verify passed`,
+and `gate: "true"` exited 0 on a pull request that exits 6 at full depth. The base step now
+writes the reason to `crapkit-base.reason` on every failure path: `shallow clone does not
+hold the fork point of <sha>; set fetch-depth: 0 on the checkout`, `no usable crapkit.toml
+at the fork point <sha>: ...`, or `lane failed at the fork point <sha>: ...` with the lane's
+first error line. The comment renders `**verify judged no changed function:** the base run
+was not made (<reason>)` in place of `verify passed`, with `no base commit` as the reason on
+a `push` event and under `delta: "false"`. With `gate: "true"` the exit step exits 1 when the
+base run was attempted on a pull request and not made, printing the reason; a `push` and
+`delta: "false"` never attempt it and keep `verify`'s own code. The renderer stays git-free:
+the sha and the reason reach `tools/action/comment.py` as `--base-sha` and `--base-reason`
+files. Moved contracts: the README's `gate` and `delta` input rows, and the "What the
+verdict line covers" passage that said none of the three failures fails the job.
+
+### The Action does not ask verify for a verdict over a failed coverage
+
+The verdict step ran `crapkit verify --json --reuse-artifacts` whatever `crapkit coverage`
+had exited. On a runner that keeps its workspace between jobs (`clean: false`), a lane that
+stopped writing its artifact was refused by `coverage` (exit 5) and then `verify` read the
+artifact that lane had left from an earlier run, passed over it, and `runs list` showed
+that run as the trusted baseline. The checkout step now records coverage's exit, the verdict
+step reads it first and does not call `verify` when it is non-zero, and the comment says
+`` **no verdict: `crapkit coverage` exited 5 (lane 'py' failed: <first line of the lane
+failure>); verify did not run.** ``, quoting the error object's message when `coverage --json`
+died before a summary, or pointing at the job log when every lane failed and nothing was
+printed. `gate: "true"` then exits with coverage's code. The renderer takes the code as
+`--coverage-exit`.
+
+### The pull-request comment names the function and the rule that failed the check
+
+On exit 6 the comment read `1 gate violation, 0 ratchet regressions, ...` over a table in
+which the pull request's own untested `route()` and an untouched ratchet-marked
+`legacy_router()` were two identical rows, and on exit 9 the ceiling and the uncovered lines
+were only in the job log. The verdict now opens with the rule the exit code stands for,
+`**verify failed, exit 6: complexity gate.**` (7 `ratchet regressions`, 8 `new test failures`,
+9 `diff-coverage ceiling 3`, the ceiling read from the receipt's `diff_uncovered_max`), then
+one bullet per finding: `` - gate: `app/calc.py:34` `route( a , b , c , d )` ccn 8, cov 0%,
+crap 72.0 -> decompose ``, `` - ratchet: `app/calc.py` `legacy_router( ... )` 72.0 -> 80.5
+(recorded -> fresh) ``, `` - new test failure: `tests/test_calc.py::test_route` ``, and the first
+twenty uncovered changed lines as `` - uncovered lines in `app/calc.py`: 35, 36, ... `` with one
+bullet per file and `- and N more uncovered changed lines` for the rest. The counts line
+closes the block unchanged. In the table, a row whose function the committed ratchet carries
+a mark for (the worklist row's `ratchet_mark`) reads `decompose (accepted debt)`, and the
+rows a finding names come first, ahead of the `top` cap. Moved contract: the README's
+rendered comment is now the byte-for-byte render of the payloads under
+`tests/fixtures/action_comment/` (a failing example), pinned by the unit suite.
+
+### The comment's scored line names the ceiling, a failed lane's first line, or the error
+
+The first line of the pull-request comment read `153 over target` with no number, while the
+scopes carried ceilings 4, 6 and 12, and a `coverage --json` that died before printing a
+summary left the comment with `wrote no run summary` and the sentence naming the fix in the
+job log. The line now reads `2 over ceiling 6` or `2 over their ceilings (6; reports 12,
+util 4)` from the summary's `ceilings`, appends `; lane 'js' failed: <first line>` for each
+entry of `lane_failures`, and, when the payload is the one-object error `--json` prints on
+a crapkit error, reads `` `crapkit coverage` exited 5: <message> ``. A 0.4.x payload without
+`ceilings` reads `over the ceiling`. The verdict line reads the same error object from
+`verify --json` (a missing baseline commit, exit 4) as `` **`crapkit verify` exited 4 and
+wrote no verdict: <message>.** `` instead of counting it as a verdict with no findings.
+Moved contract: the README's rendered comment is regenerated with the new first line.
+
+### The MCP server survives a bad call
+
+A `tools/call` with a missing positional, an undeclared key or a wrong type answers a tool result with `isError: true` in the tool's own words (`brief needs name (see inputSchema.required)`, `worklist does not take 'bogus'; accepted: repo, top, scope`, `top must be an integer (got "three")`) before any CLI spawns, and the session continues; on 0.4.15 a missing positional killed the server and every later request read end of file. `params: null` and `arguments: null` are refusals, not crashes, and a positional sent as `null` is a missing positional (`brief needs path (see inputSchema.required)`), not a spawned CLI's stderr. `tools/list` declares `required` from each tool's positionals. `ping` answers an empty result instead of `-32601`. An exception escaping the server answers a JSON-RPC `-32603` reply and the loop reads on. ADR 0001 records why the refusals are tool results and not the protocol's `-32602`.
+
+### explain and doctor answer JSON over MCP
+
+Both tools shell to their `--json` form, so all nine tools return one shape and carry `structuredContent` whenever the CLI exits 0. `explain` takes `history` and `tests` (booleans; true adds `commits` and `tests` to each function, the CLI's `--history` and `--tests`). A `doctor` that finds a FAIL exits 1 and answers its JSON text with `isError: true` and no `structuredContent`. Moved contracts: the two MCP e2e asserts that read `no problems found` from the doctor tool now read `problems: []`; the two "plain text" rows leave the MCP tables in docs/agent-json.md and AGENTS.md, and the agents guide's `initialize reports protocol 2024-11-05` line, stale since 0.4.13, names the negotiated revisions.
+
+### worklist and next_item take a scope over MCP
+
+Both tools accept `scope`, an array of declared scope names, one `--scope` each, so a large repository is partitioned before `top` applies; the CLI's answer to the flags comes back as the tool's result.
+### `mutate` never mutates a test
+`crapkit mutate` placed mutants in every file the diff touched, tests included: on one review run 6 of 9 mutants landed in `tests/test_tax.py` and the survivor was an assertion. The diff's file list, and the files `--files` names, now pass through the corpus predicate scoring uses (scopes, excludes, the test-file cut and `max_file_bytes`) before a mutant is placed. A file outside the corpus is named on stderr as `not mutating <path>: outside the scored corpus`, `--json` lists it under `outside_corpus`, and a diff with nothing left prints `mutation: nothing to mutate; outside the scored corpus (scopes, excludes, test files, max_file_bytes): <paths>` at exit 0 without starting the suite. A scope declaring `paths = ["."]` claims nothing in scoring and now claims nothing for `mutate` either; declare the files or directories by name, as `doctor` already asks.
+### A Python row's `nesting` is a depth
+
+`nesting` on a Python function is the deepest the cognitive pass's nesting stack gets, one level per `if`, `elif`, `else`, `for`, `while`, `except` and comprehension `for`, none for `with`, `try`, `finally`, `match`, `case` or a nested `def`: a flat function of seven `if`s reads 1 and a three-deep one reads 3. Until now the column read lizard's ND extension, which counts nesting structures for Python rather than depth, so the flat function read 7 and looked seven levels deep next to the same number for a function that was. The same pass now reads which function owns a token after lizard has, so the first token of the line that leaves a Python function is no longer charged to it: an outer function whose blocks follow a nested helper keeps its own `cognitive` score and depth instead of handing the first of them to the helper, and the last function of a module no longer pays for the `if __name__ == "__main__":` or the module-level call that follows it (six of the 5,258 rows in crapkit's own tree move, by one point each); `ccn` does not move. Brace languages keep lizard's column. The analysis version moves to 9, so the first `inventory` or `coverage` after upgrading runs the analysis cache cold and re-measures the corpus once; the `nesting` row of `docs/agent-json.md` names the source per language and what opens a level. (#64)
+### verify says why it refused an override
+
+`verify --override` on a run holding a ratchet regression or a new test failure used to
+exit 6 with no line about the override at all: no OVERRIDDEN, no refusal, an empty
+`crapkit overrides`. It now prints one stderr line naming the cause and the escape,
+`override refused: 1 ratchet regression (app/m.py pick( a ) 240.0 -> 380.0) never qualifies
+for an override; raise the mark by hand and commit it`, both causes on the one line when a
+run holds both. The exit code is unchanged and `--json` stdout stays one object.
+docs/ratchet.md states the rule: a mark never rises through `verify`.
+
+### verify says what it did to the marks file, and touches it only when something moved
+
+A green run rewrote `crapkit-ratchet.tsv` on every pass, so a clean checkout ended with an
+untracked marks file holding a stamp, a header and no rows, and a repo with marks got a
+dirty file with nothing on the OK line to say why. The file is now written only when its
+text would change and never created to hold zero marks. When it is written, the OK line
+ends with `ratchet: 6 dropped, 1 tightened -> git add crapkit-ratchet.tsv`, and the JSON
+receipt carries the same counts as `ratchet_changes` (`null` when the tighten wrote nothing).
+A file written before stamping is rewritten once to gain its stamp line, and the OK line
+says `ratchet: restamped -> git add crapkit-ratchet.tsv` for that rewrite. An override that
+applied writes its grant to the same file, so its OK line ends with `ratchet: 1 mark granted
+-> git add crapkit-ratchet.tsv`; `ratchet_changes` stays `null`, the grant being listed
+under `overridden`.
+
+### A shallow clone is named when the baseline commit is missing
+
+`verify` on a depth-1 checkout said `is not an ancestor of HEAD (rebase or amend rewrote
+history)` and sent the reader after a fresh baseline when nothing was rewritten. When
+`git rev-parse --is-shallow-repository` answers true the line now reads `baseline commit
+a74260f321f is not an ancestor of HEAD in this shallow clone, which does not hold it; set
+fetch-depth: 0 on the checkout or run git fetch --unshallow`. Exit 4 and the rewrite message
+on a full clone are unchanged; the README transcript shows the new line.
+
+### The verify receipt carries the diff-coverage ceiling
+
+`verify --json` adds `diff_uncovered_max`, the configured ceiling `diff_uncovered_count` is
+judged against, `null` when the repo set none. Additive; `schema` stays 1.
+### `init` writes a scoped-test command that collects a test, and `doctor` repeats its lane probe
+A python scope whose own paths hold no test file gets the whole-suite form,
+`python -m pytest tests -q -p no:cacheprovider`, naming the repo's test directory unless
+pytest's `testpaths` already collects it, in which case the positional is omitted;
+`{files}` stays only where the tests live under the scope's paths. Before, every python
+scope got `{files}`, and on the ordinary pkg/ + tests/ layout `crapkit test-scoped pkg/x.py`
+handed pytest a source file to collect from and exited 5. An npm workspace scope with a
+test script gets `npm run test -w <dir>`, written live; a root JavaScript scope gets the
+runner's related-tests mode keyed by what package.json names (`npx vitest related --run
+{files}`, `npx jest --findRelatedTests {files}`) instead of a vitest command for every
+language, and the placeholder when nothing names a runner; one comment line above each
+entry names the form chosen. `init` also says when two workspaces name a runner and no js
+lane was written. `doctor` re-runs `init`'s first-run note for every coverage.py lane, so a
+lane whose python cannot import pytest-cov now fails doctor with the same sentence instead
+of the first `crapkit coverage`; a healthy lane prints
+`ok lane 'py': python -> <path> (pytest X, pytest-cov Y)`, with a WARN when that python is
+not the one running doctor; a lane an environment manager heads (`uv run python -m pytest
+--cov`) prints a `note` that its interpreter and pytest-cov were not probed, so a lane doctor
+did not ask never reads as one it found healthy; and a `{files}` template on a scope that
+holds no test file fails, naming the whole-suite form as the fix.
+
+### One exclude glob reaches the repo root and every nested copy
+A leading `**/` in an `[exclude]` glob matches zero or more directories, so `**/dist/**`
+excludes a repo-root `dist/` as well as `web/dist/`, and `src/distro/` stays in. Under
+fnmatch alone the prefix demanded a directory in front, which is why 0.4.12's "`init` and
+`doctor` agree about the root and the dot-directories" wrote the root form beside every
+nested form; that rationale is reversed here and the duplicates are gone. The default set
+gains `**/generated/**`, `**/__generated__/**` and `**/*.generated.*`, so a generated
+client is never the first `next-item`, and `crapkit init` writes the list one glob per
+line under a two-line comment instead of a 405-character line. A hand-written root form
+such as `dist/**` still matches the root and nothing below it. A committed config carrying
+only `**/dist/**`, `**/conftest.py` or `**/*.test.*` now also excludes the root copy: run
+`crapkit doctor` after upgrading and read the per-scope file counts.
+### A failed lane's old artifact is refused on reuse
+A lane that ran and did not rewrite its artifact was refused by `coverage` (exit 5) and then
+scored by the next `coverage --reuse-artifacts` and passed by `verify --reuse-artifacts`,
+which wrote the dead lane's old numbers in as the trusted baseline. The failed attempt now
+records the modification time of the file it left behind in `.crapkit/artifacts.json`, and
+reuse refuses the file while that time still matches: `lane 'py' wrote no artifact on its
+last attempt — the .crapkit/cov/py.json on disk predates it and is the previous run's, which
+--reuse-artifacts will not score`, exit 5 for `coverage` and `verify cannot conclude with
+failed lanes` for `verify`. A real run or a rewrite of the file clears it, so a coverage JSON
+combined by hand from a killed run's shards still reuses. A lane refused before it ran (the
+container guard) records nothing, and `--reuse-unchanged` reruns a lane whose last attempt
+wrote nothing instead of trusting its stamp commit. The 0.4.12 entry's "`--reuse-artifacts`
+is untouched" no longer holds; see it below.
+
+### The full-suite guard knows pytest's `testpaths`
+`python -m pytest tests --cov=app` beside `testpaths = ["tests"]` collects the whole suite,
+and the guard refused it (`positional argument 'tests' narrows a full-suite coverage run`,
+exit 3) from every command that loads the configuration, and the advisory hook stayed silent
+in that repo. The loader now takes the repository root, reads `testpaths` from the file
+pytest would pick where the lane runs (`pytest.ini` and `.pytest.ini` decide when present,
+even empty; `pyproject.toml`, `tox.ini` and `setup.cfg` when they hold a pytest section) and
+accepts the positionals when together they name every configured entry. One entry of
+several, or a positional the testpaths do not name, is refused as before, and a lane
+without a positional reads no file. `doctor`, `coverage`, `digest`, `ratchet seed` and the
+hook all load such a lane.
+### Every worklist row carries its CRAP score and coverage
+The ranking view of a CRAP scorer printed risk, ccn, the standard-only ccn, churn and the
+recency weight, and never the score; the HTML report sent its reader to `crapkit explain`
+per row. A row now reads `risk 14.0  ccn 14  crap 38.5  cov 50%  1c/1a  calc/grade.py:7
+classify( ... )`: `(N std)` and `w 0.00` leave the text, and `--json` keeps `ccn_std` and
+`weight` beside the new `crap` and `cov`, both `null` on an inventory-only run and each
+row's own where two functions share a name in one file. The header counts the active rows
+against their total, `50 of 3980 active (worklist_top 50)`, or `(--top N)` when the flag
+set the cap, and `--json` carries `active_total`, so a capped list never reads as the whole
+repo. The report page renders CRAP and Cov columns and drops the footer sentence that
+claimed no payload carried them. The demo recording is re-rendered, and the demo generator
+now folds the interpreter path `python -m crapkit` prints in its next steps back to
+`crapkit` instead of refusing the frame.
+
+### An unknown `--scope` is a configuration error
+`worklist --scope frontend` on a repo whose scopes are `api` and `web` printed `0 active,
+0 dormant` at exit 0, which a CI step reads as a clean pass, and `next-item --scope biling`
+answered `empty: true` with every reason at 0, the payload an agent reads as a finished
+scope. Both now exit 3 with `no scope named 'frontend'; declared: api, web` before the
+store is opened, the same class the loader raises for a lane naming an undeclared scope.
+
+### Worklist rows say which functions are accepted debt
+Every `worklist --json` row carries `ratchet_mark`: the committed mark's value, or `null`
+when the function carries no mark or the repo has no marks file. The mark is read under
+the function's own ratchet key, counted over the whole run, so the second of two `f( )`
+in one file reports the mark on `f( )#2` and never its twin's.
+
+### A one-commit repository ranks by complexity
+Every row on a fresh repo read `risk 0.0` with `weight 0.0` and `commits 1`, because a
+log with one timestamp has no range to weight against and the recency logistic rounded
+every commit to nothing. A commit in such a log now counts once, the same degrade an
+untimestamped log already got, so the first worklist ranks by ccn times one; the hot
+promotion is off when every file weighs the same, since a top 10% of equal weights would
+be every file. Repositories with two or more commit times are unchanged.
+
+### One ceiling rule, and a coverage summary that says what shape the run is
+
+`Config.ceiling_of(scope)` is the one spelling of "a scope's own `target`, else the repo's"
+for every command that holds a Config (`next-item`, `brief`'s packet, the hook's file ceilings,
+the coverage summary, `digest`); the pure modules (score, verify, ratchet, packet, sarif,
+worklist, store) keep taking the `(target, scope_targets)` pair. `digest` now counts each row against its
+scope's ceiling like `trend` does, so the two agree on the same run pair: on the mini fixture
+with `src` at 200 and `tangled` (crap 72) added under it, `digest` said `over target 0 -> 1`
+and `new over target: src/extra.ts tangled` while `trend --json` read `[0, 0]`; it now says
+`over ceiling 0 -> 0`. Its lines read `over ceiling A -> B` and `new over ceiling: ...`.
+The coverage summary carries the run's shape on every path: `--json` gains `kind` (`coverage`
+or `partial`), `unmeasured_scopes` and `ceilings` (`{"default": 6, "reports": 12}`) beside
+`lane_failures`, and `over_target` and `grade` are counted over the measured scopes only, so a
+`--lane web` run no longer books the other scope's no-lane functions as this run's debt
+(`by_scope` still carries them). The plain form reads `run 1 @ fae4db93108: 2 functions
+scored: 2 measured, 1 over ceiling 6, CRAP load 41.0, grade F` (zero buckets dropped, the
+ceiling labelled, or `over their ceilings (6; reports 12, util 4)`), then `-> next: crapkit
+worklist`; a partial run opens with `partial run (lane web; api unmeasured; not a baseline)`
+and ends with `-> rerun changed lanes: crapkit coverage --reuse-unchanged`, which the `--lane`
+help now names. The `report` page collects its worklist through the same shaping `worklist
+--json` prints, so its rows carry `ratchet_mark`. Moved contracts: the coverage line in
+tests/unit/test_cli_scoring_inproc.py and the docs regex in
+tests/unit/test_docs_claims_contract.py; `new over target` in tests/e2e/test_inventory_e2e.py
+and tests/unit/test_store_prune.py; `build_digest` takes `ceiling_of` (tests/unit/test_digest.py,
+tests/unit/test_narrow_reads.py); every pasted summary line in README.md, docs/lanes.md and
+docs/ratchet.md.
+
+### `--json` prints one error object when a command dies
+
+A crapkit error escaping a command under `--json` used to leave stdout empty: `coverage
+--json` with pytest-cov missing exited 5 with 0 bytes, so the Action's comment read "wrote no
+run summary" while the sentence naming the fix stayed in the job log. stdout now carries
+`{"error": {"exit": 5, "kind": "tool", "message": "every lane failed (2 of 2); the errors are
+above"}, "schema": 1}`, with `kind` one of `state` (exit 1), `config` (3), `git` (4) or `tool`
+(5); the stderr line and the exit code are unchanged, and without `--json` stdout stays
+empty. docs/agent-json.md gains an Errors section.
+
+### `rescore --gate` carries its verdict, and a tenth MCP tool hands it to agents
+
+`rescore --gate --json` adds a `gate` block: `ok`, `judged` (the functions the working tree
+changed since HEAD, untracked files in full), `ceilings` per rescored file, `breaches` (path,
+function, start, ccn, cov, crap, remedy, key_name, ceiling) and `untracked`; exit 6 on a
+breach is unchanged. The text form prints `gate: 2 changed function(s) judged, 0 over ceiling
+6` when the gate passes, so the exit code is no longer the only signal. A tenth MCP tool,
+`gate`, maps `path` to `rescore PATH --gate --json` with the same read-only annotations; a
+breach comes back as a result with `gate.ok` false and `structuredContent`, while exits 3, 4
+and 5 stay tool errors. The server's instructions, AGENTS.md, both MCP tables and the registry
+manifest (`server.json`) count ten tools.
+
+### stdin is read as UTF-8 on Windows, so a non-ASCII path reaches the hook and the MCP server
+
+On Windows a piped stdin arrived in the locale code page while Claude Code and MCP clients
+write UTF-8, so the PostToolUse advisory for a ccn-8 edit in `pkg/café.py` exited 0 with no
+output, and `brief` over MCP answered `no function named 'f' in pkg/cafÃ©.py ... it holds:
+nothing`. crapkit now reconfigures a non-tty stdin to UTF-8 with replacement, the same rule
+stdout and stderr already had; a tty keeps its native encoding. Under
+`PYTHONIOENCODING=cp1252` the same payload now exits 2 with the advisory naming
+`pkg/café.py`, and the MCP call answers the function.
+
+### A configuration or marks file saved with a BOM reads as the same file; a UTF-16 one names the fix
+
+PowerShell 5.1's `Out-File -Encoding utf8` writes a byte-order mark, which tomllib read as
+`crapkit.toml does not parse: Invalid statement (at line 1, column 1)` and the marks reader
+as `line 1 has 1 fields, expected 3` behind a `carries no metric stamp` warning; a bare
+`Out-File` writes UTF-16, which died as a raw UnicodeDecodeError traceback at exit 1. One
+reader, `crapkit.repotext`, now decodes crapkit.toml, the marks file and a portable baseline
+with `utf-8-sig`, and a decode error is a configuration error, exit 3: `crapkit.toml is not
+UTF-8 (first bytes ff fe = UTF-16, the PowerShell 5.1 Out-File default); save it as UTF-8`,
+or `(byte e9 at offset 15)` when the mark is not the cause. Every configuration read
+(`watch`, `doctor`'s raw pass and the advisory hook included), `ratchet seed`, `prune`,
+`move`, `merge` (the git merge driver, which refused a BOM side as `ours is [unstamped]` and
+died on a UTF-16 one), `explain`, `brief`, `rescore --gate`, `verify`'s stamp guard, its
+marks compare, the marks read behind `--override` and `--baseline-tsv` go through it; no
+second copy of the decode exists. `verify` and `ratchet merge` write a marks file they
+rewrite without the mark.
+
+### `doctor` warns on a hook file git cannot spawn
+
+A pre-commit hook written with `Out-File` starts with a byte-order mark, git answers every
+commit with `cannot spawn .git/hooks/pre-commit` and lets it through ungated, and `doctor`
+passed the file. It now reads the hook git would run (`git rev-parse --git-path
+hooks/pre-commit`, so `core.hooksPath` and a linked worktree are honored) and WARNs
+`.git/hooks/pre-commit starts with a UTF-8 byte-order mark (ef bb bf), which git cannot
+spawn; rewrite it as ASCII (PowerShell: Set-Content -Encoding ascii)`, naming `a UTF-16
+byte-order mark (ff fe, the PowerShell 5.1 Out-File default)` for the other. The README's
+Route 1 gains the PowerShell form, `Set-Content -Encoding ascii` with the interpreter quoted
+and forward-slashed.
+
+### The lines a shell captures are ASCII
+
+`$x = crapkit worklist` under code page 437 captured `ΓÇö` where the header's em dash was.
+The six one-liners a script reads back now use ` - `: the worklist header (`... churn 12mo)
+- 1 of 3 active (worklist_top 50), 0 dormant`), `init`'s next step (`... own files: py -
+next: run ...`), the `ratchet seed` and `prune` line (`... added 1, tightened 0 - 1 mark(s)
+vs run 1 ...`), the `watch` banner (`watching 12 tracked files every 2.0s - ctrl-c to stop`),
+with the coverage summary and the verify OK line ASCII already. The same move on the four
+lines the earlier slices handed over: doctor's `cannot import pytest_cov - run ...` note, the
+`(rebase or amend rewrote history) - run ...` refusal, the MCP `no crapkit.toml in <dir> -
+nothing measured here.` result and the CLI's `no crapkit.toml at <dir> - nothing to analyze`
+(the Action's base step quotes that line verbatim and needs no change). `trend`'s text line
+says `N over ceiling` like `digest`. Moved contracts: the worklist header suffix in
+tests/e2e/test_two_view_queue_e2e.py, the watch banner in tests/unit/test_watch_shell.py,
+`over target` in tests/e2e/test_cli_report_gaps.py and the AGENTS.md `below_floor` row it
+pins, and every README, AGENTS.md, docs/lanes.md, docs/ratchet.md, docs/agent-json.md and
+plugin skill transcript that pastes one of those lines (docs/demo.svg is re-rendered at
+release).
+
+### Configuration is found upward, the way git finds `.git`
+
+Every command read `crapkit.toml` from the working directory only, so from a monorepo
+workspace `crapkit worklist` exited 3 with `no crapkit.toml at .../mono/web` while the root
+configuration one level up claimed `web/`, and `crapkit init` there wrote a second
+configuration claiming the same files. Without `--repo`, every command, `crapkit mcp` and
+each MCP tool's `repo` argument now walk up from the working directory to the nearest
+`crapkit.toml`, the way the advisory hook always did (ADR 0002); a `.git` entry without one
+stops the walk, so a linked worktree or a nested repository never borrows a parent's
+configuration or store. When the root found is not the working directory one stderr line
+says `crapkit: using crapkit.toml at /repo`, and a relative path argument to `brief`,
+`explain`, `rescore`, `test-scoped` or `mutate --files` is read from where you stand, so
+`crapkit brief src/grade.ts classify` typed in `web/` names `web/src/grade.ts`; a path that
+climbs out of the root is refused with `is outside the repo at /repo`. A given `--repo` names
+an exact root and walks nowhere, on `mcp` as on every other subcommand, and reads a relative
+path argument against that root as before; the flag now defaults to nothing rather than `.`.
+The MCP server runs each tool's command at the root it found, so a tool's repo-relative
+`path` holds from a server a global client started in a workspace, and a `repo` argument
+naming no directory gets the no-config answer instead of an ancestor's data. `init` writes
+where you stand and exits 3 with `crapkit.toml at /repo already claims web (scope 'web');
+edit that configuration instead` when an ancestor's scope path claims the directory, and
+writes no nested `.gitignore` line when a `.gitignore` above already ignores `.crapkit/`; a
+nested repository, whose top git consults nothing above, still gets its own line. A stray
+`crapkit.toml` in a non-git ancestor, such as a home directory, is adopted with that stderr
+line as the only warning. Moved contracts: `--repo`'s default of
+`.` (tests/unit/test_report_command.py), the lanes page's "no monorepo mode" sentence, the
+README's two `--repo` default lines, the agents page's server line and AGENTS.md's default.
+(#69)
+
+### Upgrading from 0.4.x
+
+- **Run `crapkit doctor` first.** Three defaults changed under committed configs, and doctor
+  names each one where it applies: an `[exclude]` glob with a leading `**/` now also matches the
+  repo-root copy (`**/dist/**` excludes `dist/` too), so read the per-scope file counts; a
+  coverage.py lane whose python cannot import pytest-cov now fails doctor instead of the first
+  `crapkit coverage`; and a `{files}` scoped-test template on a scope that holds no test file
+  fails, naming the whole-suite form as the fix.
+- **The first `inventory` or `coverage` runs the analysis cache cold.** The analysis version is 9:
+  a Python function's `nesting` is now a depth (a flat chain of seven `if`s reads 1, not 7), and
+  the cognitive pass no longer charges the first token after a nested helper to that helper. `ccn`
+  does not move, so no ratchet mark moves; six of crapkit's own 5,258 rows shift `cognitive` by one.
+- **`worklist` text rows changed shape.** `(N std)` and `w 0.00` left the line; `crap` and `cov` joined
+  it, and the header reads `50 of 3980 active (worklist_top 50)`. A script that parsed the text
+  should read `worklist --json`, which keeps `ccn_std` and `weight` and adds `crap`, `cov`,
+  `ratchet_mark` and `active_total` (schema stays 1).
+- **The coverage summary line changed shape.** It reads `run 1 @ <sha>: N functions scored:
+  N measured, 1 over ceiling 6, CRAP load 41.0, grade F`, drops zero buckets, and a partial run
+  opens with `partial run (...)`; `over_target` and `grade` on a partial run count the measured
+  scopes only. `digest` says `over ceiling`, and so does `trend`.
+- **Under `--json`, a command that dies prints one error object on stdout** (`{"error": {"exit",
+  "kind", "message"}, "schema": 1}`) instead of nothing; stderr and the exit code are unchanged.
+  Over MCP the same object is the tool's `isError` text for the `--json` tools.
+- **An unknown `--scope` exits 3** (`no scope named 'x'; declared: api, web`) where it printed an
+  empty list at exit 0.
+- **`--reuse-artifacts` refuses the artifact of a lane whose last attempt wrote nothing** (exit 5
+  for `coverage`, `cannot conclude` for `verify`). A real run or a rewrite of the file clears it.
+- **A lane positional that names pytest's `testpaths` now loads.** `python -m pytest tests --cov`
+  beside `testpaths = ["tests"]` was refused at exit 3 from every command; it is accepted when the
+  positionals together name every configured entry. `init` omits the positional in that case.
+- **`mutate` never places a mutant in a test file**, and a scope declaring `paths = ["."]` selects
+  no file for `mutate`, as it already selected none for scoring: declare the files by name.
+- **The Action fails a pull request it could not judge.** With `gate: "true"`, a base run that was
+  attempted and not made (a depth-1 checkout, no `crapkit.toml` at the fork point, a lane failing
+  there) exits 1 and the comment says why; set `fetch-depth: 0` on `actions/checkout`. A failed
+  `coverage` now skips `verify` and exits with coverage's code. The comment's verdict names the
+  rule and lists one bullet per finding.
+- **`verify` touches `crapkit-ratchet.tsv` only when something moved**, never creates it empty, and
+  its OK line says what it wrote (`ratchet: 6 dropped, 1 tightened -> git add crapkit-ratchet.tsv`).
+  A refused `--override` now prints one stderr line naming the cause.
+- **A one-commit repository ranks by complexity** instead of reading `risk 0.0` on every row.
+- **The MCP server has ten tools.** `gate` maps a path to `rescore PATH --gate --json`; `explain`
+  and `doctor` answer JSON; `worklist` and `next_item` take `scope`; a bad call answers `isError`
+  instead of ending the session.
+- **Windows reads and prints plainly.** stdin is read as UTF-8 even when it is a pipe, so the hook
+  and the MCP server no longer see mojibake; a `crapkit.toml` or marks file saved as UTF-16 (the
+  PowerShell 5.1 `Out-File` default) exits 3 with `crapkit.toml is not UTF-8 (first bytes ff fe =
+  UTF-16 ...); save it as UTF-8` where it was a traceback, and a UTF-8 BOM on either file is
+  tolerated; `doctor` WARNs on a pre-commit hook that starts with a BOM, which git cannot spawn.
+  The six shell-captured one-liners (the worklist header, the ratchet seed line, the coverage
+  `next` line, the watch line and two more) use ` - ` where they used an em dash, so a script
+  matching them by that character must change; `trend` and `brief` text say `over ceiling`.
+- **Every command finds `crapkit.toml` by walking up.** `--repo` now defaults to the walk instead of
+  `.`: a command run below a root uses the nearest configuration above it and prints
+  `crapkit: using crapkit.toml at <root>` on stderr (stdout is untouched, `--json` stays one
+  object); a `.git` entry holding no configuration stops the walk, so a linked worktree or a nested
+  repository never borrows a parent's store; an explicit `--repo` names an exact root and walks
+  nowhere, so the Action and every script that passes it are unchanged. When the walk found the
+  root, a relative path argument names the file where the user stands, and one climbing out of
+  the root exits 3; under an explicit `--repo` the argument stays root-relative as before. `init` exits 3 under a directory an ancestor configuration already claims through a
+  scope path, and skips its `.gitignore` append when an ancestor `.gitignore` up to the repository
+  top already ignores `.crapkit/`. A stray `crapkit.toml` in a non-git ancestor, a home directory
+  say, is adopted with that stderr line as the only warning (ADR 0002). Run `crapkit doctor` from
+  the directory you work in and read the root it names.
+
 ## 0.4.15 — 2026-09-02
 
 ### The registry name follows GitHub's casing
@@ -61,7 +928,8 @@ artifact at .crapkit/cov/py.json, and the .crapkit/cov/junit.xml on disk is the 
 run's`. `results_artifact` is held to
 the same rule, so a killed suite's junit cannot feed the test-count and no-new-failures
 checks last run's numbers. The check is the mtime and not the bytes, so a runner that
-rewrites an identical report stays green, and `--reuse-artifacts` is untouched.
+rewrites an identical report stays green. `--reuse-artifacts` was left untouched by this
+release; 0.5.0 makes it refuse the same leftover.
 
 ### `mutate` refuses to score a suite that never ran
 `crapkit mutate` read any nonzero exit from `mutation_command` as a killed mutant, so a

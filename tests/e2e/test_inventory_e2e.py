@@ -6,9 +6,11 @@ git repo per test, so the tree is committed (reviewable, stable) while each test
 still gets an isolated repository.
 """
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
 
@@ -25,11 +27,66 @@ def cache_entries(repo: Path) -> set[str]:
 
 @pytest.fixture()
 def mini_repo(tmp_path: Path) -> Path:
+    seed = tmp_path.parent / "inventory-seed"
+    if not seed.exists():
+        seed.parent.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(dir=seed.parent) as directory:
+            prepared = Path(directory)
+            shutil.copytree(FIXTURES / "mini_repo", prepared, dirs_exist_ok=True)
+            git_init_repo(prepared)
+            git_commit_all(prepared, "init")
+            prepared.rename(seed)
     repo = tmp_path / "mini"
-    shutil.copytree(FIXTURES / "mini_repo", repo)
-    git_init_repo(repo)
-    git_commit_all(repo, "init")
+    shutil.copytree(seed, repo)
     return repo
+
+
+def test_mini_fixture_reuses_pristine_input_without_sharing_git_or_measurements(tmp_path, monkeypatch):
+    initializations = []
+    original = git_init_repo
+
+    def initialize(repo):
+        initializations.append(repo)
+        return original(repo)
+
+    monkeypatch.setitem(globals(), "git_init_repo", initialize)
+    first = mini_repo.__wrapped__(tmp_path / "one")
+    second = mini_repo.__wrapped__(tmp_path / "two")
+    source = (second / "src/app.ts").read_bytes()
+    index = (second / ".git/index").read_bytes()
+    head = (second / ".git/refs/heads/main").read_bytes()
+    (first / "src/app.ts").write_text("export const privateValue = 42;\n")
+    git_commit_all(first, "private source change")
+    assert run_cli(first, "inventory", "--json").returncode == 0
+    assert (second / "src/app.ts").read_bytes() == source
+    assert (second / ".git/index").read_bytes() == index
+    assert (second / ".git/refs/heads/main").read_bytes() == head
+    result = run_cli(second, "inventory", "--json")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["cache_hits"] == 0
+    assert json.loads(result.stdout)["functions"] == 4
+    assert len(initializations) == 1, "commit the pristine shared input only once"
+
+
+def test_mini_fixture_retries_setup_after_an_interrupted_git_initialization(tmp_path, monkeypatch):
+    initializations = []
+    original = git_init_repo
+
+    def interrupted(repo):
+        initializations.append(repo)
+        original(repo)
+        if len(initializations) == 1:
+            raise RuntimeError("interrupted fixture initialization")
+
+    monkeypatch.setitem(globals(), "git_init_repo", interrupted)
+    with pytest.raises(RuntimeError, match="interrupted fixture initialization"):
+        mini_repo.__wrapped__(tmp_path / "first")
+    root = mini_repo.__wrapped__(tmp_path / "retry")
+    result = run_cli(root, "inventory", "--json")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["functions"] == 4
+    mini_repo.__wrapped__(tmp_path / "warm")
+    assert len(initializations) == 2
 
 
 def test_inventory_end_to_end_deterministic_and_cached(mini_repo: Path):
@@ -127,7 +184,10 @@ def test_coverage_single_lane_flags_other_scope_no_lane(mini_repo: Path):
     assert res.returncode == 0, res.stderr
     s = json.loads(res.stdout)
     assert s["measured"] == 1 and s["untested"] == 2 and s["no_lane"] == 1, s
-    assert s["over_target"] == 1, "guarded: cc5 at cov 0 in a no-lane scope scores 30"
+    # guarded: cc5 at cov 0 in the skipped py scope scores 30, which is py's debt
+    # under by_scope and not this partial run's grade
+    assert s["kind"] == "partial" and s["unmeasured_scopes"] == ["py"], s
+    assert s["over_target"] == 0 and s["by_scope"]["py"]["over_target"] == 1, s
 
 
 def test_coverage_end_to_end_scores_and_flags(mini_repo: Path):
@@ -416,7 +476,7 @@ def test_digest_silent_when_unchanged_and_speaks_on_regression(mini_repo: Path):
     _stage(mini_repo, "src/extra.ts", HIGH_CC_FN)
     assert run_cli(mini_repo, "coverage", "--json", "--reuse-artifacts").returncode == 0
     loud = run_cli(mini_repo, "digest")
-    assert loud.returncode == 0 and "new over target" in loud.stdout, loud.stdout
+    assert loud.returncode == 0 and "new over ceiling" in loud.stdout, loud.stdout
     assert "tangled" in loud.stdout
 
     trend = run_cli(mini_repo, "trend", "--json")
@@ -424,6 +484,31 @@ def test_digest_silent_when_unchanged_and_speaks_on_regression(mini_repo: Path):
     runs = json.loads(trend.stdout)["runs"]
     assert len(runs) == 3
     assert runs[-1]["over_target"] == runs[0]["over_target"] + 1
+
+
+def test_digest_and_trend_agree_on_a_scope_with_its_own_ceiling(mini_repo: Path):
+    """With src's ceiling raised to 200, `tangled` (ccn 8 at cov 0, crap 72)
+    is over the repo's 6 and under its scope's own, so neither `digest` nor
+    `trend` may book it as new debt. The two used to disagree on this pair:
+    digest counted every row against the repo ceiling, trend per scope."""
+    cfg = mini_repo / "crapkit.toml"
+    cfg.write_text(cfg.read_text(encoding="utf-8").replace(
+        'name = "src"\n', 'name = "src"\ntarget = 200\n', 1), encoding="utf-8")
+    assert run_cli(mini_repo, "coverage", "--json").returncode == 0
+    _stage(mini_repo, "src/extra.ts", HIGH_CC_FN)
+    assert run_cli(mini_repo, "coverage", "--json", "--reuse-artifacts").returncode == 0
+
+    digest = run_cli(mini_repo, "digest")
+    trend = run_cli(mini_repo, "trend", "--json")
+
+    assert digest.returncode == 0 and trend.returncode == 0, (digest.stderr, trend.stderr)
+    runs = json.loads(trend.stdout)["runs"]
+    assert runs[-1]["over_target"] == runs[-2]["over_target"], runs
+    counted = re.search(r"over \w+ (\d+) -> (\d+)", digest.stdout)
+    assert counted, digest.stdout
+    assert [int(n) for n in counted.groups()] == [runs[-2]["over_target"], runs[-1]["over_target"]], \
+        f"digest: {digest.stdout!r}; trend: {[r['over_target'] for r in runs]}"
+    assert "over ceiling" in digest.stdout, digest.stdout
 
 
 def test_rerunning_verify_on_a_still_broken_tree_stays_failed(mini_repo: Path):

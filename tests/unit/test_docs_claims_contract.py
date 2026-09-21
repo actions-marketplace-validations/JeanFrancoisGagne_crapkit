@@ -14,8 +14,9 @@ from pathlib import Path
 
 import pytest
 
+from crapkit.config import Config
 from crapkit.churn import parse_git_log
-from crapkit.cli import build_parser
+from crapkit.cli.parser import build_parser
 from crapkit.scaffold import detect_lanes, gitignore_entries, live_lanes, starter_toml
 from crapkit.score import grade
 
@@ -26,9 +27,12 @@ JS_SCOPES = {"src": ("typescript",)}
 # vitest in devDependencies is what makes it "a vitest repo".
 TS_PACKAGE = json.dumps({"scripts": {"test": "vitest run"},
                          "devDependencies": {"vitest": "^2.0.0"}})
+# `N functions scored: 2 measured / 1 no-lane, 1 over ceiling 6, CRAP load 3.0, grade F`,
+# zero buckets dropped, the ceiling labelled one way or the other.
 _SUMMARY = re.compile(
-    r"(\d+) functions scored — (\d+) measured / (\d+) untested / (\d+) no-lane"
-    r" / (\d+) cc-only, (\d+) over target \d+, CRAP load [\d.]+, grade (\S+)")
+    r"(\d+) functions scored(?:: ([^,]+))?, (\d+) over (?:ceiling \d+|their ceilings \([^)]*\)),"
+    r" CRAP load [\d.]+, grade (\S+)")
+_BUCKET = re.compile(r"(\d+) (measured|untested|no-lane|cc-only)")
 
 
 @lru_cache(maxsize=None)
@@ -154,10 +158,17 @@ def test_the_python_quickstart_prints_the_gitignore_line_init_writes():
     assert f"added to .gitignore: {', '.join(entries)}" in _doc("README.md")
 
 
+# The quickstart runs init on tools/demo/fixture: calc/ beside tests/, and a
+# pyproject naming no testpaths, so the scoped-tests entry is the whole-suite
+# form naming tests/. The README block has to be that repo's, not a bare call's.
+DEMO_FILES = ("calc/__init__.py", "calc/grade.py", "calc/parse.py", "calc/report.py",
+              "pyproject.toml", "tests/test_parse.py", "tests/test_report.py")
+
+
 def test_the_python_quickstart_prints_the_config_init_writes():
     """Including the commented lane template, which is what the prose above the
     block promises init leaves behind."""
-    assert starter_toml(PY_SCOPES, _py_lanes()) in _doc("README.md")
+    assert starter_toml(PY_SCOPES, _py_lanes(), tracked=DEMO_FILES) in _doc("README.md")
 
 
 def test_the_typescript_quickstart_prints_the_gitignore_line_init_writes():
@@ -210,9 +221,10 @@ def test_the_json_pages_stop_sentence_carries_every_clause():
     assert "skipped_claimed" in paragraph and "no_lane_over_target" in paragraph
 
 
-def test_the_below_floor_move_says_an_over_target_row_is_never_stuck_there():
+def test_the_below_floor_move_says_an_over_ceiling_row_is_never_stuck_there():
     row = _table_row(_section(_doc("AGENTS.md"), "## The termination rule"), "`below_floor`")
-    assert "over target" in row, "the move cell must say why ignoring these rows is safe"
+    assert "over ceiling" in row, "the move cell must say why ignoring these rows is safe"
+    assert "over target" not in row, "ceiling is the concept; target is the config key"
 
 
 def test_the_untested_note_sends_an_agent_to_write_a_test():
@@ -239,12 +251,14 @@ def test_no_doc_still_calls_a_files_less_template_a_config_error():
     assert "whole suite" in row
 
 
-def test_a_one_timestamp_log_is_the_only_weightless_one():
-    """What the README's `risk 0.0` line actually measures. Age is not it."""
+def test_a_one_timestamp_log_counts_each_commit_once():
+    """What the README says about a one-commit repo: with no range to weight
+    against each commit counts once, so risk is ccn times one. Age is not the
+    input; position in the log is, and commits minutes apart already rank."""
     minute = 60
     same = parse_git_log(_git_log([1_787_000_000] * 3))["util/stats.py"]
     apart = parse_git_log(_git_log([1_787_000_000 + n * minute for n in (0, 12, 25)]))
-    assert same.weight == 0.0
+    assert same.weight == 3.0
     assert apart["util/stats.py"].weight > 0.5, "commits minutes apart already rank"
 
 
@@ -256,12 +270,42 @@ def _git_log(stamps: list[int]) -> str:
 @pytest.mark.parametrize("page", ["README.md", "AGENTS.md", "docs/lanes.md",
                                   "docs/ratchet.md", "docs/agent-json.md"])
 def test_every_coverage_summary_in_the_docs_adds_up(page: str):
-    """A pasted summary line is arithmetic: the four flags sum to the corpus and
-    the letter follows from the over-target share. A hand-edited number breaks one."""
-    for total, measured, untested, no_lane, cc_only, over, letter in _SUMMARY.findall(_doc(page)):
-        counted = int(measured) + int(untested) + int(no_lane) + int(cc_only)
-        assert counted == int(total), f"{page}: flags sum to {counted}, not {total}"
-        assert grade(int(over), int(total)) == letter, f"{page}: {over}/{total} is not {letter}"
+    """A pasted summary line is arithmetic: the printed buckets sum to the corpus and
+    the letter follows from the over-ceiling share of the judged functions, which on
+    a partial run leaves the unmeasured scopes' no-lane rows out. A hand-edited
+    number breaks one."""
+    lines = _doc(page).splitlines()
+    for n, line in enumerate(lines):
+        m = _SUMMARY.search(line)
+        if not m:
+            continue
+        total, buckets, over, letter = m.groups()
+        counts = {word: int(k) for k, word in _BUCKET.findall(buckets or "")}
+        assert sum(counts.values()) == int(total), f"{page}: buckets sum to {counts}, not {total}"
+        partial = n > 0 and lines[n - 1].startswith("partial run (")
+        judged = int(total) - (counts.get("no-lane", 0) if partial else 0)
+        assert grade(int(over), judged) == letter, f"{page}: {over}/{judged} is not {letter}"
+
+
+# --- the gate a reader installs from Route 1 ---------------------------------
+
+def _route_one() -> str:
+    return _section(_doc("README.md"), "### Route 1: `.git/hooks/pre-commit` (local, not committed)")
+
+
+def test_route_one_carries_a_powershell_form_that_writes_no_byte_order_mark():
+    """`Out-File` under PowerShell 5.1 writes UTF-16, git answers `cannot spawn
+    .git/hooks/pre-commit`, and the commit goes through ungated. The form the
+    page prints has to be the one that writes plain bytes, with the interpreter
+    quoted and forward-slashed so git's sh can exec it."""
+    block = _route_one()
+    powershell = block[block.index("```powershell"):]
+
+    assert "Set-Content" in powershell and "-Encoding ascii" in powershell, block
+    assert "Out-File" not in powershell, "the form that writes the mark must not be the recipe"
+    assert "-replace '\\\\', '/'" in powershell, "the interpreter path is forward-slashed"
+    assert "exec '$python' -m crapkit hook-precommit" in powershell, "quoted, as sh reads it"
+    assert "cannot spawn" in block, "the failure the form avoids is named"
 
 
 # --- the gate a reader installs from Route 2 ---------------------------------
@@ -358,7 +402,7 @@ def test_the_readme_prints_the_taint_warning_the_code_produces():
     """The subsection quotes a captured warning. Reword the message and this
     pins the doc to the new text rather than leaving a transcript nobody can
     reproduce."""
-    from crapkit.cli import _taint_note
+    from crapkit.cli.verifying import _taint_note
     from crapkit.store import BaselinePick
 
     pick = BaselinePick(run={"id": 1, "commit": "88012a148f6d0a1b2c3d4e5f60718293a4b5c6d7"},
@@ -534,7 +578,7 @@ def test_both_pages_state_next_items_ordering_rule():
 
 
 def test_the_readme_names_the_markers_the_worklist_row_prints():
-    from crapkit.cli import _row_marker
+    from crapkit.cli.queue import _row_marker
 
     assert [_row_marker(_marked(f, r)) for f, r in
             (("measured", "ok"), ("no-lane", "decompose"), ("measured", "add-tests"),
@@ -592,9 +636,8 @@ def test_est_splits_in_the_tool_matches_the_formula_both_pages_print():
 
 
 def _payload_splits(ccn: int) -> int:
-    from types import SimpleNamespace
-
-    from crapkit.cli import _next_item_payload
+    
+    from crapkit.cli.queue import _next_item_payload
     from crapkit.score import ScoredRow
     from crapkit.uncovered import MissingLines
     from crapkit.worklist import admission
@@ -602,7 +645,7 @@ def _payload_splits(ccn: int) -> int:
     row = ScoredRow("calc", "calc/grade.py", "f( )", 1, 9, ccn, ccn, ccn, 8, 0, 1,
                     0.0, "measured", float(ccn), "decompose")
     payload = _next_item_payload(row, admission({}, 5),
-                                 SimpleNamespace(target=6, scope_targets={}),
+                                 Config(target=6),
                                  MissingLines({}, "no lanes here"))
     return payload["est_splits"]
 
@@ -624,10 +667,10 @@ def test_no_page_says_committing_alone_clears_a_stale_artifact():
 def test_both_pages_type_the_mcp_exclude_argument_the_way_the_server_serves_it():
     from crapkit.mcp_server import tool_listing
 
-    (served,) = [t for t in tool_listing() if t["name"] == "next_item"]
+    (served,) = [t for t in tool_listing() if t["name"] == "get_next_item"]
     assert served["inputSchema"]["properties"]["exclude"]["type"] == "array"
     for page in ("AGENTS.md", "docs/agent-json.md"):
-        row = _table_row(_doc(page), "`next_item`")
+        row = _table_row(_doc(page), "`get_next_item`")
         assert "array of strings" in row, f"{page} still types exclude as one string"
 
 
@@ -896,6 +939,18 @@ def test_the_handbook_counts_the_no_artifact_causes_the_skill_lists():
     handbook = _doc("docs/handbook.html")
     assert f"The {word} classic causes" in handbook
     assert f"{word.capitalize()} root causes" in handbook, "the exit-5 row counts them too"
+
+
+def test_the_handbook_transcripts_use_the_ascii_separator():
+    """The handbook is hand-written, so a transcript pasted from an older build
+    brings the em dash back. These two are `init`'s next step and the worklist
+    header, two of the six lines a shell captures."""
+    handbook = _doc("docs/handbook.html")
+
+    assert "— next: run" not in handbook, "init's next step reads ` - next: run`"
+    assert ") — 4 of 4 active" not in handbook, "the worklist header reads `) - 4 of 4 active`"
+    assert " - next: run `crapkit coverage`" in handbook
+    assert ") - 4 of 4 active (worklist_top 50), 0 dormant" in handbook
 
 
 # --- the README rows an agent picks a command from ---------------------------

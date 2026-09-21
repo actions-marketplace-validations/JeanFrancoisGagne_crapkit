@@ -13,8 +13,8 @@ from ..errors import ConfigError, CrapkitError, GitError, ToolError
 from ..invocation import _self
 from ..store import SnapshotStore
 from ..uncovered import MissingLines, load_uncovered
-from ._shared import (_load_repo_config, _open_store, _print_json, _ratchet_entries,
-                      _repo_out_path)
+from ._shared import (_command_root, _load_repo_config, _open_store, _print_json, _stand,
+                      _ratchet_entries, _repo_out_path, _repo_relative)
 
 
 def _digest_pair(store):
@@ -64,7 +64,7 @@ def _send_digest_alert(root: Path, cfg, prev: dict, cur: dict, lines: list[str])
 def cmd_digest(args: argparse.Namespace) -> int:
     from ..digest import build_digest
 
-    root = Path(args.repo).resolve()
+    root = _command_root(args.repo)
     cfg = _load_repo_config(root)
     db_path = root / ".crapkit" / "crap.sqlite"
     if not db_path.is_file():
@@ -76,7 +76,8 @@ def cmd_digest(args: argparse.Namespace) -> int:
     prev, cur = pair
     # read_crap, not read_scored: build_digest names four of a ScoredRow's
     # sixteen fields, and a digest carries two whole runs at once
-    d = build_digest(store.read_crap(prev["id"]), store.read_crap(cur["id"]), target=cfg.target)
+    d = build_digest(store.read_crap(prev["id"]), store.read_crap(cur["id"]),
+                     ceiling_of=cfg.ceiling_of)
     if d.quiet:
         return 0  # an unchanged week says nothing
     for line in d.lines:
@@ -113,27 +114,20 @@ def _print_trend(as_json: bool, rows_out: list, target: int) -> None:
         return
     for r in rows_out:
         print(f"run {r['run_id']:>3} @ {r['commit'][:11]} {r['created_at']}: "
-              f"{r['over_target']} over target, load {r['crap_load']}, avg {r['avg']}")
+              f"{r['over_target']} over ceiling, load {r['crap_load']}, avg {r['avg']}")
 
 
 def _trend_payload(cfg, store: SnapshotStore) -> dict:
     """The whole series, shaped once. `trend --json` prints it and `report`
     renders it, so the page and the payload cannot describe the same run
     differently."""
-    from ..store import trusted_runs
-
-    # one GROUP BY for the whole history; this used to build every ScoredRow of
-    # every trusted run to add up three numbers per run
-    agg = store.run_totals(target=cfg.target, scope_targets=cfg.scope_targets)
-    by_scope = store.run_scope_totals(target=cfg.target, scope_targets=cfg.scope_targets)
     return {"target": cfg.target,
-            "runs": [_trend_row(run, agg.get(run["id"], (0, 0, 0.0)),
-                                by_scope.get(run["id"], {}))
-                     for run in trusted_runs(store)]}
+            "runs": [_trend_row(*parts) for parts in store.history_totals(
+                target=cfg.target, scope_targets=cfg.scope_targets)]}
 
 
 def cmd_trend(args: argparse.Namespace) -> int:
-    root = Path(args.repo).resolve()
+    root = _command_root(args.repo)
     cfg = _load_repo_config(root)
     payload = _trend_payload(cfg, _open_store(root))
     _print_trend(args.json, payload["runs"], cfg.target)
@@ -153,17 +147,12 @@ def _report_worklist(root: Path, cfg, store: SnapshotStore) -> dict:
     Reassembling it here would let the page rank one function first and the
     command another, off one run.
     """
-    from ..churn_cache import load_churn
     from ..gitio import head_commit
     from ..report import report_top
-    from ..worklist import build_worklist
-    from .queue import _pushdown_floor, _worklist_marks, _worklist_payload, _worklist_run
+    from .queue import _worklist_for, _worklist_payload, _worklist_run
 
     latest = _worklist_run(root, store)
-    rows = store.read_rows(latest["id"], min_ccn=_pushdown_floor(cfg), scopes=[])
-    wl = build_worklist(rows, load_churn(root, cfg.churn_window_months),
-                        floor=cfg.worklist_floor, top=report_top(cfg.worklist_top),
-                        marks=_worklist_marks(store, cfg, latest["id"], []))
+    wl = _worklist_for(root, cfg, store, latest, top=report_top(cfg.worklist_top), scopes=[])
     return _worklist_payload(wl, latest, cfg, latest["commit"] != head_commit(root), None)
 
 
@@ -207,7 +196,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     trend series, and a banner when stale artifacts make them untrustworthy."""
     from ..report import render_report
 
-    root = Path(args.repo).resolve()
+    root = _command_root(args.repo)
     cfg = _load_repo_config(root)
     payload = _report_payload(root, cfg, _open_store(root))
     _write_report(root, args.out, render_report(payload))
@@ -216,7 +205,7 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 def cmd_runs(args: argparse.Namespace) -> int:
     """History without SQL: every run with kind, verdict, commit, lane set."""
-    store = _open_store(Path(args.repo).resolve())
+    store = _open_store(_command_root(args.repo))
     if args.action == "prune":
         return _runs_prune(store, keep=args.keep, as_json=args.json)
     return _runs_list(store, as_json=args.json)
@@ -258,16 +247,19 @@ def _runs_prune(store: SnapshotStore, *, keep: int, as_json: bool) -> int:
 
     Keep is a floor on retention, not a cap: the keep-set also holds the digest
     pair, every passing verify baseline, every run an override names, and the
-    newest non-hook run, so a prune can never make another command lie.
+    newest non-hook run and identity collision witnesses. Runs added after
+    selection belong to a later retention decision.
     """
     from ..store import prune_keep_set
 
     if keep < 1:
         raise ConfigError(f"runs prune --keep must be >= 1, got {keep}")
-    keep_ids = prune_keep_set(store.list_runs(), store.override_run_ids(), keep=keep)
+    history = store.list_runs()
+    keep_ids = prune_keep_set(history, store.override_run_ids(), keep=keep,
+                              identity_run_ids=store.identity_witness_run_ids())
     before = store.size_bytes()
     store.prune_claims(keep_ids)  # retention is one decision, runs and loop state together
-    deleted = store.prune_runs(keep_ids)
+    deleted = store.prune_runs(keep_ids, observed_ids={run["id"] for run in history})
     store.vacuum()  # the DELETE alone frees pages, not disk
     _print_prune(deleted, len(keep_ids), before - store.size_bytes(), as_json)
     return 0
@@ -282,7 +274,7 @@ def _print_prune(deleted: int, kept: int, freed: int, as_json: bool) -> None:
 
 def cmd_overrides(args: argparse.Namespace) -> int:
     """The override audit trail, read back out of the snapshot store."""
-    store = _open_store(Path(args.repo).resolve())
+    store = _open_store(_command_root(args.repo))
     trail = [{"run_id": rid, "path": path, "function": name, "crap": crap,
               "reason": reason, "created_at": ts, "commit": sha}
              for rid, path, name, crap, reason, ts, sha in store.read_overrides_all()]
@@ -320,10 +312,6 @@ class _ExplainCtx(NamedTuple):
     uncovered: MissingLines
     ratchet: list | None
     contexts: dict
-    # The twin NAME selected: 1 for a bare name, 2 for `f#2`. It is the ordinal
-    # in the ratchet key, and `(anonymous)#2` reads the same way — that handle
-    # and that twin's key are the same string.
-    ordinal: int = 1
 
 
 def cmd_explain(args: argparse.Namespace) -> int:
@@ -332,9 +320,10 @@ def cmd_explain(args: argparse.Namespace) -> int:
     Text and --json read the same payload, so a section can never say one thing
     to a human and another to a wrapper.
     """
-    root = Path(args.repo).resolve()
+    root = _command_root(args.repo)
     cfg = _load_repo_config(root)
     store = _open_store(root)
+    args.path = _repo_relative(args.path, root, _stand(args.repo))  # from where the user stands
     matches = store.find_functions(args.path, args.name)
     if not matches:
         raise CrapkitError(f"no function matching {args.name!r} in {args.path} appears in any run")
@@ -344,25 +333,24 @@ def cmd_explain(args: argparse.Namespace) -> int:
 
 
 def _explain_ctx(root: Path, cfg, store: SnapshotStore, args) -> _ExplainCtx:
-    from ..keys import split_ordinal
     from ..store import rowful_runs
 
     runs = rowful_runs(store)
-    return _ExplainCtx(root, args.path, runs[-1]["id"] if runs else None,
-                       load_uncovered(root, cfg), _ratchet_entries(root, cfg),
-                       _contexts_for_path(root, cfg, args.path) if args.tests else {},
-                       split_ordinal(args.name)[1])
+    run_id = runs[-1]["id"] if runs else None
+    rows = store.read_positions(run_id, args.path) if run_id is not None else []
+    return _ExplainCtx(root, args.path, run_id,
+                       load_uncovered(root, cfg), _ratchet_entries(root, cfg, rows, store),
+                       _contexts_for_path(root, cfg, args.path) if args.tests else {})
 
 
 def _explain_payload(ctx: _ExplainCtx, store: SnapshotStore, args, long_name: str) -> dict:
     """One function's whole packet. The span is looked up once and passed down:
     dark lines, --history and --tests all want the same line range."""
-    from ..keys import key_name
-
-    span = _latest_span(store, ctx.run_id, ctx.path, long_name)
+    key = store.function_key(ctx.path, long_name, args.name)
+    span = _latest_span(store, ctx.run_id, ctx.path, key)
     out = {"long_name": long_name,
-           "history": store.function_history(ctx.path, long_name),
-           **_mark_fields(ctx.ratchet, ctx.path, key_name(long_name, ctx.ordinal)),
+           "history": store.function_history(ctx.path, key),
+           **_mark_fields(ctx.ratchet, ctx.path, key),
            **_dark_fields(ctx.uncovered, ctx.path, span)}
     if args.history:
         out.update(_commits_fields(ctx.root, ctx.path, span))
@@ -443,16 +431,16 @@ def _contexts_for_path(root: Path, cfg, path: str) -> dict[int, set]:
     Every matched function used to reparse every artifact to ask the same
     question about the same file.
     """
-    from ..coverage_py import parse_coveragepy_contexts
+    from ..covstream import parse_coveragepy_contexts_file
 
     by_line: dict[int, set] = {}
     for lane in cfg.lanes:
         artifact = root / lane.artifact
         if lane.parser != "coveragepy" or not artifact.is_file():
             continue
-        ctx = parse_coveragepy_contexts(artifact.read_text(encoding="utf-8"),
-                                        path_prefix=lane.path_prefix)
-        for line, ids in ctx.get(path, {}).items():
+        ctx = parse_coveragepy_contexts_file(artifact, path_prefix=lane.path_prefix,
+                                            source_path=path)
+        for line, ids in ctx.items():
             by_line.setdefault(line, set()).update(ids)
     return by_line
 

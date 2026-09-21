@@ -6,6 +6,7 @@ that does lives with its family."""
 from __future__ import annotations
 
 import json
+import os
 import posixpath
 import sys
 from pathlib import Path
@@ -13,6 +14,8 @@ from pathlib import Path
 from ..config import load_config_text
 from ..errors import ConfigError, CrapkitError, ToolError
 from ..invocation import _self
+from ..repotext import repo_text
+from ..rootfind import find_root
 from ..store import SnapshotStore
 
 
@@ -35,22 +38,98 @@ def _positive_top(command: str, top: int) -> int:
     return top
 
 
-def _repo_relative(raw: str, root: Path = Path(".")) -> str:
+def _scope_names(cfg, requested: list[str] | None) -> list[str]:
+    """`--scope NAME` names a declared scope, or it is a configuration error.
+
+    The scope clause is an exact match on the identity table, so a name no
+    `[[scope]]` declares cuts the read to nothing: `worklist --scope frontend`
+    on a repo whose scopes are `api` and `web` printed `0 active, 0 dormant`
+    at exit 0, which a CI step reads as a clean pass, and `next-item --scope
+    biling` answered `empty: true` with every reason at 0, the payload an
+    agent reads as a finished scope. A typo and a declared scope with nothing
+    queued produced one payload. Exit 3 is the loader's own class, the one
+    `lane ... references undeclared scope(s)` already raises for the same
+    mistake made in crapkit.toml.
+    """
+    names = list(requested or [])
+    declared = _declared_scopes(cfg)
+    unknown = [name for name in names if name not in declared]
+    if unknown:
+        raise ConfigError(_unknown_scope_message(unknown, declared))
+    return names
+
+
+def _declared_scopes(cfg) -> list[str]:
+    return [s.name for s in cfg.scopes]
+
+
+def _unknown_scope_message(unknown: list[str], declared: list[str]) -> str:
+    named = ", ".join(repr(name) for name in unknown)
+    return f"no scope named {named}; declared: {', '.join(declared)}"
+
+
+def _command_root(repo: str | None) -> Path:
+    """The crapkit root a command works in.
+
+    `--repo` names an exact root and walks nowhere. Without it the root is the
+    nearest crapkit.toml at or above the working directory (ADR 0002: nearest
+    wins, a `.git` entry without one stops the walk), named on stderr when it
+    is not the working directory itself, so `cd web && crapkit worklist` reads
+    the root configuration that claims web/ and says which file it read. When
+    the walk finds nothing the working directory is the root, so the refusal
+    `_load_repo_config` raises names where the user stands.
+    """
+    if repo is not None:
+        return Path(repo).resolve()
+    cwd = Path.cwd().resolve()
+    found = find_root(cwd)
+    if found is None:
+        return cwd
+    if found != cwd:
+        print(f"crapkit: using crapkit.toml at {found}", file=sys.stderr)
+    return found
+
+
+def _stand(repo: str | None) -> Path | None:
+    """Where a relative path argument is read from: the working directory when
+    the root came from the walk, nothing when `--repo` named the root. The
+    rebase belongs to discovery (ADR 0002), not to the flag: `--repo ..` from
+    web/ reads `web/src/grade.py` against the root it named, as on 0.4.15."""
+    return None if repo is not None else Path.cwd()
+
+
+def _repo_relative(raw: str, root: Path = Path("."), cwd: Path | None = None) -> str:
     r"""One spelling for a file argument, whatever the shell handed in.
 
-    `src/a.py`, `src\a.py`, `./src/a.py` and the absolute path tab completion
-    returns all name one file, and every one of them has to reach
+    `src/a.py`, `./src/a.py` and the absolute path tab completion returns name
+    one file. Windows also accepts `src\a.py`; on POSIX that backslash is a
+    literal filename character. Every argument has to reach
     `universe.owning_scope` as the repo-relative posix path the scopes are
     declared in. Three commands spelled this as `raw.replace("\\", "/")` and
     nothing else, so the `./` form — the one shells, `find` and coding agents
     produce most often — matched no scope prefix in any of them: `test-scoped`
     called it a file belonging to no declared scope, and `rescore --gate` scored
     nothing and passed a gate the same file failed spelled relative.
+
+    `cwd` is where the user stands, handed in only when the root came from
+    the walk (`_stand`). Below the root, a relative argument is rebased from
+    there (ADR 0002): `grade.py` typed in web/src names web/src/grade.py, and
+    one climbing out of the root is refused like an absolute path outside it.
+    At the root, from a directory outside it, or under `--repo`, the argument
+    is root-relative as it always was.
     """
-    path = raw.replace("\\", "/")
+    path = raw.replace("\\", "/") if os.name == "nt" else raw
     if _is_rooted(path):
         return _under_root(path, root)
+    if _below(cwd, root):
+        return _under_root(str(cwd / path), root)
     return posixpath.normpath(path)
+
+
+def _below(cwd: Path | None, root: Path) -> bool:
+    """Whether the working directory sits strictly under the root, the one
+    place a relative argument means something other than root-relative."""
+    return cwd is not None and root.resolve() in cwd.resolve().parents
 
 
 def _is_rooted(path: str) -> bool:
@@ -119,8 +198,8 @@ def _analysis_tools():
 def _load_repo_config(root: Path):
     config_path = root / "crapkit.toml"
     if not config_path.is_file():
-        raise ConfigError(f"no crapkit.toml at {root} — nothing to analyze")
-    return load_config_text(config_path.read_text(encoding="utf-8"))
+        raise ConfigError(f"no crapkit.toml at {root} - nothing to analyze")
+    return load_config_text(repo_text(config_path, "crapkit.toml"), root=root)
 
 
 def _file_sizer(root: Path):
@@ -170,7 +249,7 @@ def _ratchet_or_die(text: str, name: str) -> list:
 def _load_ratchet_or_die(ratchet_path: Path, name: str) -> list:
     if not ratchet_path.is_file():
         return []
-    return _ratchet_or_die(ratchet_path.read_text(encoding="utf-8"), name)
+    return _ratchet_or_die(repo_text(ratchet_path, name), name)
 
 
 def _dirty_tag(dirty: bool) -> str:
@@ -196,11 +275,47 @@ def _open_store(root: Path, first_command: str = "coverage") -> SnapshotStore:
     return SnapshotStore(db_path)
 
 
-def _ratchet_entries(root: Path, cfg) -> list | None:
+def _identity_history(root: Path, store=None) -> set:
+    if store is not None:
+        return store.historical_collision_groups()
+    path = root / ".crapkit" / "crap.sqlite"
+    if not path.is_file():
+        return set()
+    from contextlib import closing
+
+    opened = SnapshotStore(path)
+    with closing(opened._conn):
+        return opened.historical_collision_groups()
+
+
+def _check_ratchet_identity(text: str, root: Path, name: str, rows, store=None) -> int:
+    from ..ratchet import (KEY_VERSION, check_reader_keys, checked_key_version,
+                           read_key_version, read_ratchet)
+
+    try:
+        check_reader_keys(text)
+        if read_key_version(text) == KEY_VERSION:
+            return KEY_VERSION
+        if not read_ratchet(text)[0]:
+            return KEY_VERSION
+        proof = rows() if callable(rows) else rows
+        return checked_key_version(text, proof, historical=_identity_history(root, store))
+    except ValueError as exc:
+        raise ConfigError(f"{name}: {exc}") from exc
+
+
+def _ratchet_key_version(root: Path, cfg, rows, store=None) -> int:
+    path = root / cfg.ratchet_file
+    text = repo_text(path, cfg.ratchet_file) if path.is_file() else ""
+    return _check_ratchet_identity(text, root, cfg.ratchet_file, rows, store)
+
+
+def _ratchet_entries(root: Path, cfg, rows=None, store=None) -> list | None:
     """The committed marks, or None when the repo carries no marks file yet.
 
     Lenient, because every caller here only READS the marks: `explain`, `brief`
-    and `rescore --gate`. A line crapkit cannot parse carries no mark, so
+    and `rescore --gate`. Rows may be deferred until legacy identity needs them.
+    A line crapkit cannot parse carries no mark, so
     dropping it can only make the gate stricter, never let a regression through.
     One hand-edited short line used to reach explain and brief, which are also
     two of the MCP tools an agent calls, as a raw ValueError traceback, with the
@@ -212,7 +327,10 @@ def _ratchet_entries(root: Path, cfg) -> list | None:
     ratchet_path = root / cfg.ratchet_file
     if not ratchet_path.is_file():
         return None
-    entries, complaints = read_ratchet(ratchet_path.read_text(encoding="utf-8"))
+    text = repo_text(ratchet_path, cfg.ratchet_file)
+    entries, complaints = read_ratchet(text)
+    if rows is not None:
+        _check_ratchet_identity(text, root, cfg.ratchet_file, rows, store)
     for complaint in complaints:
         print(f"crapkit: skipped an unreadable mark in {cfg.ratchet_file}: {complaint}",
               file=sys.stderr)

@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator
 from itertools import combinations
 
-from .churn import _unquote_git_path
+from .gitpaths import history_line, unquote_path
 
 MAX_COMMIT_FILES = 30
 # The thresholds the ranking answers when nobody names one. Named because
@@ -26,22 +26,19 @@ def _commit_file_sets(lines: Iterable[str]) -> Iterator[set[str]]:
     path. Empty sets are yielded rather than skipped: they add no file counts
     and form no pairs, so the caller cannot tell them from a skip.
 
-    Unquoted before the slashes are normalized, the way the churn parser does
-    it: git quotes a non-ASCII path and writes its bytes as octal escapes, so
-    normalizing first cuts `src/b\\303\\252ta.py` into directories. Either way
-    the pair would name a path no repo has, and the file the log meant would
-    never join the churn map, ls-files or a scored row.
+    Git framing and C quoting use the same rules as churn. Path content,
+    including whitespace and literal backslashes, survives unchanged.
     """
     files: set[str] = set()
     past_header = False
     for raw in lines:
-        line = raw.strip()
+        line = history_line(raw)
         if line.startswith("\x01"):
             yield files
             files, past_header = set(), True
             continue
         if past_header and line:
-            files.add(_unquote_git_path(line).replace("\\", "/"))
+            files.add(unquote_path(line))
         past_header = True  # a log starting mid-commit opens on a severed header
     yield files
 
@@ -74,30 +71,15 @@ def _rank_pairs(file_counts: dict, pair_counts: dict, min_support: int,
     return out if top is None else out[:top]
 
 
-def _partner(pair: dict, path: str) -> dict:
-    a, b = pair["files"]
-    return {"path": b if a == path else a, "support": pair["support"],
-            "confidence": pair["confidence"]}
 
 
-def partners(lines: Iterable[str], path: str, *, min_support: int = DEFAULT_MIN_SUPPORT,
-             min_confidence: float = DEFAULT_MIN_CONFIDENCE, top: int = 5) -> list[dict]:
-    """One file's coupled partners, best first.
-
-    Ranked over EVERY qualifying pair before the cut: a global top applied first
-    would drop a quiet file's own partners behind the repo's noisiest pairs and
-    report it as uncoupled.
-    """
-    ranked = change_coupling_lines(lines, min_support=min_support,
-                                   min_confidence=min_confidence, top=None)
-    return [_partner(p, path) for p in ranked if path in p["files"]][:top]
 
 
 def change_coupling(log_text: str, *, min_support: int = DEFAULT_MIN_SUPPORT,
                     min_confidence: float = DEFAULT_MIN_CONFIDENCE,
                     top: int | None = 50, tracked: set[str] | None = None) -> list[dict]:
     """Whole-text entrypoint: the log already in hand."""
-    return change_coupling_lines(log_text.splitlines(), min_support=min_support,
+    return change_coupling_lines(log_text.split("\n"), min_support=min_support,
                                  min_confidence=min_confidence, top=top, tracked=tracked)
 
 

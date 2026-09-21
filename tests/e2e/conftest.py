@@ -18,8 +18,9 @@ body to diff against 41 others. Nothing here is a policy: the defaults are the
 plainest child (120 s, platform decoding, the inherited environment), and a file
 that needs otherwise says so.
 
-The child inherits PYTHONPATH. That is what makes the suite test the working
-tree rather than an installed crapkit, so no default here may drop it.
+The child inherits the parent's package selection. Development can select the
+working tree with PYTHONPATH; isolated CI selects its verified wheel through
+the environment's interpreter. No default here may replace that choice.
 """
 
 from __future__ import annotations
@@ -50,6 +51,10 @@ def run_cli(repo: Path, *args: str, timeout: int = 120, env_extra: dict | None =
             encoding: str | None = None, errors: str | None = None,
             stdin: str | None = None) -> subprocess.CompletedProcess:
     """`python -m crapkit <args>` in `repo`, captured as text."""
+    if args and args[0] == 'mcp' and stdin is not None:
+        from mcp_stdio import run
+        return run([*CRAPKIT, *args], cwd=repo, frames=stdin, env=child_env(env_extra),
+                   timeout=timeout, encoding=encoding, errors=errors)
     return subprocess.run([*CRAPKIT, *args], cwd=repo, input=stdin,
                           capture_output=True, text=True, encoding=encoding,
                           errors=errors, timeout=timeout, env=child_env(env_extra))

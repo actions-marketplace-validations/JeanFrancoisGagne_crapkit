@@ -2,20 +2,20 @@
 and how the loop is bounded. The mtime diffing behind it is pure and lives in
 test_contexts_and_watch.py.
 
-subprocess.run is recorded rather than run: the argv IS the contract here (the
+run_owned is recorded rather than run: the argv IS the contract here (the
 rescore has to leave the watcher's own process, so a half-saved syntax error
 cannot take the loop down with it), and a real child would only re-prove what
 tests/e2e/test_watch_cycles_e2e.py proves against a real repo.
 """
-import subprocess
+from crapkit import procs
 import sys
 
-from crapkit.cli import _watch_banner, _watch_cycles, _watch_rescore
+from crapkit.cli.admin import _watch_banner, _watch_cycles, _watch_rescore
 
 
 def _recorded(monkeypatch) -> list:
     calls = []
-    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr(procs, "run_owned", lambda argv, **kw: calls.append(argv))
     return calls
 
 
@@ -53,9 +53,9 @@ def test_a_bounded_watch_yields_exactly_the_polls_it_was_given():
 
 
 def test_the_banner_of_an_unbounded_run_says_how_to_stop_it():
-    assert _watch_banner(12, 2.0, None) == "watching 12 tracked files every 2.0s — ctrl-c to stop"
+    assert _watch_banner(12, 2.0, None) == "watching 12 tracked files every 2.0s - ctrl-c to stop"
 
 
 def test_the_banner_of_a_bounded_run_names_its_own_end_instead():
     assert _watch_banner(12, 0.5, 3) == \
-        "watching 12 tracked files every 0.5s — 3 poll(s) then stop"
+        "watching 12 tracked files every 0.5s - 3 poll(s) then stop"

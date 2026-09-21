@@ -144,27 +144,27 @@ def _touch_scope_file(repo: Path) -> None:
 
 
 def test_a_lane_that_never_ran_is_not_unchanged(repo: Path):
-    assert lane_unchanged(repo, _the_lane(repo), SCOPE_PATHS) is False
+    assert lane_unchanged(repo, _the_lane(repo)) is False
 
 
 def test_a_fresh_artifact_over_untouched_scopes_is_unchanged(repo: Path):
     lane = _the_lane(repo)
     _run_and_stamp(repo, lane)
-    assert lane_unchanged(repo, lane, SCOPE_PATHS) is True
+    assert lane_unchanged(repo, lane) is True
 
 
 def test_a_deleted_artifact_is_never_unchanged(repo: Path):
     lane = _the_lane(repo)
     _run_and_stamp(repo, lane)
     (repo / lane.artifact).unlink()
-    assert lane_unchanged(repo, lane, SCOPE_PATHS) is False
+    assert lane_unchanged(repo, lane) is False
 
 
 def test_an_uncommitted_edit_under_a_scope_makes_the_lane_changed(repo: Path):
     lane = _the_lane(repo)
     _run_and_stamp(repo, lane)
     _touch_scope_file(repo)
-    assert lane_unchanged(repo, lane, SCOPE_PATHS) is False
+    assert lane_unchanged(repo, lane) is False
 
 
 def test_a_commit_after_the_stamp_makes_the_lane_changed(repo: Path):
@@ -172,35 +172,15 @@ def test_a_commit_after_the_stamp_makes_the_lane_changed(repo: Path):
     _run_and_stamp(repo, lane)
     _touch_scope_file(repo)
     _commit(repo, "touch src")
-    assert lane_unchanged(repo, lane, SCOPE_PATHS) is False
+    assert lane_unchanged(repo, lane) is False
 
 
-def test_changes_outside_the_scopes_leave_the_lane_unchanged(repo: Path):
+def test_a_new_commit_outside_scopes_still_requires_measurement(repo: Path):
     lane = _the_lane(repo)
     _run_and_stamp(repo, lane)
     (repo / "docs" / "notes.md").write_text("edited\n", encoding="utf-8")
     _commit(repo, "docs only")
-    assert lane_unchanged(repo, lane, SCOPE_PATHS) is True
-
-
-@pytest.mark.parametrize("scope_paths", [{}, {"src": ()}, {"other": ("src",)}])
-def test_a_lane_with_no_scope_prefixes_has_nothing_to_go_stale(repo: Path, scope_paths):
-    """No prefixes to compare against means no file can fall inside them."""
-    lane = _the_lane(repo)
-    _run_and_stamp(repo, lane)
-    _touch_scope_file(repo)
-    assert lane_unchanged(repo, lane, scope_paths) is True
-
-
-def test_a_file_valued_scope_path_still_marks_its_lane_changed(repo: Path):
-    """A scope may declare a file rather than a directory — crapkit's own
-    tests/e2e/test_parallel_lanes_e2e.py writes that shape. Prefix matching
-    alone never matches the file itself, so editing it read as no change and the
-    lane reused an artifact that no longer described its code."""
-    lane = _the_lane(repo)
-    _run_and_stamp(repo, lane)
-    _touch_scope_file(repo)
-    assert lane_unchanged(repo, lane, {"src": ("src/app.ts",)}) is False
+    assert lane_unchanged(repo, lane) is False
 
 
 def test_a_stamp_commit_that_left_history_is_not_unchanged(repo: Path):
@@ -210,14 +190,14 @@ def test_a_stamp_commit_that_left_history_is_not_unchanged(repo: Path):
     lane = _the_lane(repo)
     _run_and_stamp(repo, lane)
     _git(repo, "reset", "--hard", "-q", first)
-    assert lane_unchanged(repo, lane, SCOPE_PATHS) is False
+    assert lane_unchanged(repo, lane) is False
 
 
 def test_without_git_the_lane_is_never_unchanged(repo: Path, monkeypatch):
     lane = _the_lane(repo)
     _run_and_stamp(repo, lane)
     monkeypatch.setenv("PATH", str(repo))
-    assert lane_unchanged(repo, lane, SCOPE_PATHS) is False
+    assert lane_unchanged(repo, lane) is False
 
 
 # --- the same decision seen through `crapkit coverage --reuse-unchanged` -----
@@ -250,6 +230,55 @@ def test_cli_reuse_unchanged_reruns_after_an_uncommitted_scope_edit(repo: Path):
     assert res.returncode == 0, res.stderr
     assert _lane_runs(repo) == 2, "a working-tree edit under the scope must rerun the lane"
     assert "reusing without rerun" not in res.stderr
+
+
+@pytest.mark.parametrize("rel", ["docs/notes.md", "run_counted.py", "crapkit.toml"])
+@pytest.mark.parametrize("committed", [False, True])
+def test_uncovered_lines_survive_other_input_changes_that_require_a_rerun(repo, rel, committed):
+    assert _run_cli(repo, "coverage", "--json").returncode == 0
+    path = repo / rel
+    path.write_text(path.read_text(encoding="utf-8") + "\n# changed\n", encoding="utf-8")
+    if committed:
+        _commit(repo, "change measurement input")
+
+    shown = _run_cli(repo, "brief", "src/app.ts", "dispatch", "--json")
+
+    assert shown.returncode == 0, shown.stderr
+    assert json.loads(shown.stdout)["uncovered_lines"] == [], "the artifact has no dark statements"
+    assert _lane_runs(repo) == 1, "reading lines must not execute the lane"
+    measured = _run_cli(repo, "coverage", "--reuse-unchanged", "--json")
+    assert measured.returncode == 0, measured.stderr
+    assert _lane_runs(repo) == 2, "display freshness must not authorize measurement reuse"
+
+
+def test_uncovered_lines_survive_an_environment_change_that_requires_a_rerun(repo):
+    assert _run_cli(repo, "coverage", "--json").returncode == 0
+    environment = {"CRAPKIT_TEST_LINE_DISPLAY": "different"}
+
+    shown = _run_cli(repo, "brief", "src/app.ts", "dispatch", "--json", env_extra=environment)
+
+    assert shown.returncode == 0, shown.stderr
+    assert json.loads(shown.stdout)["uncovered_lines"] == [], "the artifact has no dark statements"
+    assert _lane_runs(repo) == 1
+    measured = _run_cli(repo, "coverage", "--reuse-unchanged", "--json", env_extra=environment)
+    assert measured.returncode == 0, measured.stderr
+    assert _lane_runs(repo) == 2
+
+
+@pytest.mark.parametrize("committed", [False, True])
+def test_uncovered_lines_are_withheld_after_source_changes(repo, committed):
+    assert _run_cli(repo, "coverage", "--json").returncode == 0
+    _touch_scope_file(repo)
+    if committed:
+        _commit(repo, "change source")
+
+    shown = _run_cli(repo, "brief", "src/app.ts", "dispatch", "--json")
+
+    assert shown.returncode == 0, shown.stderr
+    packet = json.loads(shown.stdout)
+    assert packet["uncovered_lines"] is None
+    assert "files in its scopes changed" in packet["uncovered_lines_note"]
+    assert _lane_runs(repo) == 1
 
 
 def test_cli_reuse_unchanged_reruns_when_the_stamp_commit_left_history(repo: Path):
@@ -620,8 +649,11 @@ def test_a_non_numeric_timestamp_degrades_to_the_commit_count():
 
 
 def test_in_a_half_timestamped_log_only_stamped_files_get_a_time_weight():
+    """Two stamps give the log a range; the file on the older one weighs less
+    than a commit count, and the unstamped file falls back to its count."""
     log = ("\x01alice\x021700000000\nsrc/hot.ts\n\n"
+           "\x01alice\x021700009000\nsrc/newer.ts\n\n"
            "\x01bob\nsrc/cold.ts\n")
     churn = parse_git_log(log)
     assert churn["src/cold.ts"].weight == 1.0, "no stamp: fall back to the commit count"
-    assert churn["src/hot.ts"].weight < 1.0
+    assert churn["src/hot.ts"].weight < 1.0, "the oldest stamp in a spread weighs less than a count"

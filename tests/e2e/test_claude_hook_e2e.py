@@ -214,10 +214,10 @@ def _child_overrides() -> dict:
             "CRAPKIT_OVERRIDE_REASON": None}
 
 
-def run_hook(golden: dict, repo: Path, cwd: Path) -> subprocess.CompletedProcess:
+def run_hook(golden: dict, repo: Path, cwd: Path, *, env_extra=None) -> subprocess.CompletedProcess:
     return run_cli(cwd, *golden["argv"], stdin=_stdin_text(golden, str(repo)),
                    timeout=300, encoding="utf-8", errors="replace",
-                   env_extra=_child_overrides())
+                   env_extra={**_child_overrides(), **(env_extra or {})})
 
 
 def _built(golden: dict, tmp_path: Path) -> Path:
@@ -360,20 +360,65 @@ def _best_ms(call, reps: int = 5) -> float:
 def _warm_ms(name: str, tmp_path: Path) -> float:
     golden = _case(name)
     repo = _built(golden, tmp_path)
-    return _best_ms(lambda: run_hook(golden, repo, tmp_path))
+    return _best_ms(lambda: run_hook(golden, repo, tmp_path, env_extra=_timing_overrides()))
+
+
+def _timing_overrides() -> dict:
+    """Measure shipped startup cost; golden cases separately collect coverage."""
+    return {key: None for key in os.environ if key.startswith(("COVERAGE_", "COV_CORE_"))}
 
 
 def _floor_ms() -> float:
     """What a spawned interpreter costs here before crapkit exists at all."""
     return _best_ms(lambda: subprocess.run([PY, "-c", "pass"], capture_output=True,
-                                           timeout=300))
+                                           timeout=300, env=child_env(_timing_overrides())))
+
+
+# A box whose bare interpreter needs this long to start is busy with something
+# else, and an absolute ceiling then measures that something: 666 ms against the
+# 500 ms ceiling while another repository's coverage ran beside the suite. The
+# design's floor is 29.3 ms. CI is never excused, since its runners are the
+# machines the hard ceiling was written for.
+_SATURATED_FLOOR_MS = 250.0
+
+
+def _excuse_a_saturated_box() -> None:
+    if os.environ.get("CI"):
+        return
+    floor = _floor_ms()
+    if floor > _SATURATED_FLOOR_MS:
+        pytest.skip(f"python -c pass took {floor:.0f} ms to start here against a design floor of "
+                    "29.3 ms: this box is too busy to measure a wall-clock ceiling, and CI enforces it")
 
 
 @pytest.mark.parametrize("name", sorted(BUDGETS))
 def test_the_warm_path_stays_inside_the_ci_budget(name: str, tmp_path):
     hard, _ = BUDGETS[name]
+    _excuse_a_saturated_box()
 
     assert _warm_ms(name, tmp_path) < hard
+
+
+def test_a_saturated_box_is_excused_from_the_wall_clock_ceiling(monkeypatch):
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.setattr(sys.modules[__name__], "_floor_ms", lambda: 600.0)
+
+    with pytest.raises(pytest.skip.Exception, match="600 ms"):
+        _excuse_a_saturated_box()
+
+
+def test_ci_is_never_excused_from_the_wall_clock_ceiling(monkeypatch):
+    monkeypatch.setenv("CI", "true")
+    monkeypatch.setattr(sys.modules[__name__], "_floor_ms", lambda: 600.0)
+
+    _excuse_a_saturated_box()
+
+
+def test_a_quiet_box_is_held_to_the_wall_clock_ceiling(monkeypatch):
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.setattr(sys.modules[__name__], "_floor_ms", lambda: 31.0)
+
+    _excuse_a_saturated_box()
 
 
 @_STRICT

@@ -1,4 +1,8 @@
-"""crapkit.toml parsing. Pure: text in, Config out; every rejection is a ConfigError (exit 3)."""
+"""crapkit.toml parsing. Text in, Config out; every rejection is a ConfigError (exit 3).
+
+Pure, with one exception: given a `root`, the full-suite guard reads pytest's
+own configuration in a lane's working directory, and only when the lane's
+pytest command carries a positional to judge against `testpaths`."""
 from __future__ import annotations
 
 import os
@@ -6,18 +10,18 @@ import re
 import shlex
 import tomllib
 from collections.abc import Iterator
+from pathlib import Path
 from typing import NamedTuple
 
 from .errors import ConfigError
+from .config_contract import admit, enum_values
 
 # `cpp` is the whole C family, C included: lizard resolves every one of its
 # suffixes to a single CLikeReader, so a `c` label beside this one could never
 # measure differently — and `.h` is the header both dialects share, which no rule
 # could assign to one of them.
-SUPPORTED_LANGUAGES = frozenset({"typescript", "tsx", "javascript", "python", "swift",
-                                 "go", "rust", "shell", "cpp", "objectivec", "vue",
-                                 "java", "zig", "powershell"})
-SUPPORTED_PARSERS = frozenset({"istanbul", "coveragepy"})
+SUPPORTED_LANGUAGES = frozenset(enum_values("scope", "languages"))
+SUPPORTED_PARSERS = frozenset(enum_values("lane", "parser"))
 DEFAULT_TARGET = 6
 
 # Only what a vitest command line can carry: this tuple guards istanbul lane
@@ -55,6 +59,7 @@ class Lane(NamedTuple):
     no_progress_seconds: int = 0
     retries: int = 0
     retest_command: str = ""  # {tests} template for the flake retry before exit 8
+    log_max_bytes: int = 16777216  # inherited global bound, not a per-lane TOML key
 
 
 # pytest options that read the NEXT token as their value. `-n 8` is eight
@@ -315,17 +320,143 @@ def _narrowing_arguments(tokens: list[str]) -> list[str]:
             if i not in values and not tok.startswith("-") and "=" not in tok]
 
 
-def _validate_coveragepy_command(name: str, command: str) -> None:
+# Where pytest keeps `testpaths`, in the order pytest picks its inifile, as
+# (file, pytest section, decides even without that section). pytest reads one
+# inifile and never consults a lower-ranked one: pytest.ini decides even empty,
+# while .pytest.ini and the other three decide only
+# when they hold a pytest section. pyproject.toml's section is the
+# `[tool.pytest.ini_options]` table, named by an empty section here. Parsed,
+# never executed and never imported.
+_PYTEST_INI_FILES = (("pytest.ini", "pytest", True), (".pytest.ini", "pytest", False),
+                     ("pyproject.toml", "", False), ("tox.ini", "pytest", False),
+                     ("setup.cfg", "tool:pytest", False))
+PYTEST_CONFIG_FILES = tuple(name for name, _, _ in _PYTEST_INI_FILES)
+
+
+def _split_testpaths(value) -> tuple[str, ...]:
+    """pytest's `args` type: a list as it stands, a string split on whitespace."""
+    if isinstance(value, str):
+        return tuple(value.split())
+    if isinstance(value, list):
+        return tuple(str(path) for path in value)
+    return ()
+
+
+def _ini_testpaths(text: str, section: str, always: bool) -> tuple[str, ...] | None:
+    """`testpaths` out of an ini file, or None when the file holds no pytest
+    section for the search to stop at; a file that decides `always` stops it
+    with () instead. A file that will not parse holds none either way."""
+    import configparser
+
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read_string(text)
+    except configparser.Error:
+        return None
+    if not parser.has_section(section):
+        return () if always else None
+    return _split_testpaths(parser.get(section, "testpaths", fallback=""))
+
+
+def _toml_table(data, *keys: str):
+    """One key path through nested tables, or None the moment it leaves them."""
+    for key in keys:
+        if not isinstance(data, dict):
+            return None
+        data = data.get(key)
+    return data
+
+
+def _toml_testpaths(text: str) -> tuple[str, ...] | None:
+    """None unless `[tool.pytest.ini_options]` is there, the table pytest looks
+    for before it reads a pyproject as its inifile."""
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return None
+    section = _toml_table(data, "tool", "pytest", "ini_options")
+    if not isinstance(section, dict):
+        return None
+    return _split_testpaths(section.get("testpaths"))
+
+
+def _pytest_text(directory: str | os.PathLike, name: str) -> str | None:
+    """Read one candidate file without confusing absence with an empty file."""
+    try:
+        return (Path(directory) / name).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _pytest_testpaths(read_text) -> tuple[str, ...]:
+    for name, section, always in _PYTEST_INI_FILES:
+        text = read_text(name)
+        if text is None:
+            continue
+        found = _toml_testpaths(text) if not section else _ini_testpaths(text, section, always)
+        if found is not None:
+            return found
+    return ()
+
+
+def pytest_testpaths_texts(texts: dict[str, str]) -> tuple[str, ...]:
+    """Select testpaths from supplied config texts using pytest's precedence."""
+    return _pytest_testpaths(texts.get)
+
+
+def pytest_testpaths_at(directory: str | os.PathLike) -> tuple[str, ...]:
+    """Read testpaths from the first deciding pytest config in this directory."""
+    return _pytest_testpaths(lambda name: _pytest_text(directory, name))
+
+
+def _as_testpath(token: str) -> str:
+    """One spelling for the comparison: forward slashes, no leading `./`, no
+    trailing separator. `tests/`, `./tests` and `tests` name one directory."""
+    spelled = token.replace("\\", "/")
+    if spelled.startswith("./"):
+        spelled = spelled[2:]
+    return spelled.rstrip("/")
+
+
+def _declared_testpaths(positionals: list[str], lane_dir: Path | None) -> set[str]:
+    """The configured `testpaths` entries in the guard's spelling, or an empty
+    set when there is nothing to judge. pytest's files are opened only when
+    there is a positional to judge and a directory to read them in, so the
+    common lane costs a read-only command no file read."""
+    if not positionals or lane_dir is None:
+        return set()
+    return {_as_testpath(path) for path in pytest_testpaths_at(lane_dir)}
+
+
+def _outside_testpaths(positionals: list[str], lane_dir: Path | None) -> list[str]:
+    """The positionals that narrow the run: all of them, unless together they
+    name every configured `testpaths` entry, in which case the entries drop out
+    and only the extras are left. `pytest tests` under `testpaths = ["tests"]`
+    collects exactly what a bare `pytest` collects, and refusing it sent a
+    maintainer to `full_suite = false` on a lane that runs the whole suite;
+    `pytest tests` under `testpaths = ["tests", "integration"]` collects half
+    of what a bare `pytest` does, which is the narrowing this guard exists to
+    refuse, so one entry of several is not enough."""
+    declared = _declared_testpaths(positionals, lane_dir)
+    if not declared <= {_as_testpath(tok) for tok in positionals}:
+        return positionals
+    # An empty `declared` is a subset of anything and drops nothing below.
+    return [tok for tok in positionals if _as_testpath(tok) not in declared]
+
+
+def _validate_coveragepy_command(name: str, command: str, lane_dir: Path | None = None) -> None:
     # Subset coverage under a suite with cross-file pollution is run-order-dependent;
     # a full-suite lane refuses positional narrowing. Scoped suites opt out with
     # full_suite = false, an explicit and reviewable decision. Every chained
     # segment is read: a second pytest run narrows just as much as the first.
     for segment in shell_segments(command):
-        _refuse_pytest_narrowing(name, command, segment)
+        _refuse_pytest_narrowing(name, command, segment, lane_dir)
 
 
-def _refuse_pytest_narrowing(name: str, command: str, tokens: list[str]) -> None:
-    """One command's argv. A segment that runs no pytest has nothing to narrow.
+def _refuse_pytest_narrowing(name: str, command: str, tokens: list[str],
+                             lane_dir: Path | None = None) -> None:
+    """One command's argv. A segment that runs no pytest has nothing to narrow,
+    and a positional equal to a configured testpaths entry narrows nothing.
 
     Two exits, not one. A scoped suite opts out with `full_suite = false`. A
     suite that cannot collect all its testpaths in one process has no full-suite
@@ -333,7 +464,8 @@ def _refuse_pytest_narrowing(name: str, command: str, tokens: list[str]) -> None
     leaves its other testpaths unmeasured with nothing saying so, which is why
     the message names the multi-lane pattern rather than only the flag.
     """
-    for tok in _narrowing_arguments(_tokens_after_pytest(tokens)):
+    positionals = _narrowing_arguments(_tokens_after_pytest(tokens))
+    for tok in _outside_testpaths(positionals, lane_dir):
         raise ConfigError(
             f"lane {name!r}: positional argument '{tok}' narrows a full-suite coverage run; "
             f"drop it, attach it to the flag it belongs to (-n8, --numprocesses=8), "
@@ -404,6 +536,20 @@ class Config(NamedTuple):
         """Every scope's effective ceiling: its own target or the repo default."""
         return {s.name: (s.target if s.target is not None else self.target) for s in self.scopes}
 
+    def ceiling_of(self, scope: str) -> int:
+        """The ceiling one scope's functions are judged against: the scope's own
+        `target` when it sets one, else the repo's. The one spelling of that
+        rule for every command holding a Config; a scope nothing declared is
+        judged at the repo ceiling."""
+        return self.scope_targets.get(scope, self.target)
+
+    @property
+    def ceilings(self) -> dict[str, int]:
+        """The ceilings in force, as a summary labels them: `default` and only
+        the scopes whose own target differs from it."""
+        own = {name: c for name, c in self.scope_targets.items() if c != self.target}
+        return {"default": self.target, **own}
+
     @property
     def coverage_optional_scopes(self) -> frozenset[str]:
         """The scopes scored cc-only: no coverage join, and no lane required."""
@@ -442,7 +588,7 @@ class Config(NamedTuple):
     scoped_tests: tuple[tuple[str, str], ...] = ()
     mutation_command: str = ""  # the suite run once per mutant; nonzero exit = killed
     mutation_timeout_seconds: int = 300  # a mutant that loops forever counts as killed
-    mutation_workers: int = 1  # >1 runs mutants in that many detached git worktrees
+    mutation_workers: int = 1  # one retained detached worktree per worker
     diff_uncovered_max: int | None = None  # verify exit 9 past this many dead changed lines
     # A tighten claims an improvement; one commit measured twice cannot have
     # improved. Past this factor between two runs of the same commit, verify
@@ -451,7 +597,11 @@ class Config(NamedTuple):
     debt_max_age_months: int | None = None  # ratchet report --enforce flags older marks
     repayment_min_per_30d: int | None = None  # --enforce flags a stalled burn-down
     max_parallel_lanes: int = 1  # lanes running at once; 1 = strictly serial
-    analysis_workers: int = 0  # lizard pool size; 0 = one worker per core
+    analysis_workers: int = 0  # requested lizard workers; 0 = automatic sizing
+    analysis_worker_budget: int = 0  # shared pool slot ceiling; 0 = available CPUs
+    log_max_bytes: int = 16777216  # each active/backup lane log; 0 = unlimited
+    test_retention_days: int = 7  # finished default test evidence; 0 = no age pruning
+    test_retention_count: int = 10  # finished default test evidence; 0 = no count pruning
     # Operational traps the repo learned the hard way. They lived as TOML
     # comments, which the parser drops, so no payload could ever quote them.
     notes: tuple[str, ...] = ()
@@ -460,13 +610,17 @@ class Config(NamedTuple):
     scope_notes: dict[str, tuple[str, ...]] = {}
 
 
-def load_config_text(text: str) -> Config:
+def load_config_text(text: str, *, root: str | os.PathLike | None = None) -> Config:
+    """`root` is the directory crapkit.toml sits in. Given, it lets the
+    full-suite guard read pytest's `testpaths` where each lane runs; absent, a
+    positional in a pytest command is judged from the command alone."""
     try:
         raw = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"crapkit.toml does not parse: {exc}") from exc
     try:
-        return _build_config(raw)
+        admit(raw)
+        return _build_config(raw, root)
     except KeyError as exc:
         raise ConfigError(f"crapkit.toml is missing a required key: {exc}") from exc
 
@@ -496,9 +650,8 @@ def _scope_path(name, raw: str) -> str:
     empty scope. `..` is refused as a SEGMENT, not as a prefix: `src/../etc` is
     the spelling a reader reaches for when they mean a sibling directory, and
     matching a leading `../` alone let it through into the same silent empty
-    scope. A bare `.` is left exactly as it is: whether a scope can declare the
-    repo root is the matcher's question, not this one's, and `doctor` already
-    reports such a scope as `0 files`.
+    scope. A bare `.` is the repo root. The matcher gives it the lowest path
+    precedence so a deeper scope can own its subtree.
     """
     path = _unrooted(raw)
     if path == "" or ".." in path.split("/") or ":" in path:
@@ -510,29 +663,12 @@ def _scope_path(name, raw: str) -> str:
 
 def _parse_scope(row: dict) -> Scope:
     languages = tuple(row.get("languages", ()))
-    unknown = set(languages) - SUPPORTED_LANGUAGES
-    if unknown:
-        raise ConfigError(f"unsupported language(s) {sorted(unknown)} in scope {row.get('name')!r}")
     scope_target = row.get("target")
-    if scope_target is not None and (not isinstance(scope_target, int) or scope_target < 1):
-        raise ConfigError(f"scope {row.get('name')!r}: target must be a positive int, got {scope_target!r}")
     return Scope(name=row["name"],
                  paths=tuple(_scope_path(row.get("name"), p) for p in row["paths"]),
                  languages=languages,
                  target=scope_target,
-                 coverage_optional=bool(row.get("coverage_optional", False)))
-
-
-def _notes(row: dict, where: str) -> tuple[str, ...]:
-    """The `notes` list, rejected unless every entry is a string.
-
-    A bare `notes = "..."` is the trap TOML sets: it is iterable, so it would
-    load as one note per letter and every reader would print them that way.
-    """
-    raw = row.get("notes", [])
-    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
-        raise ConfigError(f"{where}: notes must be a list of strings, got {raw!r}")
-    return tuple(raw)
+                 coverage_optional=row.get("coverage_optional", False))
 
 
 def _parse_scopes(rows) -> tuple[tuple[Scope, ...], dict[str, tuple[str, ...]]]:
@@ -542,127 +678,110 @@ def _parse_scopes(rows) -> tuple[tuple[Scope, ...], dict[str, tuple[str, ...]]]:
     second pass would re-read and re-validate every row for nothing — and, when
     the rows arrive as an iterator, would find none of them.
     """
-    scopes: list[Scope] = []
+    scopes: dict[str, Scope] = {}
     notes: dict[str, tuple[str, ...]] = {}
     for row in rows:
         scope = _parse_scope(row)
-        scopes.append(scope)
-        row_notes = _notes(row, f"scope {scope.name!r}")
+        if scope.name in scopes:
+            raise ConfigError(f"duplicate scope name {scope.name!r}; each scope needs its own name")
+        scopes[scope.name] = scope
+        row_notes = tuple(row.get("notes", ()))
         if row_notes:
             notes[scope.name] = row_notes
-    return tuple(scopes), notes
+    return tuple(scopes.values()), notes
 
 
-def _validate_lane_command(parser: str, full_suite: bool, name: str, command: str) -> None:
+def _validate_lane_command(parser: str, full_suite: bool, name: str, command: str,
+                           lane_dir: Path | None = None) -> None:
     if parser == "istanbul":
         _validate_istanbul_command(name, command)
     if parser == "coveragepy" and full_suite:
-        _validate_coveragepy_command(name, command)
+        _validate_coveragepy_command(name, command, lane_dir)
 
 
-def _parse_lane(row: dict, scope_names: set) -> Lane:
+def _lane_dir(root: str | os.PathLike | None, cwd: str) -> Path | None:
+    """Where the lane's command runs, which is where pytest picks its inifile;
+    None without a root, and then no file is read."""
+    if root is None:
+        return None
+    return Path(root) / cwd if cwd else Path(root)
+
+
+def _parse_lane(row: dict, scope_names: set, root: str | os.PathLike | None = None) -> Lane:
     parser = row["parser"]
-    if parser not in SUPPORTED_PARSERS:
-        raise ConfigError(f"lane {row.get('name')!r}: unsupported parser {parser!r}")
     lane_scopes = tuple(row.get("scopes", ()))
     unknown_scopes = set(lane_scopes) - scope_names
     if unknown_scopes:
         raise ConfigError(f"lane {row.get('name')!r} references undeclared scope(s) {sorted(unknown_scopes)}")
-    full_suite = bool(row.get("full_suite", True))
-    _validate_lane_command(parser, full_suite, row.get("name", "?"), row["command"])
+    full_suite = row.get("full_suite", True)
+    _validate_lane_command(parser, full_suite, row.get("name", "?"), row["command"],
+                           _lane_dir(root, row.get("cwd", "")))
     return Lane(name=row["name"], command=row["command"], artifact=row["artifact"],
                 parser=parser, scopes=lane_scopes,
                 cwd=row.get("cwd", ""), path_prefix=row.get("path_prefix", ""),
-                env=tuple(sorted((str(k), str(v)) for k, v in row.get("env", {}).items())),
-                full_suite=full_suite, container_ok=bool(row.get("container_ok", False)),
+                env=tuple(sorted(row.get("env", {}).items())),
+                full_suite=full_suite, container_ok=row.get("container_ok", False),
                 results_artifact=row.get("results_artifact", ""),
-                timeout_seconds=_nonneg_int(row, "timeout_seconds"),
-                no_progress_seconds=_nonneg_int(row, "no_progress_seconds"),
-                retries=_nonneg_int(row, "retries"),
+                timeout_seconds=row.get("timeout_seconds", 0),
+                no_progress_seconds=row.get("no_progress_seconds", 0),
+                retries=row.get("retries", 0),
                 retest_command=row.get("retest_command", ""))
 
 
-def _nonneg_int(row: dict, key: str) -> int:
-    value = row.get(key, 0)
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ConfigError(
-            f"lane {row.get('name', '?')!r}: {key} must be a non-negative int, got {value!r}")
-    return value
-
-
-def _reject_shared_artifacts(lanes: list) -> None:
+def _reject_shared_artifacts(lanes: list, root=None) -> None:
     seen_artifacts: dict[str, str] = {}
     for lane in lanes:
         for artifact in filter(None, (lane.artifact, lane.results_artifact)):
-            if artifact in seen_artifacts and seen_artifacts[artifact] != lane.name:
+            key = os.path.normcase(os.path.abspath(os.path.join(root or '.', artifact)))
+            if key in seen_artifacts:
                 raise ConfigError(
-                    f"lanes {seen_artifacts[artifact]!r} and {lane.name!r} share the artifact path "
+                    f"lanes {seen_artifacts[key]!r} and {lane.name!r} share the artifact path "
                     f"{artifact!r}; reused paths cross-attribute coverage under --reuse-artifacts")
-            seen_artifacts[artifact] = lane.name
+            seen_artifacts[key] = lane.name
 
 
-def _build_config(raw: dict) -> Config:
-    scope_rows = raw.get("scope", [])
-    if not scope_rows:
-        raise ConfigError("crapkit.toml declares no [[scope]] — nothing to analyze")
-    scopes, scope_notes = _parse_scopes(scope_rows)
+def _unique_lanes(rows, scope_names: set, root) -> list[Lane]:
+    lanes: dict[str, Lane] = {}
+    for row in rows:
+        lane = _parse_lane(row, scope_names, root)
+        if lane.name in lanes:
+            raise ConfigError(f"duplicate lane name {lane.name!r}; each lane needs its own name")
+        lanes[lane.name] = lane
+    return list(lanes.values())
+
+
+def _build_config(raw: dict, root: str | os.PathLike | None = None) -> Config:
+    scopes, scope_notes = _parse_scopes(raw["scope"])
     scope_names = {s.name for s in scopes}
-    lanes = [_parse_lane(row, scope_names) for row in raw.get("lane", [])]
-    _reject_shared_artifacts(lanes)
     main = raw.get("crapkit", {})
+    lanes = [lane._replace(log_max_bytes=main.get("log_max_bytes", 16777216))
+             for lane in _unique_lanes(raw.get("lane", []), scope_names, root)]
+    _reject_shared_artifacts(lanes, root)
     return Config(
-        target=int(main.get("target", DEFAULT_TARGET)),
+        target=main.get("target", DEFAULT_TARGET),
         scopes=scopes,
         exclude_globs=tuple(raw.get("exclude", {}).get("globs", ())),
-        max_file_bytes=_optional_int(raw.get("exclude", {}), "max_file_bytes"),
-        churn_window_months=int(main.get("churn_window_months", 12)),
-        worklist_floor=int(main.get("worklist_floor", 5)),
-        worklist_top=int(main.get("worklist_top", 50)),
+        max_file_bytes=raw.get("exclude", {}).get("max_file_bytes"),
+        churn_window_months=main.get("churn_window_months", 12),
+        worklist_floor=main.get("worklist_floor", 5),
+        worklist_top=main.get("worklist_top", 50),
         lanes=tuple(lanes),
         ratchet_file=main.get("ratchet_file", "crapkit-ratchet.tsv"),
         alert_command=main.get("alert_command", ""),
-        scoped_tests=tuple(sorted((str(k), str(v)) for k, v in main.get("scoped_tests", {}).items())),
+        scoped_tests=tuple(sorted(main.get("scoped_tests", {}).items())),
         mutation_command=main.get("mutation_command", ""),
-        mutation_timeout_seconds=int(main.get("mutation_timeout_seconds", 300)),
-        mutation_workers=_positive_int(main, "mutation_workers", 1),
-        diff_uncovered_max=_optional_int(main, "diff_uncovered_max"),
-        tighten_max_jump=_factor(main, "tighten_max_jump", 2.0),
-        debt_max_age_months=_optional_int(main, "debt_max_age_months"),
-        repayment_min_per_30d=_optional_int(main, "repayment_min_per_30d"),
-        max_parallel_lanes=_bounded_int(main, "max_parallel_lanes", default=1, minimum=1),
-        analysis_workers=_bounded_int(main, "analysis_workers", default=0, minimum=0),
-        notes=_notes(main, "[crapkit]"),
+        mutation_timeout_seconds=main.get("mutation_timeout_seconds", 300),
+        mutation_workers=main.get("mutation_workers", 1),
+        diff_uncovered_max=main.get("diff_uncovered_max"),
+        tighten_max_jump=float(main.get("tighten_max_jump", 2.0)),
+        debt_max_age_months=main.get("debt_max_age_months"),
+        repayment_min_per_30d=main.get("repayment_min_per_30d"),
+        max_parallel_lanes=main.get("max_parallel_lanes", 1),
+        analysis_workers=main.get("analysis_workers", 0),
+        analysis_worker_budget=main.get("analysis_worker_budget", 0),
+        log_max_bytes=main.get("log_max_bytes", 16777216),
+        test_retention_days=main.get("test_retention_days", 7),
+        test_retention_count=main.get("test_retention_count", 10),
+        notes=tuple(main.get("notes", ())),
         scope_notes=scope_notes,
     )
-
-
-def _bounded_int(main: dict, key: str, *, default: int, minimum: int) -> int:
-    value = main.get(key, default)
-    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
-        raise ConfigError(f"{key} must be an int >= {minimum}, got {value!r}")
-    return value
-
-
-def _factor(main: dict, key: str, default: float) -> float:
-    """A ratio knob: any number at or above 1. Below 1 would refuse a tighten
-    where nothing moved, which stops the ratchet falling and says nothing."""
-    value = main.get(key, default)
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 1:
-        raise ConfigError(f"{key} must be a number >= 1, got {value!r}")
-    return float(value)
-
-
-def _positive_int(main: dict, key: str, default: int) -> int:
-    value = main.get(key, default)
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-        raise ConfigError(f"{key} must be a positive int, got {value!r}")
-    return value
-
-
-def _optional_int(main: dict, key: str) -> int | None:
-    value = main.get(key)
-    if value is None:
-        return None
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ConfigError(f"{key} must be a non-negative int, got {value!r}")
-    return value

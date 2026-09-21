@@ -1,7 +1,9 @@
 # crapkit.toml
 
-One file at the repo root. `crapkit init` writes a working starter; this page is the whole
-key list.
+`crapkit.toml` defines the project root, scopes and measurement commands. That root
+can sit below the Git repository's top directory. `crapkit init` writes a starter;
+this page lists every key. Use [Adoption](adoption.md) to choose the initial scope
+and test layout, and [Coverage lanes](lanes.md) for runner recipes.
 
 Five dials carry almost every decision you will make. Everything else has a default you can
 leave alone:
@@ -21,7 +23,7 @@ Four tables hold them: `[crapkit]`, `[[scope]]`, `[[lane]]`, `[exclude]`.
 
 ```
 $ crapkit doctor
-FAIL unknown key crapkit.churn_windo_months — crapkit ignores it (typo?); [crapkit] accepts these keys: alert_command, analysis_workers, churn_window_months, debt_max_age_months, diff_uncovered_max, max_parallel_lanes, mutation_command, mutation_timeout_seconds, mutation_workers, notes, ratchet_file, repayment_min_per_30d, scoped_tests, target, tighten_max_jump, worklist_floor, worklist_top
+FAIL unknown key crapkit.churn_windo_months — crapkit ignores it (typo?); [crapkit] accepts these keys: alert_command, analysis_worker_budget, analysis_workers, churn_window_months, debt_max_age_months, diff_uncovered_max, log_max_bytes, max_parallel_lanes, mutation_command, mutation_timeout_seconds, mutation_workers, notes, ratchet_file, repayment_min_per_30d, scoped_tests, target, test_retention_count, test_retention_days, tighten_max_jump, worklist_floor, worklist_top
 doctor: 1 problem(s)
 ```
 
@@ -30,6 +32,36 @@ time, and only `doctor` fails on it. Every rejection the loader *does* make (a b
 an unknown parser, a lane naming an undeclared scope, a negative `timeout_seconds`) exits 3.
 
 ---
+
+## File paths and root discovery
+
+Without `--repo`, CLI commands find the nearest `crapkit.toml` at or above the
+current directory. A `.git` entry stops the search. With `--repo PATH`, that path
+names the exact project root; the flag belongs after the subcommand.
+
+| File argument | Meaning |
+|---|---|
+| Relative path with a discovered root | Relative to the current directory, then rebased to the project root. |
+| Relative path with explicit `--repo` | Relative to the named project root. |
+| Absolute source path | Accepted when it resolves inside the project root. |
+| Windows backslash | A directory separator on Windows; a literal filename character on POSIX. |
+
+These rules apply to source arguments such as `brief`, `rescore`, `test-scoped`
+and `claims release`. The `claude-hook` exception gets its root from its input
+payload. [MCP tools](agent-json.md#mcp-server) take project-relative paths because
+their CLI calls run at the server's selected root.
+
+Tracked Git paths preserve whitespace and Unicode separators. Their bytes must
+decode as UTF-8; invalid filename bytes are refused. Scope-prefix normalization
+below applies to configuration strings, not to the filenames Git reports.
+Output flags such as `--export`, `--sarif` and `--emit-baseline` are project-relative;
+an absolute output path explicitly selects a destination outside it.
+
+Parsed source diffs use Crapkit's own Git settings. Display preferences, external
+diff commands and textconv do not change attribution. A supported source file
+marked binary by Git attributes receives a text fallback; ordinary binary files
+remain outside source decoding. Source text is read as UTF-8, then cp1252 as a
+fallback. UTF-16 source is outside that reader policy.
 
 ## `[crapkit]`
 
@@ -41,17 +73,46 @@ an unknown parser, a lane naming an undeclared scope, a negative `timeout_second
 | `worklist_top` | int >= 1 | `50` | Cap on the worklist active list. `worklist --top N` overrides it per call. |
 | `ratchet_file` | string | `"crapkit-ratchet.tsv"` | The committed marks file, repo-relative. |
 | `alert_command` | string | `""` | A shell command that receives a digest or override body on **stdin**. `digest --alert` uses it, and an override refuses to grant without it. Never interpolated into the shell string. |
-| `scoped_tests` | table | none | Written as its own table, `[crapkit.scoped_tests]`, mapping scope name to a command template. `test-scoped` fills `{files}` with the quoted file list; a template with no `{files}` runs as written, which is how a scope runs its whole suite when its tests live outside its own `paths`. It is also step 4 of the burn-down loop and `brief`'s `commands.scoped_tests`, so **doctor warns** about a scope a lane measures with no template behind it: `null` there leaves a session with nothing to run between the gate and verify. |
+| `scoped_tests` | table | none | Written as its own table, `[crapkit.scoped_tests]`, mapping scope name to a command template. `test-scoped` fills `{files}` with the quoted file list; a template with no `{files}` runs as written, which is how a scope runs its whole suite when its tests live outside its own `paths`. `init` picks the form per scope from the tracked files: `{files}` only where the scope's own paths hold a test file; the whole-suite form otherwise, naming the repo's test directory unless pytest's `testpaths` already collects it; `npm run test -w <dir>` for an npm workspace with a test script; and the runner's related-tests mode (`npx vitest related --run {files}`, `npx jest --findRelatedTests {files}`) for a root JavaScript scope, keyed by what package.json names. One comment line above each entry says which form it chose. It is also step 4 of the burn-down loop and `brief`'s `commands.scoped_tests`, so **doctor warns** about a scope a lane measures with no template behind it (`null` there leaves a session with nothing to run between the gate and verify) and **doctor fails** a `{files}` template on a scope that holds no test file, since that template hands the runner a source path and collects nothing. |
 | `notes` | array of string | `[]` | House rules for this repo, in the config rather than in a file an agent has to find. `brief` carries them into the packet as `notes`, repo-wide lines first, then the scope's own. crapkit never parses them. |
-| `mutation_command` | string | `""` | The suite run once per mutant. A nonzero exit means the mutant was killed, so the command is also run **once against the unmutated tree** before the first mutant and must exit 0 there: without that baseline a command that cannot start here killed every mutant and scored 100%. `mutate` refuses to run without it. Shell and PowerShell files in the diff are skipped and named on stderr: `<` and `>` are redirections in both, so their mutants would be noise. |
+| `mutation_command` | string | `""` | The suite run once per mutant. A nonzero exit means the mutant was killed, so the command is also run **once against the unmutated tree** before the first mutant and must exit 0 there: without that baseline a command that cannot start here killed every mutant and scored 100%. `mutate` refuses to run without it. Shell and PowerShell files in the diff are skipped and named on stderr: `<` and `>` are redirections in both, so their mutants would be noise. So is every file outside the scored corpus (a test file, an excluded path, a file over `max_file_bytes`, a file no scope claims): `mutate` never mutates a test, and a diff with nothing left says `nothing to mutate` at exit 0 without running the command. |
 | `mutation_timeout_seconds` | int >= 1 | `300` | Per-mutant timeout. Expiry counts as killed, and the kill takes the suite's whole process tree, so a looping mutant does not outlive the run that gave up on it. At the default cap of 100 mutants this bounds one `mutate` run at over 8 hours, so lower it for a slow suite. |
-| `mutation_workers` | int >= 1 | `1` | Mutants run at once. `1` applies them to the live working tree one at a time and keeps no pool. Above 1, crapkit runs each worker in its own detached git worktree and deals mutants round-robin. Those worktrees are **kept**, at `.crapkit/mutate-pool/w0..wN`: building four of them costs 30.6 s on a 31,459-file repo and re-preparing the kept four costs 0.46 s, and every run re-prepares them (`git checkout --force <HEAD sha>`, then `git clean -xdff`) before a mutant is applied, so the last run's mutant goes back and a commit made since lands. What stays on disk is that many checkouts of your repo, and nothing bounds its size; `crapkit mutate --drop-pool` removes them and exits. A second `mutate` running in the same repo finds the pool locked and gets its own throwaway worktrees, removed on the way out as before. Results merge by the mutant's position in the list, so the same tree reports the same JSON at any worker count. |
+| `mutation_workers` | int >= 1 | `1` | Mutants run at once. Every worker uses a kept detached Git worktree, including one. See [mutation worktrees](#mutation-worktrees) for preparation, concurrent runs and cleanup. |
 | `diff_uncovered_max` | int >= 0 | absent | Ceiling on changed lines that never ran. **Absent means warn only**: `verify` still prints `warning: N changed line(s) have no coverage` on stderr and lists the first 20, but exits 0. Set it and a breach exits 9. |
 | `debt_max_age_months` | int >= 0 | absent | `ratchet report --enforce` flags open marks older than this (counted at 30 days per month). |
 | `repayment_min_per_30d` | int >= 0 | absent | `ratchet report --enforce` flags a burn-down that repaid fewer marks than this in the last 30 days while debt is open. |
 | `max_parallel_lanes` | int >= 1 | `1` | Lanes running at once. `1` is strictly serial. See [lanes.md](lanes.md#running-lanes-in-parallel). |
-| `analysis_workers` | int >= 0 | `0` | The lizard process pool size. `0` means one worker per core. Set it when the analysis pass runs beside something else. |
+| `analysis_workers` | int >= 0 | `0` | Requested analysis pool ceiling. `0` sizes pools automatically to balance startup cost and available work, within the process-visible CPU limit. Small or cached passes remain serial. Runnable chunks and the shared budget can admit fewer workers. |
+| `analysis_worker_budget` | int >= 0 | `0` | Shared pool slot ceiling for Crapkit processes running as the same user on this host. `0` uses available CPUs. Admission never waits: a busy pool gives up slots, falling back to the calling process when none are free. See [resource policies](resources.md). |
+| `log_max_bytes` | int >= 0 | `16777216` | Maximum bytes in each current and previous lane log, 16 MiB by default. Rotation keeps recent output and preserves no-progress accounting. `0` retains unlimited direct logs. |
+| `test_retention_days` | int >= 0 | `7` | Remove recognized, idle default test-run evidence older than this many days. `0` disables age pruning. Explicit `--output` directories remain caller-managed. |
+| `test_retention_count` | int >= 0 | `10` | Keep this many recent recognized default test runs. `0` disables count pruning. A run expires when either enabled limit is exceeded; active runs are preserved. |
 | `tighten_max_jump` | number >= 1 | `2.0` | How far a function's CRAP may move between two runs of the **same commit** and still tighten its mark. Past this factor, `verify` holds the mark and prints one `NO TIGHTEN` line on stderr naming the function and both values. One commit measured twice cannot have improved, so a jump that size is the measurement talking, not the code. See [ratchet.md](ratchet.md#damping-a-measurement-that-bounces). |
+
+### Mutation worktrees
+
+Every mutation worker runs in a detached Git worktree, including the default of one.
+Crapkit re-prepares each worker at the current HEAD, then replays dirty, untracked
+and deleted inputs before running the unmutated baseline and the mutants.
+
+The kept pool lives at `.crapkit/mutate-pool/w0..wN` and remains between runs.
+On reuse, Crapkit removes surplus worker directories under the pool's exclusive
+lease, so reducing `mutation_workers` also reduces retained checkouts.
+`crapkit mutate --drop-pool` removes the kept pool and exits.
+
+A concurrent run that finds the pool locked uses private worktrees under
+`.crapkit/mutate-tmp` and removes them when finished. Each new temporary run
+records its repository identity and holds a stable operating-system lease.
+Startup recovery and `crapkit clean` remove only recognized, abandoned runs;
+active or unproved paths stay intact. Old system-temp checkouts from releases
+before 0.7.1 lack that ownership proof and are not removed automatically.
+Results retain mutant order at every worker count.
+
+Mutation refuses symlink or Windows reparse components in captured inputs and
+worker paths. Worker writes also refuse files with multiple hard links, including
+a path the suite replaced before restoration. Use private regular files for
+mutation inputs. Commands finish only after their owned descendants stop; see
+[command cleanup](lanes.md#the-kill-takes-the-whole-process-tree) for platform scope.
 
 ### The debt policy
 
@@ -68,9 +129,13 @@ An array of tables. One scope per group of directories that share a ceiling and 
 languages. Every tracked source file in a declared language must belong to a scope, or
 `doctor` fails with `N tracked file(s) match a scope language but no scope path`.
 
+Use `paths = ["."]` to claim the repo root, including loose source files. A deeper
+declared path takes precedence over this root scope. Language and exclude rules
+still apply.
+
 | Key | Type | Required | Default | What it does |
 |---|---|---|---|---|
-| `name` | string | yes | | The scope's id. Lanes reference it, `--scope` filters on it (exact, not substring). |
+| `name` | string | yes | | The scope's id. Lanes reference it, `--scope` filters on it (exact, not substring; a name no scope declares is a configuration error, exit 3, naming the declared scopes). |
 | `paths` | array of string, min 1 | yes | | Repo-relative path prefixes the scope claims. A bare path also matches that exact file, so `paths = ["core/hot.py"]` claims one file and editing it marks that scope's lane changed. The **deepest** declared path wins when two claim the same file; see [Scope matching](#scope-matching). Written the way git writes one: a leading `./`, a leading or trailing `/` and a `\` separator are all normalized away, so `./src`, `src\` and `src` are one path. A path holding `..` or a drive letter is refused, because no tracked file can match it. |
 | `languages` | array, min 1 | yes | | One or more of `typescript`, `tsx`, `javascript`, `python`, `swift`, `go`, `rust`, `shell`, `powershell`, `cpp`, `objectivec`, `vue`, `java`, `zig`. A file joins the scope only when both its path prefix and its extension match. |
 | `target` | int >= 1 | no | the repo `target` | This scope's ceiling. One repo, different ceilings: strict on new code, tolerant on a legacy tree. |
@@ -122,13 +187,12 @@ naming scripts that way. One line does it:
 
 ```toml
 [exclude]
-globs = ["*.Tests.ps1", "**/*.Tests.ps1"]
+globs = ["**/*.Tests.ps1"]
 ```
 
-Both forms, because [globs are whole-path](#exclude): `**/*.Tests.ps1` needs at least one
-directory in front of the file name, so a repo-root `Deploy.Tests.ps1` stays in the corpus
-and comes back from `doctor` as a tracked file no scope claims. PowerShell repos keep
-scripts at the root more often than most, which is why the bare form leads.
+One form is enough: a leading `**/` [matches zero or more directories](#exclude), so the
+glob reaches a repo-root `Deploy.Tests.ps1` as well as `scripts/Deploy.Tests.ps1`.
+PowerShell repos keep scripts at the root more often than most, which is why that matters.
 
 **`cpp` is the whole C family, C included.** There is no separate `c` label. lizard resolves
 all six suffixes to one reader, so two labels could never measure differently, and `.h` is
@@ -188,14 +252,9 @@ ok   scope 'hot': 1 file
 ok   every tracked source file belongs to a scope
 ```
 
-One predicate answers this for everyone since 0.4.5: the scored corpus, `test-scoped`
-routing, lane reuse and the `brief` packet. They used to answer separately, so `brief` could
-take a function's lane and test command from one scope and its ceiling from another.
-
-**If your repo has nested scopes, its next scan may move files between them.** Whichever
-scope declares the longer path now owns those files, so their per-scope rollups, ceilings
-and lane change. A repo with no nested scopes sees no change at all. Run `crapkit doctor`
-after upgrading and read the per-scope file counts.
+The scored corpus, `test-scoped`, lane reuse and `brief` share this ownership rule.
+After changing nested scopes, run `crapkit doctor --show-files` and check the
+per-scope file lists before measuring them.
 
 ### `coverage_optional = true`
 
@@ -250,7 +309,7 @@ An array of tables. One lane per coverage command. Full recipes in [lanes.md](la
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `globs` | array of string | `[]` | Paths matching any glob leave the corpus. Each glob must match the **whole** repo-relative path, case-insensitively. |
+| `globs` | array of string | `[]` | Paths matching any glob leave the corpus. Each glob matches the **whole** repo-relative path, case-insensitively, and a leading `**/` matches zero or more directories, so one glob covers the repo root and every nested copy. |
 | `max_file_bytes` | int >= 0 | absent (no limit) | Files larger than this leave the corpus entirely, minified blobs included. `doctor` reports each one as a `note`, never a FAIL, and the count surfaces as `skipped_max_bytes` in `inventory --json` and `coverage --json`. |
 
 Test directories are excluded **unconditionally**, before `globs` is consulted: any path
@@ -263,28 +322,49 @@ opens on a dot leaves the corpus before `globs` is read, `.github/workflows/gen.
 there had nothing that could own it and came back from `doctor` as a tracked file matching
 a scope language with no scope path. A dot *file* is not a dot directory and stays in.
 
-Globs are whole-path, so `**/dist/**` requires at least one directory *before* `dist`: it
-matches `web/dist/bundle.js` and not a repo-root `dist/bundle.js`. Write the root form
-beside the nested one for anything you want gone in both places:
+A leading `**/` matches zero or more directories, so `**/dist/**` matches a repo-root
+`dist/bundle.js` and `web/dist/bundle.js` alike, and never `src/distro/x.py`. Write each
+pattern once; a root form such as `dist/**` is still read the way fnmatch reads it (the
+root only), so a hand-written one keeps matching what it matched.
 
-```toml
-globs = ["**/dist/**", "dist/**"]
-```
-
-`init` ships both forms for the four generated trees and for the test-file spellings, so a
-tracked `vendor/` or `dist/` at the repo root no longer becomes a scope of its own, which is
-what it did before, and then either failed `doctor` as a scope no lane measures or joined
-the js lane in a repo that had one, scoring vendored code as the team's own debt.
-`crapkit init` writes this default set:
+`crapkit init` writes this default set, one glob per line:
 
 ```toml
 [exclude]
-globs = ["**/node_modules/**", "**/dist/**", "**/build/**", "**/vendor/**", "**/*.test.*", "**/*.spec.*", "**/test_*.py", "**/*_test.py", "**/conftest.py", "node_modules/**", "dist/**", "build/**", "vendor/**", "*.test.*", "*.spec.*", "test_*.py", "*_test.py", "conftest.py", "*_test.go", "**/*_test.go", "*.config.ts", "*.config.js", "*.config.mts", "**/*.config.ts", "**/*.config.js", "**/*.config.mts"]
+# A leading **/ matches zero or more directories, so each glob below reaches the
+# repo root and every nested copy. Test directories leave the corpus on their own.
+globs = [
+  "**/node_modules/**",
+  "**/dist/**",
+  "**/build/**",
+  "**/vendor/**",
+  "**/generated/**",
+  "**/__generated__/**",
+  "**/*.generated.*",
+  "**/*.test.*",
+  "**/*.spec.*",
+  "**/test_*.py",
+  "**/*_test.py",
+  "**/conftest.py",
+  "**/*_test.go",
+  "**/*.config.ts",
+  "**/*.config.js",
+  "**/*.config.mts",
+]
 ```
 
-The six `*.config.*` entries keep runner config files (`vitest.config.ts` and friends) out
-of the unclaimed-file doctor check; globs are whole-path, so the bare form matches the repo
-root and the `**/` form matches nested copies.
+The three `generated` entries keep generated clients and schemas out of the queue: a
+generated tree scores like anyone else's debt, and on one monorepo a generated client at
+CRAP 90 was the first `next-item`. The three `*.config.*` entries keep runner config files
+(`vitest.config.ts` and friends) out of the unclaimed-file doctor check. `hook-precommit`
+and `claude-hook` apply the same globs the scored corpus does, so a file the list excludes
+is gated by neither.
+
+**If your committed config carries only the nested form, its next scan moves files.**
+Before 0.5.0 `**/dist/**` left a repo-root `dist/` in the corpus; it now excludes it, and
+the same goes for a root `conftest.py` under `**/conftest.py` or a root `*.test.*` file
+under `**/*.test.*`. Ratchet marks on a function that leaves the corpus are held, not
+dropped. Run `crapkit doctor` after upgrading and read the per-scope file counts.
 
 ```
 $ crapkit doctor

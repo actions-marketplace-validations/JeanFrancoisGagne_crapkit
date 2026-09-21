@@ -51,7 +51,7 @@ def test_gate_violations_are_errors():
 # code-scanning UI reads dropped them on the floor.
 
 def test_every_uncovered_changed_line_gets_its_own_located_finding():
-    first, second = diff_uncovered_results([("src/a.py", 12), ("src\\b.py", 4)])
+    first, second = diff_uncovered_results([("src/a.py", 12), ("src/b.py", 4)])
     assert first["ruleId"] == "crapkit/diff-uncovered"
     assert first["level"] == "warning"
     loc = first["locations"][0]["physicalLocation"]
@@ -68,7 +68,7 @@ def test_a_fully_covered_diff_emits_nothing():
 # --- verify's own emission wires all three finding kinds -------------------
 
 def _verify_sarif(tmp_path, uncovered: list) -> list[dict]:
-    from crapkit.cli import _emit_verify_findings
+    from crapkit.cli.verifying import _emit_verify_findings
 
     args = SimpleNamespace(sarif="out.sarif", github=False)
     verdict = SimpleNamespace(gate_violations=(), ratchet_regressions=())

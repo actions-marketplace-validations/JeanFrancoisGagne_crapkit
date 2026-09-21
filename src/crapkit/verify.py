@@ -89,12 +89,35 @@ class RatchetRegression(NamedTuple):
     dirty: bool = False
 
 
+class UncoveredViolation(NamedTuple):
+    path: str
+    line: int
+    dirty: bool = False
+
+
 class Verdict(NamedTuple):
     ok: bool
     gate_violations: list[GateViolation]
     ratchet_regressions: list[RatchetRegression]
     new_failures: list[str]
     dirty_failures: list[str]
+    uncovered_violations: tuple[UncoveredViolation, ...] = ()
+
+
+def settle_verdict(verdict: Verdict) -> Verdict:
+    """Derive success from every remaining finding after a grant or retry."""
+    ok = not (verdict.gate_violations or verdict.ratchet_regressions
+              or verdict.new_failures or verdict.uncovered_violations)
+    return verdict._replace(ok=ok)
+
+
+def with_diff_coverage(verdict: Verdict, uncovered: list[tuple[str, int]],
+                       maximum: int | None, dirty_paths: set[str]) -> Verdict:
+    """Keep a breached changed-line ceiling in the verdict's findings."""
+    if maximum is None or len(uncovered) <= maximum:
+        return verdict
+    findings = tuple(UncoveredViolation(path, line, path in dirty_paths) for path, line in uncovered)
+    return settle_verdict(verdict._replace(uncovered_violations=findings))
 
 
 def _id_forms(path: str) -> tuple[str, str]:
@@ -116,7 +139,8 @@ def dirty_counts(verdict: Verdict) -> tuple[int, int]:
     dirty_ids = set(verdict.dirty_failures)
     flags = ([v.dirty for v in verdict.gate_violations]
              + [r.dirty for r in verdict.ratchet_regressions]
-             + [f in dirty_ids for f in verdict.new_failures])
+             + [f in dirty_ids for f in verdict.new_failures]
+             + [v.dirty for v in verdict.uncovered_violations])
     dirty = sum(flags)
     return len(flags) - dirty, dirty
 
@@ -204,6 +228,23 @@ def _ratchet_regressions(fresh, ratchet, dirty) -> list[RatchetRegression]:
                                                  round(row.crap, 4), entry.path in dirty))
     regressions.sort(key=lambda r: (-(r.fresh_crap - r.recorded), r.path))
     return regressions
+
+
+def unmarked_over_ceiling(fresh: list[ScoredRow], ratchet: list[RatchetEntry], target: int,
+                          scope_targets: dict[str, int] | None = None) -> list[ScoredRow]:
+    """Standing debt nothing guards: the worst row per ratchet key that sits over
+    its ceiling with no mark under that key, worst first.
+
+    The gate judges touched functions only and the ratchet check compares marks
+    only, so a rise on one of these (coverage loss included) reaches no finding.
+    A marked function that rose is a regression already; this is the debt
+    `ratchet seed` was never run on.
+    """
+    marks = _marks_of(ratchet)
+    rows = [row for key, row in rows_by_key(fresh).items()
+            if row.crap > _ceiling(row, target, scope_targets) and key not in marks]
+    rows.sort(key=lambda r: (-r.crap, r.path, r.start))
+    return rows
 
 
 def evaluate(

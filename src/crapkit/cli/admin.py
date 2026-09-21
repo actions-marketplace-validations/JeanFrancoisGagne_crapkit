@@ -16,12 +16,13 @@ from pathlib import Path, PurePath
 from .. import __version__, config
 from ..config import load_config_text, shell_words
 from ..doctor import Finding
-from ..errors import ConfigError, ToolError
-from ..gitio import _common_dir, _git_dir, ls_files
+from ..errors import ConfigError, GitError, ToolError
+from ..gitio import _common_dir, _git, _git_dir, ls_files
 from ..invocation import _self
+from ..rootfind import MAX_LEVELS, find_root
 from ..store import SnapshotStore
-from ..universe import assign_files, scan_files
-from ._shared import _file_sizer, _load_repo_config, _print_json
+from ..universe import assign_files, overlapping_scope, path_matchers, scan_files
+from ._shared import _command_root, _file_sizer, _load_repo_config, _print_json, repo_text
 
 
 def _present_lockfiles(root: Path) -> frozenset[str]:
@@ -194,18 +195,38 @@ def _next_step(scopes: dict, lanes: tuple) -> str:
 
     if lanes:
         return (f"detected {len(lanes)} lane(s) from this repo's own files: "
-                f"{', '.join(lane.name for lane in lanes)} — next: run `{_self()} coverage`")
+                f"{', '.join(lane.name for lane in lanes)} - next: run `{_self()} coverage`")
     if all(cc_only_scope(languages) for languages in scopes.values()):
         return ("no coverage parser reads this repo's languages, so every scope is "
-                "cc-only (coverage_optional = true) and needs no lane — next: run "
+                "cc-only (coverage_optional = true) and needs no lane - next: run "
                 f"`{_self()} coverage`")
     return ("next: declare a [[lane]] per coverage command (see the commented template), "
             f"then run `{_self()} coverage`")
 
 
-def _print_init_summary(scopes: dict, lanes: tuple) -> None:
+def _unrouted_workspaces_note(written: tuple, package_json) -> str | None:
+    """Why there is no js lane when several workspaces could each have had
+    one. File presence cannot pick among them, and saying nothing left a
+    monorepo lead to learn it from doctor's next line."""
+    from ..scaffold import runner_workspaces
+
+    named = runner_workspaces(package_json)
+    if len(named) < 2 or any(lane.parser == "istanbul" for lane in written):
+        return None
+    listed = ", ".join(f"{directory}: {runner}" for directory, runner in named)
+    return (f"{len(named)} workspaces name a runner ({listed}) and the root names none, so "
+            "no js lane was written: declare one [[lane]] per workspace from the commented "
+            "template, each with its own cwd and artifact")
+
+
+def _print_init_summary(scopes: dict, lanes: tuple, package_json="") -> None:
+    from ..scaffold import live_lanes
+
     print(f"wrote crapkit.toml with {len(scopes)} scope(s): {', '.join(scopes)}")
     print(_next_step(scopes, lanes))
+    note = _unrouted_workspaces_note(live_lanes(lanes, scopes), package_json)
+    if note:
+        print(note)
 
 
 def _no_scopes_reason(root: Path) -> str:
@@ -252,13 +273,11 @@ def _start_probe(word: str) -> int | None:
     asks; only the shell's own could-not-run code answers no.
 
     Memoized on the word, which is the whole question: no cwd, no env, so two
-    lanes starting with `pnpm` cannot get different answers. A repo with N
-    lanes over K distinct first words spawned N shells to learn K things —
-    openclaw declares 14 lanes over 2 words, and doctor spent 5.6 of its 6.9
-    seconds waiting on the 12 duplicates. None is cached on purpose: it is the
-    answer for OSError and for the 15 s deadline alike, and caching it turns a
-    hung runner from 14 timeouts into 1. Whoever gives the probe a cwd or an
-    env has to put it in the key in the same commit."""
+    lanes starting with `pnpm` cannot get different answers. Probe each distinct
+    first word once, including when it returns None after OSError or the 15 s
+    deadline. Repeated lanes then share the answer without repeating a hung
+    runner's timeout. Whoever gives the probe a cwd or an env has to put it in
+    the key in the same commit."""
     from ..procs import run_bounded
 
     try:
@@ -404,7 +423,7 @@ def _missing_pytest_cov_note(name: str, word: str) -> str:
 
     resolved = shutil.which(word) or word
     return (f"note: lane {name!r} names `{word}`, which resolves here to {resolved} and "
-            f"cannot import pytest_cov — run `{word} -m pip install pytest-cov` in the "
+            f"cannot import pytest_cov - run `{word} -m pip install pytest-cov` in the "
             "environment the suite runs in "
             # Double quotes, not single: cmd.exe passes ' through as an
             # ordinary character and pip rejects the requirement. Double
@@ -484,12 +503,42 @@ def _warn_missing_pytest_cov(lanes: tuple) -> None:
             print(note, file=sys.stderr)
 
 
+def _store_ignored_above(root: Path) -> bool:
+    """Whether a .gitignore above the root already ignores the state directory.
+
+    git applies an unanchored pattern at every depth, so a root `.crapkit/`
+    line ignores web/.crapkit/ too and a nested init has nothing to add. git
+    consults nothing above a repository's own top, so a root that is one (a
+    nested repository, a linked worktree, a checkout under an ignoring
+    directory) reads no ancestor at all, and a deeper root stops reading at
+    the first top it finds."""
+    if (root / ".git").exists():
+        return False
+    for directory in root.parents[:MAX_LEVELS]:
+        if _ignores_store(directory / ".gitignore"):
+            return True
+        if (directory / ".git").exists():
+            return False
+    return False
+
+
+def _ignores_store(gitignore: Path) -> bool:
+    if not gitignore.is_file():
+        return False
+    lines = {line.strip() for line in
+             gitignore.read_text(encoding="utf-8", errors="replace").splitlines()}
+    return bool(lines & {".crapkit/", ".crapkit"})
+
+
 def _extend_gitignore(root: Path, lanes: tuple) -> None:
     """Ignore what adopting crapkit will write: the store, and each lane's
     artifact. Without this the consumer's next `git status` is a wall of
-    untracked coverage output nobody asked for."""
+    untracked coverage output nobody asked for. A nested configuration under a
+    root whose .gitignore already ignores the store writes nothing (ADR 0002)."""
     from ..scaffold import gitignore_update
 
+    if _store_ignored_above(root):
+        return
     path = root / ".gitignore"
     current = path.read_text(encoding="utf-8") if path.is_file() else ""
     text, added = gitignore_update(current, lanes)
@@ -499,29 +548,52 @@ def _extend_gitignore(root: Path, lanes: tuple) -> None:
     print(f"added to .gitignore: {', '.join(added)}")
 
 
+def _refuse_claimed_by_ancestor(root: Path) -> None:
+    """A second crapkit.toml under a directory an ancestor's scope path already
+    claims would be two configurations selecting the same files, one store
+    each, with the nested one shadowing the root's for everything below it
+    (ADR 0002: nearest wins). The walk starts at the root itself, so a `.git`
+    entry there, a nested repository or a linked worktree, stops it and init
+    proceeds; a root that is the repository top never walks past its own `.git`."""
+    above = find_root(root)
+    if above is None:
+        return
+    directory = root.relative_to(above).as_posix()
+    cfg = _load_repo_config(above)
+    scope = overlapping_scope(directory, path_matchers({s.name: s.paths for s in cfg.scopes}))
+    if scope is not None:
+        raise ConfigError(f"crapkit.toml at {above} already claims {directory} "
+                          f"(scope {scope!r}); edit that configuration instead")
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     from ..scaffold import (detect_lanes, live_lanes, pytest_testpaths, sniff_scopes,
                             starter_toml)
 
-    root = Path(args.repo).resolve()
+    root = Path(args.repo or ".").resolve()  # init writes where the user stands; it adopts nothing
     toml_path = root / "crapkit.toml"
     if toml_path.is_file():
         raise ConfigError(f"crapkit.toml already exists in {root} — edit it instead")
-    scopes = sniff_scopes(ls_files(root))
+    _refuse_claimed_by_ancestor(root)
+    files = ls_files(root)
+    scopes = sniff_scopes(files)
     if not scopes:
         raise ConfigError(_no_scopes_reason(root))
     # A config whose lanes are all commented out scores every function no-lane,
     # so a fresh repo cannot rank anything until somebody hand-writes a lane.
     # The interpreter goes to both: a repo with no pytest marker file gets no
     # lane to read it back off, and its commented template is what the reader
-    # uncomments.
+    # uncomments. The tracked files and the package.json map go to the starter
+    # too: they decide which scoped-test form each scope gets.
     interpreter = _interpreter(root, tuple(scopes))
-    lanes = detect_lanes(_present_markers(root), _package_json(root), interpreter=interpreter)
+    packages = _package_json(root)
+    lanes = detect_lanes(_present_markers(root), packages, interpreter=interpreter)
     text = starter_toml(scopes, lanes, interpreter=interpreter,
-                        testpaths=pytest_testpaths(_marker_texts(root)))
+                        testpaths=pytest_testpaths(_marker_texts(root)),
+                        tracked=files, package_json=packages)
     load_config_text(text)  # self-check: never write a config crapkit cannot read back
     toml_path.write_text(text, encoding="utf-8", newline="\n")
-    _print_init_summary(scopes, lanes)
+    _print_init_summary(scopes, lanes, packages)
     _warn_missing_pytest_cov(live_lanes(lanes, scopes))
     _extend_gitignore(root, live_lanes(lanes, scopes))
     return 0
@@ -721,15 +793,141 @@ def _doctor_lane_summary(cfg) -> Finding:
     return Finding("ok", "no [[lane]] declared: every scope is cc-only, so none is needed")
 
 
-def _lane_problems(root: Path, cfg) -> list[str]:
-    return [p for lane in cfg.lanes
-            for p in (_lane_problem(root, lane), *_lane_command_problems(root, lane),
-                      _lane_start_problem(lane)) if p]
+def _lane_problems_of(root: Path, lane) -> list[str]:
+    return [p for p in (_lane_problem(root, lane), *_lane_command_problems(root, lane),
+                        _lane_start_problem(lane)) if p]
+
+
+def _lane_findings(cfg, problems: list[str]) -> list[Finding]:
+    return [Finding("FAIL", p) for p in problems] or [_doctor_lane_summary(cfg)]
 
 
 def _doctor_lanes(root: Path, cfg) -> list[Finding]:
-    return ([Finding("FAIL", p) for p in _lane_problems(root, cfg)]
-            or [_doctor_lane_summary(cfg)]) + _doctor_results_artifacts(cfg)
+    """The lane checks, then the probe of every lane that passed them. A lane
+    with a problem of its own is not probed: the dead-interpreter FAIL already
+    names the word, and init's note would say it again one line down."""
+    by_lane = [(lane, _lane_problems_of(root, lane)) for lane in cfg.lanes]
+    healthy = [lane for lane, problems in by_lane if not problems]
+    return (_lane_findings(cfg, [p for _, problems in by_lane for p in problems])
+            + _doctor_results_artifacts(cfg) + _doctor_lane_probes(healthy))
+
+
+# One probe answers three questions about the python a lane names: where the
+# word lands, and which pytest and pytest-cov it carries. Printed on a clean
+# doctor, because `no problems found` on a lane running the system python
+# while the repo's own venv held the plugin is the report this came from.
+_RUNNER_MARKER = "CRAPKIT_RUNNER_REPORT "
+_VERSION_PROBE = ('-c "import sys, pytest, pytest_cov; '
+                  f"print('{_RUNNER_MARKER}' + sys.executable, "
+                  'pytest.__version__, pytest_cov.__version__)"')
+
+
+def _runner_versions(report: str) -> tuple[str, str, str] | None:
+    line = next((line[len(_RUNNER_MARKER):] for line in report.splitlines()
+                 if line.startswith(_RUNNER_MARKER)), "")
+    parts = line.rsplit(None, 2)
+    return (parts[0], parts[1], parts[2]) if len(parts) == 3 else None
+
+
+@lru_cache(maxsize=None)
+def _runner_report(word: str) -> tuple[str, str, str] | None:
+    """(executable, pytest version, pytest-cov version) the interpreter word
+    answers through the lane's shell, or None when it cannot say. Memoized on
+    the word for the reason `_start_probe` is: one machine fact per word,
+    however many lanes name it. The path may hold spaces, so the two versions
+    are split off the right."""
+    from tempfile import TemporaryFile
+    from ..procs import run_bounded
+
+    try:
+        with TemporaryFile() as output:
+            code = run_bounded(f"{_shell_quote(word)} {_VERSION_PROBE}",
+                               _PROBE_TIMEOUT_SECONDS, stream=output,
+                               env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+            output.seek(0)
+            report = output.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    return _runner_versions(report) if code == 0 else None
+
+
+def _same_environment(a: str, b: str) -> bool:
+    """Do two interpreter paths name one environment? Judged on the directory
+    each executable sits in, never on the binary: on POSIX `python -m venv`
+    symlinks bin/python to the base interpreter, so samefile on the two
+    executables read a venv and its base as one python while a package
+    installed in one stayed invisible to the other. `python` and `python3.12`
+    beside each other in one bin are one install, symlink or not."""
+    dir_a, dir_b = os.path.dirname(os.path.abspath(a)), os.path.dirname(os.path.abspath(b))
+    try:
+        return os.path.samefile(dir_a, dir_b)
+    except OSError:
+        return os.path.normcase(dir_a) == os.path.normcase(dir_b)
+
+
+def _foreign_interpreter(name: str, executable: str) -> list[Finding]:
+    """WARN when the lane's python is not the one running this doctor. A
+    package installed in one is invisible to the other, which is how a lane
+    ran the system python while the repo's venv held pytest-cov."""
+    if _same_environment(executable, sys.executable):
+        return []
+    return [Finding("WARN", f"lane {name!r} runs {executable}, not the python running this "
+                            f"doctor ({sys.executable}); a package installed in one is not "
+                            "seen by the other")]
+
+
+def _pytest_head(command: str) -> str:
+    """The word in front of pytest: the manager or tool the lane runs pytest
+    through when no python does. A lane that chains steps runs pytest after
+    `&&`, so this is the segment's head, not the command's first word; the
+    first word only when no segment names pytest at all."""
+    segment = _pytest_segment(command)
+    return segment[0] if segment else _first_word(command)
+
+
+def _unprobed_lane_note(lane) -> Finding:
+    """A lane no python heads names nothing doctor can ask: `uv run` and its
+    siblings provision the environment they run in, and asking one would
+    provision it to answer. Said out loud, because a lane that printed nothing
+    read the same as one probed and found healthy."""
+    return Finding("note", f"lane {lane.name!r} runs pytest through `{_pytest_head(lane.command)}`, "
+                           "which is not a python doctor can ask: interpreter and pytest-cov not "
+                           f"probed, the first `{_self()} coverage` will say whether the plugin imports")
+
+
+def _first_run_failure(lane) -> list[Finding]:
+    """init's first-run note as a FAIL, or nothing when a stub interpreter
+    answered neither the version probe nor the import probe."""
+    note = _lane_first_run_note(lane)
+    return [Finding("FAIL", note.removeprefix("note: "))] if note else []
+
+
+def _lane_probe_findings(lane) -> list[Finding]:
+    """The interpreter and plugin versions a healthy lane resolves to, plus a
+    WARN when that interpreter is foreign; init's first-run note as a FAIL when
+    the interpreter cannot say; a note when no python heads the lane. The
+    version report goes first: it imports pytest_cov on its way, so it answers
+    the first-run question too, and a healthy lane costs one interpreter start
+    instead of two."""
+    word = _probe_interpreter(lane.command)
+    if word is None:
+        return [_unprobed_lane_note(lane)]
+    report = _runner_report(word)
+    if report is None:
+        return _first_run_failure(lane)
+    executable, pytest_version, cov_version = report
+    resolved = Finding("ok", f"lane {lane.name!r}: {word} -> {executable} "
+                             f"(pytest {pytest_version}, pytest-cov {cov_version})")
+    return [resolved, *_foreign_interpreter(lane.name, executable)]
+
+
+def _doctor_lane_probes(lanes) -> list[Finding]:
+    """init's first-run lane note, asked again of every coverage.py lane that
+    runs `pytest --cov`, so a lane whose python cannot import pytest-cov fails
+    doctor instead of the first `crapkit coverage`. Only those lanes: an
+    istanbul lane has no plugin to import. A manager-headed one names no
+    python to ask and gets a note saying so."""
+    return [finding for lane in _probed_lanes(lanes) for finding in _lane_probe_findings(lane)]
 
 
 _RESULTS_HINT = {
@@ -798,14 +996,16 @@ def _newest_coverage_run(store: SnapshotStore) -> dict | None:
 @dataclass
 class _DirCount:
     """One directory's share of a run: how many functions it holds, how many of
-    them carry a verdict other than untested, and the file stems to match on."""
+    them carry a verdict other than untested, and the file stems and language
+    families to match on."""
     functions: int = 0
     others: int = 0
     stems: set = field(default_factory=set)
+    families: set = field(default_factory=set)
 
 
 def _dirs_from_counts(counts: list[tuple]) -> dict[str, _DirCount]:
-    from ..doctor import _dir_of, _stem_of
+    from ..doctor import _dir_of, _family_of, _stem_of
 
     dirs: dict[str, _DirCount] = {}
     for path, functions, others in counts:
@@ -813,6 +1013,7 @@ def _dirs_from_counts(counts: list[tuple]) -> dict[str, _DirCount]:
         entry.functions += functions
         entry.others += others
         entry.stems.add(_stem_of(path))
+        entry.families.add(_family_of(path))
     return dirs
 
 
@@ -823,12 +1024,13 @@ def _unmeasured_gaps(counts: list[tuple], tracked: list[str]) -> tuple:
     it carries a verdict other than untested and a tracked test file names its
     code. The matching itself stays doctor's, so the mirror rule has one copy.
     """
-    from ..doctor import UnmeasuredDir, _matching_test, _test_files
+    from ..doctor import UnmeasuredDir, _matching_test, _tests_by_family
 
-    test_files = _test_files(tracked)
+    test_files = _tests_by_family(tracked)
     found = []
     for directory, stats in sorted(_dirs_from_counts(counts).items()):
-        example = _matching_test(directory, stats.stems, test_files) if not stats.others else None
+        example = _matching_test(directory, stats.stems, stats.families, test_files) \
+            if not stats.others else None
         if example:
             found.append(UnmeasuredDir(directory, stats.functions, example))
     return tuple(found)
@@ -885,6 +1087,53 @@ def _doctor_hook_modes(root: Path) -> list[Finding]:
                             "is set, so Unix clones silently skip it; fix with "
                             f"`git update-index --chmod=+x {path}` and commit")
             for path in non_executable_hooks(_hook_modes(root))]
+
+
+# The byte-order marks a Windows editor or shell puts in front of a script, and
+# how the warning names each. git execs the file as-is, and no kernel or sh
+# reads `\xef\xbb\xbf#!/bin/sh` as a shebang.
+_LEADING_MARKS = (
+    (b"\xef\xbb\xbf", "a UTF-8 byte-order mark (ef bb bf)"),
+    (b"\xff\xfe", "a UTF-16 byte-order mark (ff fe, the PowerShell 5.1 Out-File default)"),
+    (b"\xfe\xff", "a UTF-16 byte-order mark (fe ff)"),
+)
+
+
+def _hook_file(root: Path) -> str | None:
+    """The pre-commit hook git would spawn for this checkout, spelled the way git
+    spells it: under `core.hooksPath` when that is set, else the admin
+    directory's `hooks/`, so a linked worktree lands on the right one. None
+    outside a repository."""
+    try:
+        return _git(root, "rev-parse", "--git-path", "hooks/pre-commit").strip() or None
+    except GitError:
+        return None
+
+
+def _leading_mark(path: Path) -> str | None:
+    """What the file opens with when that is a byte-order mark, else None; a
+    hook that is not there is not a finding."""
+    try:
+        head = path.read_bytes()[:3]
+    except OSError:
+        return None
+    return next((what for sign, what in _LEADING_MARKS if head.startswith(sign)), None)
+
+
+def _doctor_hook_encoding(root: Path) -> list[Finding]:
+    """WARN on a pre-commit hook whose first bytes git cannot spawn.
+
+    A Windows author who wrote the hook with `Out-File` got a BOM (or UTF-16)
+    in front of the shebang, git said `cannot spawn .git/hooks/pre-commit` at
+    the first commit and let it through ungated, and doctor had passed the
+    file. WARN, not FAIL: the config is fine, the file beside it is not.
+    """
+    named = _hook_file(root)
+    mark = _leading_mark(root / named) if named else None
+    if mark is None:
+        return []
+    return [Finding("WARN", f"{named} starts with {mark}, which git cannot spawn; rewrite "
+                            "it as ASCII (PowerShell: Set-Content -Encoding ascii)")]
 
 
 _CG_SIGNATURE = b"CGPH"
@@ -966,15 +1215,20 @@ def _doctor_findings(root: Path, cfg, raw: dict, files: list[str],
             + _doctor_lanes(root, cfg)
             + _doctor_artifact_litter(cfg)
             + _doctor_hook_modes(root)
+            + _doctor_hook_encoding(root)
             + _doctor_commit_graph(root)
             + _doctor_tools()
-            + _doctor_scoped_tests(cfg)
+            + _doctor_scoped_tests(cfg, files)
             + _doctor_unmeasured(root, cfg, files))
 
 
-def _doctor_scoped_tests(cfg) -> list[Finding]:
-    from ..doctor import scoped_test_gaps
-    return list(scoped_test_gaps(cfg.lanes, cfg.scoped_tests))
+def _doctor_scoped_tests(cfg, files: list[str]) -> list[Finding]:
+    """The scope a lane measures with no template (WARN), and the {files}
+    template on a scope that holds no test file (FAIL)."""
+    from ..doctor import files_template_gaps, scoped_test_gaps
+
+    return (list(scoped_test_gaps(cfg.lanes, cfg.scoped_tests))
+            + list(files_template_gaps(cfg.scoped_tests, cfg.scope_paths, files)))
 
 
 def _at_level(findings: list[Finding], level: str) -> list[str]:
@@ -1027,9 +1281,19 @@ def _doctor_report(root: Path, cfg, findings: list[Finding]) -> dict:
             "lanes": _lane_reports(root, cfg),
             "newest_run": _newest_run_report(_store_if_any(root)),
             "problems": _at_level(findings, "FAIL"),
+            "resources": _resource_policy(cfg),
             "store": _store_report(root),
             "versions": _version_report(),
             "warnings": _at_level(findings, "WARN")}
+
+
+def _resource_policy(cfg) -> dict:
+    from ..resources import resource_status
+    return {**resource_status(analysis_workers=cfg.analysis_workers,
+                              worker_budget=cfg.analysis_worker_budget),
+            "log_max_bytes": cfg.log_max_bytes,
+            "test_retention_days": cfg.test_retention_days,
+            "test_retention_count": cfg.test_retention_count}
 
 
 def _print_findings(findings: list[Finding]) -> None:
@@ -1043,6 +1307,11 @@ def _emit_doctor(root: Path, cfg, findings: list[Finding], as_json: bool) -> Non
     if as_json:
         _print_json(_doctor_report(root, cfg, findings))
         return
+    policy = _resource_policy(cfg)
+    print(f"resources: up to {policy['pool_worker_limit']} analysis worker(s) per pool, "
+          f"{policy['shared_pool_limit']} shared slot(s); "
+          f"lane log limit {policy['log_max_bytes']} bytes per file; "
+          f"test evidence {policy['test_retention_days']} days / {policy['test_retention_count']} runs")
     _print_findings(findings)
 
 
@@ -1078,11 +1347,10 @@ def _lane_durations(root: Path, cfg) -> tuple[float, ...]:
 def _doctor_tune(root: Path, cfg) -> int:
     """Advisory only: knob lines from this machine's cpu count and whatever lane
     durations are already on disk. Nothing is written and nothing is executed."""
-    import os
-
     from ..doctor import suggest_knobs, tune_lines
+    from ..resources import available_cpus
 
-    cpus = os.cpu_count() or 1
+    cpus, _ = available_cpus()
     knobs = suggest_knobs(cpus=cpus, lanes=len(cfg.lanes))
     for line in tune_lines(cpus=cpus, knobs=knobs, durations=_lane_durations(root, cfg)):
         print(line)
@@ -1117,17 +1385,22 @@ def _named_protocol(handler: dict) -> str | None:
     args end at `--protocol` is malformed, and reading it must not raise.
     """
     args = handler.get("args", [])
+    if not isinstance(args, list) or any(not isinstance(arg, str) for arg in args):
+        raise ValueError("hook args must be a list of strings")
     return dict(zip(args, args[1:])).get("--protocol")
 
 
 def _hook_protocols(root: Path) -> tuple[str, ...] | None:
-    """Every protocol the plugin's hooks name, or None when it ships no hooks
-    file. The empty tuple is the third state: a hooks file naming no protocol,
+    """Every protocol the plugin's hooks name, or None for unreadable hooks.
+    The empty tuple is the third state: a hooks file naming no protocol,
     which argparse defaults to the supported one."""
     hooks = _plugin_json(root / "hooks" / "hooks.json")
     if not isinstance(hooks, dict):
         return None
-    named = [_named_protocol(handler) for handler in _hook_handlers(hooks)]
+    try:
+        named = [_named_protocol(handler) for handler in _hook_handlers(hooks)]
+    except (AttributeError, TypeError, ValueError):
+        return None
     return tuple(p for p in named if p is not None)
 
 
@@ -1220,34 +1493,21 @@ def _resolve_plugin_root(arg: str) -> tuple[Path | None, str]:
     return _newest_root(_installed_crapkit_roots(plugins)), str(plugins)
 
 
-def _probed_cli_version(executable: str) -> str:
-    """What `<executable> --version` answers, reduced to the number the manifest
-    carries, or this module's own `__version__` when the probe cannot run OR
-    does not exit 0.
-
-    Only a clean exit is a version. A `crapkit` that starts and then errors — a
-    stale shim, a broken entry point printing a traceback, an argparse usage
-    dump — still has a last word, and taking it made the gap line name a version
-    nothing on the machine reports.
-
-    Spawned directly rather than through `run_bounded`: this probe needs the
-    OUTPUT, and with no shell in between the real program is the child, so
-    subprocess's own timeout lands on it. `crapkit --version` prints
-    `crapkit 0.4.11`, and the manifest carries the number alone.
-    """
+def _probed_cli_version(executable: str) -> str | None:
+    """The launcher's declared version, or None when it cannot answer."""
     import subprocess
 
     try:
-        done = subprocess.run([executable, "--version"], capture_output=True, text=True,
+        done = subprocess.run([executable, "--version"], capture_output=True, encoding="utf-8",
                               timeout=_PROBE_TIMEOUT_SECONDS)
-    except (OSError, subprocess.SubprocessError):
-        return __version__
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return None
     answer = (done.stdout or done.stderr).split() if done.returncode == 0 else []
-    return answer[-1] if answer else __version__
+    return answer[1] if len(answer) == 2 and answer[0] == "crapkit" else None
 
 
 @lru_cache(maxsize=None)
-def _spawned_cli() -> tuple[str, str] | None:
+def _spawned_cli() -> tuple[str, str | None] | None:
     """The console script the plugin actually starts and the version it answers,
     or None when PATH carries no `crapkit` at all.
 
@@ -1316,6 +1576,10 @@ def _doctor_plugin(plugin_root: str) -> int:
         print(_no_crapkit_on_path())
         return 1
     executable, cli_version = spawned
+    if cli_version is None:
+        print(f"crapkit doctor: FAIL {executable} did not answer `crapkit --version`. "
+              "Repair this launcher or install crapkit on the PATH the plugin inherits.")
+        return 1
     lines = plugin_handshake(where=str(root), version=_manifest_version(root),
                              cli_version=cli_version, cli_where=executable,
                              protocols=_hook_protocols(root), supported=PROTOCOL)
@@ -1329,18 +1593,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     if args.plugin_root is not None:
         return _doctor_plugin(args.plugin_root)
-    root = Path(args.repo).resolve()
+    root = _command_root(args.repo)
     cfg = _load_repo_config(root)  # a config that does not parse already exits 3 here
     if args.tune:
         return _doctor_tune(root, cfg)
-    raw = tomllib.loads((root / "crapkit.toml").read_text(encoding="utf-8"))
+    raw = tomllib.loads(repo_text(root / "crapkit.toml", "crapkit.toml"))
     findings = _doctor_findings(root, cfg, raw, ls_files(root), args.show_files)
     _emit_doctor(root, cfg, findings, args.json)
     return 1 if _at_level(findings, "FAIL") else 0
 
 
 def _watch_rescore(root: Path, moved: list[str]) -> None:
-    import subprocess
+    from ..procs import run_owned
 
     present = [f for f in moved if (root / f).is_file()]
     if not present:
@@ -1348,7 +1612,7 @@ def _watch_rescore(root: Path, moved: list[str]) -> None:
     # flush: watch output exists to be tailed live; a block-buffered pipe sits silent
     print(f"--- changed: {', '.join(moved)}", flush=True)
     # a subprocess so a half-saved syntax error can never kill the watcher
-    subprocess.run([sys.executable, "-m", "crapkit", "rescore", *present, "--repo", str(root)])
+    run_owned([sys.executable, "-m", "crapkit", "rescore", *present, "--repo", str(root)])
 
 
 def _watched_files(root: Path, cfg) -> list[str]:
@@ -1360,8 +1624,8 @@ def _watched_files(root: Path, cfg) -> list[str]:
 def _watch_cycles(cycles: int | None):
     """The poll counter: `cycles` polls, or an endless one when nothing bounds it.
 
-    Unbounded is the default, because a watcher an operator starts is meant to
-    outlive the shell it was typed into. A bound is what lets the loop be driven
+    Unbounded is the default; the caller must explicitly supervise or detach a
+    persistent watcher. A bound is what lets the loop be driven
     to a known end — by a test, or by a caller that wants one sweep and its exit
     code rather than a process to kill.
     """
@@ -1374,7 +1638,7 @@ def _watch_banner(watched: int, interval: float, cycles: int | None) -> str:
     """The first line, naming how this run ends. Telling an operator to press
     ctrl-c on a `--cycles 3` run describes a loop that is not the one running."""
     stop = "ctrl-c to stop" if cycles is None else f"{cycles} poll(s) then stop"
-    return f"watching {watched} tracked files every {interval}s — {stop}"
+    return f"watching {watched} tracked files every {interval}s - {stop}"
 
 
 def _watch_cycle(root: Path, files: list[str], prev: dict[str, float],
@@ -1395,7 +1659,7 @@ def _watch_cycle(root: Path, files: list[str], prev: dict[str, float],
 def cmd_watch(args: argparse.Namespace) -> int:
     from ..watch import snapshot_mtimes
 
-    root = Path(args.repo).resolve()
+    root = _command_root(args.repo)
     files = _watched_files(root, _load_repo_config(root))
     prev = snapshot_mtimes(root, files)
     print(_watch_banner(len(prev), args.interval, args.cycles), flush=True)

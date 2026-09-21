@@ -10,8 +10,8 @@ from pathlib import Path
 from ..errors import ConfigError, CrapkitError
 from ..invocation import _self
 from ..store import SnapshotStore
-from ._shared import (_load_ratchet_or_die, _load_repo_config, _open_store, _print_json,
-                      _ratchet_or_die)
+from ._shared import (_command_root, _load_ratchet_or_die, _load_repo_config, _open_store,
+                      _print_json, _ratchet_or_die, repo_text)
 
 
 def _is_failed_verify(run: dict) -> bool:
@@ -85,29 +85,50 @@ def _merge_stamp(texts: list[str]) -> str:
 
 def _ratchet_merge(files: list) -> int:
     from ..ratchet import dump_ratchet, merge_ratchets
+    from ..ratchetfile import RatchetFile
 
     if len(files) != 3:
         raise ConfigError("ratchet merge takes exactly three files: BASE OURS THEIRS (git %O %A %B)")
-    texts = [Path(f).read_text(encoding="utf-8") for f in files]
+    # The one reader: OURS is the working copy a shell may have saved with a
+    # BOM, which read strictly hid its stamp (`ours is [unstamped]`, exit 3).
+    saved = [RatchetFile.read(Path(f), required=True) for f in files]
+    texts = [side.text or "" for side in saved]
     stamp = _merge_stamp(texts)
+    key_version = _merge_key_version(texts)
     merged = merge_ratchets(*(_ratchet_or_die(t, f) for t, f in zip(texts, files)))
-    Path(files[1]).write_text(dump_ratchet(merged, stamp=stamp), encoding="utf-8", newline="\n")
+    saved[1].publish(dump_ratchet(merged, stamp=stamp, key_version=key_version))
     print(f"ratchet merge: {len(merged)} mark(s)")
     return 0
 
 
+def _merge_key_version(texts: list[str]) -> int:
+    from ..ratchet import read_key_version
+
+    try:
+        versions = {read_key_version(text) for text in texts}
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    if len(versions) != 1:
+        raise ConfigError("ratchet key identity versions differ; reconcile the legacy "
+                          "function mapping before merging; OURS was left unchanged")
+    return versions.pop()
+
+
 def _ratchet_move(root: Path, cfg, files: list) -> int:
-    from ..ratchet import dump_ratchet, move_marks
+    from ..ratchet import dump_ratchet, move_marks, read_key_version, read_stamp
+    from ..ratchetfile import RatchetFile
 
     if len(files) != 2:
         raise ConfigError("ratchet move takes exactly two paths: OLD NEW")
     ratchet_path = root / cfg.ratchet_file
-    entries, moved = move_marks(_load_ratchet_or_die(ratchet_path, cfg.ratchet_file),
-                                files[0], files[1])
+    saved = RatchetFile.read(ratchet_path)
+    before = saved.text or ""
+    entries, moved = move_marks(saved.entries, files[0], files[1])
     if not moved:
         raise ConfigError(f"ratchet move: no mark under {files[0]} in {cfg.ratchet_file} "
                           "(a directory must end in '/')")
-    ratchet_path.write_text(dump_ratchet(entries), encoding="utf-8", newline="\n")
+    text = dump_ratchet(entries, stamp=read_stamp(before), key_version=read_key_version(before))
+    saved.publish(text)
     print(f"{cfg.ratchet_file}: moved {moved} mark(s) from {files[0]} to {files[1]}")
     return 0
 
@@ -192,11 +213,13 @@ def _ratchet_report(root: Path, cfg, as_json: bool, enforce: bool) -> int:
 
 
 def cmd_ratchet(args: argparse.Namespace) -> int:
-    from ..ratchet import dump_ratchet, seed_ratchet
+    from ..ratchet import seed_ratchet
+    from ..ratchetfile import RatchetFile
+    from ._shared import _check_ratchet_identity
 
     if args.action == "merge":  # a git merge driver runs with no crapkit.toml in sight
         return _ratchet_merge(args.files)
-    root = Path(args.repo).resolve()
+    root = _command_root(args.repo)
     cfg = _load_repo_config(root)
     if args.action == "report":
         return _ratchet_report(root, cfg, args.json, args.enforce)
@@ -206,14 +229,30 @@ def cmd_ratchet(args: argparse.Namespace) -> int:
     latest, skipped = _latest_full_run(store)
     fresh = store.read_scored(latest["id"])
     ratchet_path = root / cfg.ratchet_file
-    prior = _load_ratchet_or_die(ratchet_path, cfg.ratchet_file)
+    saved = RatchetFile.read(ratchet_path)
+    prior = saved.entries
+    key_version = _check_ratchet_identity(saved.text or "", root, cfg.ratchet_file, fresh, store)
     if args.action == "seed":
         entries, added, tightened = seed_ratchet(prior, fresh, target=cfg.target,
                                                  scope_targets=cfg.scope_targets)
         note = f"added {added}, tightened {tightened}"
     else:
         entries, note = _pruned(root, store, prior, fresh)
-    ratchet_path.write_text(dump_ratchet(entries), encoding="utf-8", newline="\n")
-    print(f"{cfg.ratchet_file}: {note} — {len(entries)} mark(s) vs run {latest['id']} "
+    _write_checked_marks(saved, entries, fresh, key_version,
+                          latest['tool_versions'].get('analysis_version'))
+    print(f"{cfg.ratchet_file}: {note} - {len(entries)} mark(s) vs run {latest['id']} "
           f"({latest['commit'][:11]}){_skip_note(skipped)}")
     return 0
+
+
+def _write_checked_marks(saved, entries, fresh, key_version: int,
+                          analysis_version) -> None:
+    from ..ratchet import check_reader_version, checked_key_version, dump_ratchet
+
+    text = dump_ratchet(entries, key_version=key_version)
+    try:
+        check_reader_version(entries, analysis_version)
+        checked_key_version(text, fresh)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    saved.publish(text)

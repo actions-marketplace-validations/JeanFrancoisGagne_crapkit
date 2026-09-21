@@ -13,7 +13,8 @@ from pathlib import Path
 
 from .errors import ConfigError, ToolError
 from .keys import stated_key
-from .ratchet import RatchetEntry, dump_ratchet, load_ratchet
+from .ratchet import RatchetEntry, dump_ratchet
+from .ratchetfile import RatchetFile
 from .store import SnapshotStore
 from .verify import GateViolation
 
@@ -28,16 +29,46 @@ def record_override(
     violations: list[GateViolation],
     reason: str,
     raise_marks: bool = True,
+    key_version: int | None = None,
+    identity_rows=None,
+    ratchet_input: RatchetFile | None = None,
 ) -> None:
+    saved = ratchet_input or RatchetFile.read(root / ratchet_file)
+    _validate_override_keys(saved, violations, identity_rows, key_version)
     _require_auditable_override(reason, alert_command)
     _alert_or_refuse(alert_command, root, violations, reason)
 
     # Audit before grant: the snapshot record lands BEFORE the ratchet write,
     # because the ratchet entry is the functional exemption. A failure between
     # the two leaves an audit trail with no grant, never a grant with no trail.
-    store.write_overrides(run_id, [(v.path, v.long_name, v.crap, reason) for v in violations])
+    store.write_overrides(run_id, [(*stated_key(v), v.crap, reason) for v in violations])
 
-    _grant_ratchet_debt(root / ratchet_file, violations, raise_marks=raise_marks)
+    _grant_ratchet_debt(saved, violations, raise_marks=raise_marks,
+                        key_version=key_version)
+
+
+def _validate_override_keys(saved: RatchetFile, violations, rows, key_version: int | None) -> None:
+    """Reject a mixed-format grant before its alert or either durable record."""
+    _check_saved_reader(saved)
+    prior = saved.entries
+    if rows is None or key_version != 0:
+        return
+    from .ratchet import checked_key_version
+
+    proposed = prior + [RatchetEntry(*stated_key(v), v.crap) for v in violations]
+    try:
+        checked_key_version(dump_ratchet(proposed), rows)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+
+
+def _check_saved_reader(saved: RatchetFile) -> None:
+    from .ratchet import check_reader_keys
+
+    try:
+        check_reader_keys(saved.text or "")
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def _require_auditable_override(reason: str, alert_command: str) -> None:
@@ -65,21 +96,24 @@ def _alert_or_refuse(alert_command: str, root: Path, violations: list[GateViolat
             f"{(proc.stderr or proc.stdout).strip()[-300:]} — no alert, no override")
 
 
-def _grant_ratchet_debt(ratchet_path: Path, violations: list[GateViolation], *,
-                        raise_marks: bool) -> None:
+def _grant_ratchet_debt(saved: RatchetFile, violations: list[GateViolation], *,
+                        raise_marks: bool, key_version: int | None = None) -> None:
     """The functional exemption: the debt enters the committed ratchet, diff-visible."""
-    by_key = _marks_by_key(ratchet_path)
+    by_key = {(e.path, e.long_name): e for e in saved.entries}
     for v in violations:
         key = stated_key(v)
         mark = _override_mark(by_key.get(key), v.crap, raise_marks=raise_marks)
         by_key[key] = RatchetEntry(key[0], key[1], round(mark, 4))
-    ratchet_path.write_text(dump_ratchet(list(by_key.values())), encoding="utf-8", newline="\n")
+    text = dump_ratchet(list(by_key.values()), key_version=_grant_key_version(saved, key_version))
+    saved.publish(text)
 
 
-def _marks_by_key(ratchet_path: Path) -> dict[tuple[str, str], RatchetEntry]:
-    """Prior marks by (path, key name); an absent ratchet file is simply no marks."""
-    existing = load_ratchet(ratchet_path.read_text(encoding="utf-8")) if ratchet_path.is_file() else []
-    return {(e.path, e.long_name): e for e in existing}
+def _grant_key_version(saved: RatchetFile, checked: int | None) -> int:
+    from .ratchet import read_key_version
+
+    if checked is not None:
+        return checked
+    return read_key_version(saved.text or "")
 
 
 def _override_mark(prior: RatchetEntry | None, crap: float, *, raise_marks: bool) -> float:

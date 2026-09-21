@@ -165,6 +165,25 @@ def test_an_unparseable_manifest_reads_as_a_missing_one(tmp_path, capsys):
     assert len(lines) == 1 and ".claude-plugin/plugin.json" in lines[0], lines
 
 
+@pytest.mark.parametrize("hooks", [
+    {"hooks": []},
+    {"hooks": {"PostToolUse": 1}},
+    {"hooks": {"PostToolUse": [None]}},
+    {"hooks": {"PostToolUse": [{"hooks": [None]}]}},
+    {"hooks": {"PostToolUse": [{"hooks": [{"args": "--protocol 1"}]}]}},
+    {"hooks": {"PostToolUse": [{"hooks": [{"args": ["--protocol", []]}]}]}},
+])
+def test_malformed_hook_shapes_report_the_file_without_crashing(tmp_path, capsys, hooks):
+    root = plugin(tmp_path / "p")
+    _write(root / "hooks" / "hooks.json", hooks)
+
+    code, lines, err = check(root, capsys)
+
+    assert code == 1
+    assert len(lines) == 1 and "readable hooks/hooks.json" in lines[0]
+    assert not err
+
+
 # --- what it does not read ----------------------------------------------------
 
 def test_the_handshake_runs_where_there_is_no_crapkit_toml(tmp_path, capsys, monkeypatch):
@@ -423,11 +442,8 @@ def test_an_empty_path_resolves_no_crapkit_at_all(tmp_path, monkeypatch):
     assert RESOLVE.__wrapped__() is None
 
 
-def test_an_executable_that_answers_nothing_falls_back_to_this_module(tmp_path):
-    """The probe is best effort. A console script that cannot run says nothing
-    about versions, and a handshake that reported '' would be worse than one
-    that reports the number it does hold."""
-    assert admin._probed_cli_version(str(tmp_path / "no-such-executable")) == CLI
+def test_an_executable_that_cannot_run_has_no_observed_version(tmp_path):
+    assert admin._probed_cli_version(str(tmp_path / "no-such-executable")) is None
 
 
 def _failing_shim(directory: Path, says: str) -> str:
@@ -450,7 +466,7 @@ def test_an_executable_that_errors_is_not_read_for_a_version(tmp_path):
     nothing on the machine reports."""
     shim = _failing_shim(tmp_path / "bin", "usage: crapkit [-h] COMMAND")
 
-    assert admin._probed_cli_version(shim) == CLI
+    assert admin._probed_cli_version(shim) is None
 
 
 def test_a_zero_exit_is_still_read_for_its_version(tmp_path):

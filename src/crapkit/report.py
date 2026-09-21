@@ -7,15 +7,13 @@ something `crapkit worklist --json` and `crapkit trend --json` do not.
 
 Three decisions are load-bearing.
 
-The page renders the worklist AT ITS DEFAULT, `worklist_top` rows. Rendering
-every admitted row was measured: 46,567 rows of openclaw came to 9.85 MB of HTML
-and 46,567 DOM rows, which is a page that hangs the tab rather than one a
-teammate opens. `report_top` refuses anything past REPORT_ROW_CEILING.
+The page renders the worklist at its default, `worklist_top` rows. Rendering
+every admitted row makes the HTML and DOM grow with the full corpus.
+`report_top` refuses anything past REPORT_ROW_CEILING.
 
-There is no per-function drill-down, because no --json surface carries
-per-function CRAP or coverage repo-wide: a worklist row has `risk` and `weight`,
-not `crap` and `cov`. Each row prints `crapkit explain PATH NAME` instead, so the
-detail is one command away and the file stays in the tens of KB.
+Every row carries the function's CRAP and coverage off the worklist payload,
+and no more than that: dark lines, history and marks stay one `crapkit explain
+PATH NAME` away, which each row prints, so the file stays in the tens of KB.
 
 Every value that reaches the page goes through `_esc`. A function name is source
 text, not markup: `read_chunk( path , max_bytes = 1 < < 20 )` is a real recorded
@@ -27,6 +25,8 @@ contract test compares the two.
 from __future__ import annotations
 
 from html import escape
+import os
+import shlex
 
 from .errors import ConfigError
 from .invocation import _self
@@ -38,7 +38,7 @@ REPORT_ROW_CEILING = 2000
 _CHART_W = 660
 _CHART_H = 130
 
-_WORKLIST_COLUMNS = ("Risk", "CCN", "nloc", "Churn", "Scope", "Function",
+_WORKLIST_COLUMNS = ("Risk", "CCN", "CRAP", "Cov", "nloc", "Churn", "Scope", "Function",
                      "Verdict", "Drill down")
 _SCOPE_COLUMNS = ("Scope", "Functions", "Over target", "CRAP load", "Grade")
 _TREND_COLUMNS = ("Run", "Commit", "When", "Functions", "Over target",
@@ -99,9 +99,8 @@ def _footer(payload: dict) -> str:
     wl = payload["worklist"]
     return (f'<footer>Ranked by risk (ccn times recency-weighted churn) over a '
             f'{_esc(wl["churn_window_months"])}-month window, admitted at '
-            f'ccn &gt;= {_esc(wl["floor"])}. Per-function CRAP and coverage are not on this '
-            f'page: no repo-wide payload carries them. Run the drill-down command on a row '
-            f'to get them.</footer>')
+            f'ccn &gt;= {_esc(wl["floor"])}. Run the drill-down command on a row for its '
+            f'dark lines, history and mark.</footer>')
 
 
 # --- the banner --------------------------------------------------------------
@@ -220,12 +219,26 @@ def _worklist_row(entry: dict) -> str:
     read off the page and one read off `worklist --json` are the same number."""
     return (f'<tr class="wl"><td class="mono">{_esc(entry["risk"])}</td>'
             f'<td class="mono">{_esc(entry["ccn"])}</td>'
+            f'<td class="mono">{_crap_cell(entry)}</td>'
+            f'<td class="mono">{_cov_cell(entry)}</td>'
             f'<td class="mono">{_esc(entry["nloc"])}</td>'
             f'<td class="mono">{_esc(entry["commits"])}c/{_esc(entry["authors"])}a</td>'
             f'<td class="mono">{_esc(entry["scope"])}</td>'
             f'<td>{_function_cell(entry)}</td>'
             f'<td>{_verdict_cell(entry)}</td>'
             f'<td><code>{_drill_down(entry)}</code></td></tr>')
+
+
+def _crap_cell(entry: dict) -> str:
+    """The score as `worklist --json` carries it, one decimal. Empty on a row no
+    run scored (an inventory-only run), never a number the page invented."""
+    crap = entry.get("crap")
+    return "" if crap is None else _esc(f"{crap:.1f}")
+
+
+def _cov_cell(entry: dict) -> str:
+    cov = entry.get("cov")
+    return "" if cov is None else _esc(f"{cov:.0%}")
 
 
 def _function_cell(entry: dict) -> str:
@@ -253,8 +266,17 @@ def _remedy_tone(remedy) -> str:
 
 
 def _drill_down(entry: dict) -> str:
-    """The command that answers what this page deliberately does not carry."""
-    return _esc(f'crapkit explain {entry["path"]} "{entry["function"]}"')
+    """The command that opens the row: dark lines, history, the committed mark."""
+    selector = entry.get("handle") or str(entry["start"])
+    return _esc(f'crapkit explain {_command_arg(entry["path"])} {_command_arg(selector)}')
+
+
+def _command_arg(value: str) -> str:
+    """Quote for PowerShell on Windows and POSIX shells elsewhere."""
+    quoted = shlex.quote(value)
+    if os.name == "nt" and quoted != value:
+        return "'" + value.replace("'", "''") + "'"
+    return quoted
 
 
 # --- the trend series --------------------------------------------------------
@@ -323,18 +345,18 @@ _DOC_OPEN = ('<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\
 # compares every colour token here against that page.
 _STYLE = """
   :root {
-    --paper: #FAF8F4; --ink: #211C17; --muted: #6E6459; --faint: #94897C;
+    --paper: #FAF8F4; --ink: #211C17; --muted: #6E6459; --faint: #766B5E;
     --line: #E5DFD5; --card: #FFFFFF; --card-line: #EAE4DA;
     --accent: #A6391F; --accent-soft: #F7E9E4;
-    --ok: #2E7D46; --ok-soft: #E7F2EA;
-    --warn: #A66A00; --warn-soft: #F8EFDC;
+    --ok: #276B3D; --ok-soft: #E7F2EA;
+    --warn: #8A5900; --warn-soft: #F8EFDC;
     --info: #3B5B8C; --info-soft: #E8EEF7;
     --data1: #A6391F; --data2: #B8860B; --data3: #3E6B8F; --data4: #2E7D46;
     --code-bg: #F1EDE5; --grid: #E9E3D8;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --paper: #17140F; --ink: #EAE4DB; --muted: #A79C8D; --faint: #7E7466;
+      --paper: #17140F; --ink: #EAE4DB; --muted: #A79C8D; --faint: #A79C8D;
       --line: #322C24; --card: #1F1B15; --card-line: #373128;
       --accent: #E0714F; --accent-soft: #33211B;
       --ok: #6FBF8A; --ok-soft: #1E2E23;

@@ -69,6 +69,12 @@ def _session_notes(root: ET.Element) -> list[str]:
             for e in root.iter("error") if id(e) not in in_case]
 
 
+def _collection_notes(root: ET.Element) -> list[str]:
+    """xdist can return exit 1 after collection stopped, with this case error."""
+    return [f"collection error: {_error_text(error)}" for error in root.iter("error")
+            if error.get("message") == "collection failure"]
+
+
 def _refuse_unfinished(root: ET.Element) -> None:
     """A report that admits the run stopped early is not a measurement.
 
@@ -78,10 +84,11 @@ def _refuse_unfinished(root: ET.Element) -> None:
     a quarter of the scope scores cov 0. Reported on a 15,300-test lane where
     one dead worker left 4,626 tests unexecuted (#21).
     """
-    notes = _crash_notes(root) + _session_notes(root)
+    notes = _crash_notes(root) + _session_notes(root) + _collection_notes(root)
     if notes:
         raise ToolError("junit reports a run that did not finish, so its coverage measures "
                         f"a partial suite: {'; '.join(notes)}")
+    _refuse_partial(root)
 
 
 def suite_summary(xml_text: str) -> tuple[set[str], dict]:
@@ -113,6 +120,34 @@ def suite_counts(xml_text: str) -> dict:
 
 def failed_test_ids(xml_text: str) -> set[str]:
     return suite_summary(xml_text)[0]
+
+
+def passed_test_ids(xml_text: str) -> set[str]:
+    """Completed passing cases; any failure or skip of the same ID wins."""
+    root = _root(xml_text)
+    _refuse_unfinished(root)
+    passed, blocked = set(), set()
+    for case in root.iter("testcase"):
+        destination = blocked if _is_failure(case) or case.find("skipped") is not None else passed
+        destination.add(_case_id(case))
+    return passed - blocked
+
+
+def _refuse_partial(root: ET.Element) -> None:
+    """Count each subtree once, including aggregate testsuites declarations."""
+    counts = {}
+    for element in reversed(list(root.iter())):
+        count = int(element.tag == "testcase") + sum(counts[child] for child in element)
+        counts[element] = count
+        if element.tag in ("testsuite", "testsuites"):
+            _admit_declared_count(element.get("tests"), count)
+
+
+def _admit_declared_count(declared: str | None, count: int) -> None:
+    if declared is None:
+        return
+    if not declared.isascii() or not declared.isdigit() or int(declared) != count:
+        raise ToolError("junit test count does not match its cases; the report is incomplete")
 
 
 def _seconds(raw: str | None) -> float:

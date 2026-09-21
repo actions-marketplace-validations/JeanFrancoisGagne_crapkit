@@ -18,7 +18,7 @@ from cli_inproc_repo import (add_knotty, commit_all, istanbul, repo,  # noqa: F4
 import pytest
 
 from crapkit.cli import main
-from crapkit.lanes import write_stamps
+from crapkit.invocation import _self
 from crapkit.store import SnapshotStore
 
 
@@ -112,7 +112,10 @@ def test_coverage_scores_every_lane_and_writes_a_baseline_run(repo, capsys):
     code, out, err = run(["coverage", "--reuse-artifacts"], repo, capsys)
 
     assert (code, err) == (0, "")
-    assert "3 functions scored — 3 measured / 0 untested / 0 no-lane / 0 cc-only" in out
+    assert "3 functions scored: 3 measured, 0 over ceiling 6, CRAP load" in out, out
+    assert "untested" not in out and "no-lane" not in out, "a zero bucket is not printed"
+    assert out.rstrip().endswith(f"-> next: {_self()} worklist"), out
+    assert not out.startswith("partial"), "a full run opens with the run line"
     assert [r["kind"] for r in runs(repo)] == ["coverage"]
 
 
@@ -137,7 +140,9 @@ def test_one_failed_lane_leaves_its_scopes_unmeasured_and_the_run_untrusted(repo
 
     assert code == 5
     assert "lane 'ui' FAILED" in err and "lane 'ui' FAILED" in out
-    assert "2 measured / 0 untested / 1 no-lane" in out, out
+    assert out.startswith("partial run (lane unit; lane ui failed; web unmeasured; not a baseline)\n"), out
+    assert "3 functions scored: 2 measured / 1 no-lane, 0 over ceiling 6" in out, out
+    assert out.rstrip().endswith(f"-> rerun changed lanes: {_self()} coverage --reuse-unchanged"), out
     assert [r["kind"] for r in runs(repo)] == ["partial"]
 
 
@@ -166,46 +171,87 @@ def test_a_lane_subset_is_a_partial_run(repo, capsys):
     code, out, _ = run(["coverage", "--reuse-artifacts", "--lane", "unit"], repo, capsys)
 
     assert code == 0
-    assert "2 measured / 0 untested / 1 no-lane" in out, out
+    assert out.startswith("partial run (lane unit; web unmeasured; not a baseline)\n"), out
+    assert "2 measured / 1 no-lane" in out, out
     assert [r["kind"] for r in runs(repo)] == ["partial"]
 
 
-def test_reuse_unchanged_skips_the_lane_whose_scopes_have_not_moved(repo, capsys):
-    """The stamp says which commit the artifact describes. Nothing under either
-    scope moved since, so neither command needs to run again."""
-    seed_artifacts(repo)
-    commit = head(repo)
-    write_stamps(repo, {"coverage/unit.json": {"commit": commit, "lane": "unit", "seconds": 1.0},
-                        "coverage/ui.json": {"commit": commit, "lane": "ui", "seconds": 1.0}})
+# --- what the summary says about the run's shape (0.5.0) ----------------------
+#
+# `coverage --lane web` used to print the same line a full run prints, with the
+# other scope's no-lane functions counted as debt, and only `runs list` said the
+# run was partial. The summary now carries the shape on every path.
 
-    code, _, err = run(["coverage", "--reuse-unchanged"], repo, capsys)
+def test_the_json_summary_names_the_run_kind_the_ceilings_and_what_went_unmeasured(repo, capsys):
+    seed_artifacts(repo)
+
+    _, out, _ = run(["coverage", "--reuse-artifacts", "--json"], repo, capsys)
+    summary = json.loads(out)
+
+    assert summary["kind"] == "coverage"
+    assert summary["unmeasured_scopes"] == [] and summary["lane_failures"] == {}
+    assert summary["ceilings"] == {"default": 6}
+
+
+def test_a_partial_run_counts_debt_over_the_measured_scopes_only(repo, capsys):
+    """web's `knotty` is ccn 8 with no lane this run: crap 72 at cov 0. It is
+    web's debt to report under by_scope, not this run's grade."""
+    add_knotty(repo, "web/ui.ts")
+    commit_all(repo, "knotty in web")
+    seed_artifacts(repo)
+
+    code, out, _ = run(["coverage", "--reuse-artifacts", "--lane", "unit", "--json"], repo, capsys)
+    summary = json.loads(out)
 
     assert code == 0
-    assert err.count("artifact still matches its scopes; reusing without rerun") == 2, err
+    assert summary["kind"] == "partial" and summary["unmeasured_scopes"] == ["web"]
+    assert (summary["over_target"], summary["grade"]) == (0, "A+"), summary
+    assert summary["by_scope"]["web"]["over_target"] == 1, "the scope rollup still carries it"
+
+    _, text, _ = run(["coverage", "--reuse-artifacts", "--lane", "unit"], repo, capsys)
+    assert "4 functions scored: 2 measured / 2 no-lane, 0 over ceiling 6" in text, text
 
 
-def _ui_lane_writes_its_artifact(repo) -> None:
-    """The template's `python -c pass` writes nothing, and a lane that leaves
-    the previous run's artifact where it found it is refused. A rerun this test
-    calls a rerun has to write the file it declares."""
-    text = (repo / "crapkit.toml").read_text(encoding="utf-8")
-    head_text, marker, tail = text.partition('name = "ui"\n')
-    writes = 'command = "python -c \\"import os; os.utime(\'coverage/ui.json\')\\""'
+def test_the_summary_labels_every_ceiling_in_force(repo, capsys):
+    toml = (repo / "crapkit.toml").read_text(encoding="utf-8")
     (repo / "crapkit.toml").write_text(
-        head_text + marker + tail.replace('command = "python -c pass"', writes, 1),
-        encoding="utf-8")
-
-
-def test_reuse_unchanged_reruns_the_lane_whose_scope_moved(repo, capsys):
-    """The one test that runs a lane command. `ui` has no stamp, so it reruns
-    and records one; `unit` is reused and records nothing."""
+        toml.replace('paths = ["web"]\n', 'paths = ["web"]\ntarget = 4\n', 1), encoding="utf-8")
     seed_artifacts(repo)
-    _ui_lane_writes_its_artifact(repo)
-    write_stamps(repo, {"coverage/unit.json": {"commit": head(repo), "lane": "unit",
-                                               "seconds": 1.0}})
 
+    _, out, _ = run(["coverage", "--reuse-artifacts"], repo, capsys)
+    _, as_json, _ = run(["coverage", "--reuse-artifacts", "--json"], repo, capsys)
+
+    assert "0 over their ceilings (6; web 4)" in out, out
+    assert json.loads(as_json)["ceilings"] == {"default": 6, "web": 4}
+
+
+def _stamp_real_measurement(repo, capsys) -> None:
+    seed_artifacts(repo)
+    text = (repo / "crapkit.toml").read_text(encoding="utf-8")
+    for name in ("unit", "ui"):
+        command = json.dumps(f'python -c "import os; os.utime(\'coverage/{name}.json\')"')
+        text = text.replace('command = "python -c pass"\nartifact',
+                            f'command = {command}\nartifact', 1)
+    (repo / "crapkit.toml").write_text(text, encoding="utf-8")
+    commit_all(repo, "measurement commands")
+    code, _, err = run(["coverage"], repo, capsys)
+    assert code == 0, err
+
+
+def test_reuse_unchanged_skips_identical_clean_measurements(repo, capsys):
+    _stamp_real_measurement(repo, capsys)
     code, _, err = run(["coverage", "--reuse-unchanged"], repo, capsys)
+    assert code == 0
+    assert err.count("measurement inputs unchanged; reusing without rerun") == 2, err
 
+
+def test_reuse_unchanged_reruns_only_the_lane_without_a_valid_stamp(repo, capsys):
+    _stamp_real_measurement(repo, capsys)
+    path = repo / ".crapkit/artifacts.json"
+    entries = json.loads(path.read_text())
+    del entries["coverage/ui.json"]
+    path.write_text(json.dumps(entries), encoding="utf-8")
+    code, _, err = run(["coverage", "--reuse-unchanged"], repo, capsys)
     assert code == 0
     assert err.count("reusing without rerun") == 1, err
     assert "lane 'unit'" in err and "lane 'ui'" not in err
@@ -349,3 +395,70 @@ def test_rescore_with_only_an_inventory_run_still_has_no_coverage_to_overlay(rep
 
     assert code == 1
     assert "no scored run" in err, err
+
+
+# --- the verdict in the payload (0.5.0) ---------------------------------------
+#
+# `rescore --gate --json` printed the functions list with no verdict on stdout
+# and the GATE lines on stderr, so an MCP wrapper handed an agent a failure with
+# no finding in it. The payload now carries `gate`; the text form says when the
+# gate passed, so the exit code is not the only signal.
+
+def test_rescore_gate_json_carries_the_verdict_the_exit_code_says(scored, capsys):
+    add_knotty(scored)
+
+    code, out, err = run(["rescore", "src/app.ts", "--gate", "--json"], scored, capsys)
+    gate = json.loads(out)["gate"]
+
+    assert code == 6
+    assert gate["ok"] is False and gate["judged"] >= 1, gate
+    assert gate["ceilings"] == {"src/app.ts": 6} and gate["untracked"] == []
+    (breach,) = gate["breaches"]
+    assert set(breach) == {"path", "function", "start", "ccn", "cov", "crap", "remedy",
+                           "key_name", "ceiling"}
+    assert breach["path"] == "src/app.ts" and "knotty" in breach["function"]
+    assert (breach["ccn"], breach["ceiling"], breach["remedy"]) == (8, 6, "decompose")
+    assert "GATE" in err, "the stderr lines stay for a reader"
+
+
+def test_a_passing_gate_json_says_ok_and_what_it_judged(scored, capsys):
+    (scored / "src" / "app.ts").write_text(
+        (scored / "src" / "app.ts").read_text(encoding="utf-8").replace("x > 10", "x > 11"),
+        encoding="utf-8")
+
+    code, out, err = run(["rescore", "src/app.ts", "--gate", "--json"], scored, capsys)
+
+    assert (code, err) == (0, "")
+    assert json.loads(out)["gate"] == {"ok": True, "judged": 1, "ceilings": {"src/app.ts": 6},
+                                       "breaches": [], "untracked": []}
+
+
+def test_the_text_form_prints_the_gate_line_when_it_passes(scored, capsys):
+    (scored / "src" / "app.ts").write_text(
+        (scored / "src" / "app.ts").read_text(encoding="utf-8").replace("x > 10", "x > 11"),
+        encoding="utf-8")
+
+    code, out, err = run(["rescore", "src/app.ts", "--gate"], scored, capsys)
+
+    assert (code, err) == (0, "")
+    assert out.rstrip().endswith("gate: 1 changed function(s) judged, 0 over ceiling 6"), out
+
+
+def test_without_the_gate_flag_the_payload_carries_no_verdict(scored, capsys):
+    _, out, _ = run(["rescore", "src/app.ts", "--json"], scored, capsys)
+
+    assert "gate" not in json.loads(out)
+
+
+def test_an_untracked_file_is_named_in_the_verdict(scored, capsys):
+    (scored / "src" / "extra.ts").write_text(
+        "export function loops(n: number): number {\n"
+        + "".join(f"  if (n > {i}) {{ return {i}; }}\n" for i in range(1, 8))
+        + "  return 0;\n}\n", encoding="utf-8")
+
+    code, out, _ = run(["rescore", "src/extra.ts", "--gate", "--json"], scored, capsys)
+    gate = json.loads(out)["gate"]
+
+    assert code == 6
+    assert gate["untracked"] == ["src/extra.ts"] and gate["judged"] == 1
+    assert [b["function"] for b in gate["breaches"]] == ["loops ( n )"]

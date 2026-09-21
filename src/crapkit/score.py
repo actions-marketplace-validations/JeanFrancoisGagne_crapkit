@@ -14,6 +14,9 @@ from collections.abc import Iterator
 from typing import NamedTuple
 
 from .coverage_istanbul import FnCoverage
+from .errors import ToolError
+from .keys import require_unambiguous
+from .records import decode_record, encode_record, record_lines
 from .snapshot import InventoryRow
 
 
@@ -52,17 +55,13 @@ class ScoredRow(NamedTuple):
     crap: float
     remedy: str
     cognitive: int = 0  # Sonar-spec cognitive complexity; reporting only, never gated
+    occurrence: int = 0  # Positive source order on one start line; 0 is legacy
 
 
 _FIELD_TYPES = (str, str, str, int, int, int, int, int, int, int, int,
-                float, str, float, str, int)
+                float, str, float, str, int, int)
 _SCORED_HEADER = "\t".join(ScoredRow._fields)
-# One %s per field, built once. %s of every field is str() of it, so the bytes
-# do not move; a row is a tuple, so it IS the argument list and the per-row
-# generator, the join and the concatenation all disappear (179 -> 116 ms on
-# 140,922 rows). Derived from _fields rather than written out, so a new column
-# cannot leave the template a field short.
-_SCORED_ROW = "\t".join(["%s"] * len(ScoredRow._fields)) + "\n"
+_SCORED_HEADERS = {"\t".join(ScoredRow._fields[:-1]): 16, _SCORED_HEADER: 17}
 
 
 def scored_tsv_lines(rows: list[ScoredRow]) -> Iterator[str]:
@@ -70,21 +69,41 @@ def scored_tsv_lines(rows: list[ScoredRow]) -> Iterator[str]:
     is the empty string, so the file stays the single newline it always was."""
     yield (_SCORED_HEADER if rows else "") + "\n"
     for r in rows:
-        yield _SCORED_ROW % r
+        yield encode_record(r) + "\n"
 
 
 def parse_scored_row(line: str) -> ScoredRow:
     """One exported line back to a row. str() of every field round-trips through
     its own constructor, floats included, so the re-emitted bytes are identical."""
-    parts = line.split("\t")
-    if len(parts) != len(_FIELD_TYPES):
-        raise ValueError(f"scored row has {len(parts)} fields, expected {len(_FIELD_TYPES)}: {line!r}")
-    return ScoredRow(*[cast(part) for cast, part in zip(_FIELD_TYPES, parts)])
+    parts = decode_record(line)
+    return _scored_parts(parts)
+
+
+def _scored_parts(parts: list[str]) -> ScoredRow:
+    if len(parts) not in (16, 17):
+        raise ValueError(f"scored row has {len(parts)} fields, expected 16 or 17: {parts!r}")
+    row = ScoredRow(*[cast(part) for cast, part in zip(_FIELD_TYPES, parts)])
+    if row.occurrence < 0:
+        raise ValueError("scored occurrence must be nonnegative")
+    return row
 
 
 def parse_scored_tsv(text: str) -> list[ScoredRow]:
-    return [parse_scored_row(line) for line in text.splitlines()
-            if line.strip() and line != _SCORED_HEADER]
+    lines = [line for line in record_lines(text) if line.strip()]
+    if not lines:
+        return []
+    count = _SCORED_HEADERS.get(lines[0])
+    if count is not None:
+        lines = lines[1:]
+    return [_scored_line(line, count) for line in lines]
+
+
+def _scored_line(line: str, count: int | None) -> ScoredRow:
+    parts = decode_record(line)
+    fields = len(parts)
+    if count is not None and fields != count:
+        raise ValueError(f"scored row has {fields} fields, expected {count}")
+    return _scored_parts(parts)
 
 
 def _overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> int:
@@ -109,37 +128,70 @@ def _best_match(row: InventoryRow, candidates: list[FnCoverage]) -> FnCoverage |
     return best
 
 
-def _remedy(ccn: int, score: float, ceiling: int) -> str:
+def _remedy(ccn: int, score: float, ceiling: int, shared_span: bool = False) -> str:
+    """The first thing that can lower this score. A function sharing its source
+    line span with another scores as uncovered whatever its tests do, so
+    add-tests there is advice nobody can follow: splitting the definitions is,
+    and the run after the split says whether tests are still owed."""
     if ccn > ceiling:
         return "decompose"
-    return "ok" if score <= ceiling else "add-tests"
+    if score <= ceiling:
+        return "ok"
+    return "split-lines" if shared_span else "add-tests"
 
 
-def _finish(row, cov: float, flag: str, *, target: int, scope_targets) -> ScoredRow:
+def _finish(row, cov: float, flag: str, *, target: int, scope_targets,
+            shared_span: bool = False) -> ScoredRow:
     # cc-only is the pre-commit hook's rule: crap IS ccn, so _remedy can only
     # answer ok or decompose. Feeding it cov=0 through the formula would say
     # add-tests about code no test can reach.
     score = float(row.ccn) if flag == "cc-only" else crap(row.ccn, cov)
     ceiling = scope_targets.get(row.scope, target) if scope_targets else target
-    # Positional, and NOT *row: cognitive is last in both tuples with four
+    # Positional, and NOT *row: cognitive and occurrence trail both tuples with four
     # fields between, so splicing the row in whole lands it in cov. Building
     # this row is a third of the join's cost at 140,922 rows — **row._asdict()
     # built a throwaway dict per row and looked every field up by name.
     return ScoredRow(row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7],
                      row[8], row[9], row[10],
-                     cov, flag, score, _remedy(row[7], score, ceiling), row[11])
+                     cov, flag, score, _remedy(row[7], score, ceiling, shared_span), row[11], row[12])
 
 
-def _named_overlay_cov(row, by_key: dict) -> tuple[float, str]:
-    # by_key is grouped on (path, long_name) up front: filtering the whole
-    # path's candidates per row made this O(rows x candidates) per file
-    # (measured 2,998,554 comparisons on a whole-repo rescore). The nearest-start
-    # tie-break is unchanged, and min() still keeps the FIRST nearest twin
-    # because the group holds the baseline's own order.
-    named = by_key.get((row.path, row.long_name))
-    if named:
-        return min(named, key=lambda c: abs(c.start - row.start)).cov, "measured"
-    return 0.0, "untested"
+def _nearest_overlay(row, candidates) -> list:
+    if not candidates:
+        return []
+    start = min(candidates, key=lambda c: abs(c.start - row.start)).start
+    return [c for c in candidates if c.start == start]
+
+
+def _same_occurrence(row, candidates):
+    if not row.occurrence:
+        return None
+    return next((c for c in candidates if c.occurrence == row.occurrence), None)
+
+
+def _overlay_match(row, candidates, unique: bool):
+    exact = _same_occurrence(row, candidates)
+    if exact is not None:
+        return exact
+    if unique and len({c.occurrence for c in candidates}) == 1:
+        return candidates[0]
+    return None
+
+
+def _named_overlay_cov(row, by_key: dict, positions: dict) -> tuple[float, str]:
+    # Search only this signature's candidates, keeping the baseline order for
+    # equal-distance starts. Occurrence separates siblings at that start.
+    named = _nearest_overlay(row, by_key.get((row.path, row.long_name)))
+    unique = len(positions[(row.path, row.long_name, row.start)]) == 1
+    match = _overlay_match(row, named, unique)
+    return (match.cov, "measured") if match is not None else (0.0, "untested")
+
+
+def _overlay_positions(rows) -> dict:
+    positions: dict[tuple, set[int]] = {}
+    for row in rows:
+        positions.setdefault((row.path, row.long_name, row.start), set()).add(row.occurrence)
+    return positions
 
 
 def _cov_without_join(row, lane_scopes: set, cc_only_scopes) -> tuple[float, str] | None:
@@ -218,23 +270,101 @@ def overlay_stale_coverage(
 ) -> list[ScoredRow]:
     """Rescore fresh complexity against a BASELINE run's coverage.
 
-    Joins by function NAME only (edits shift spans, names survive), nearest
-    start among same-name twins. A renamed or new function joins NOTHING —
+    Joins by function name, nearest start among same-name twins, and occurrence
+    when callbacks share a line. A renamed or new function joins NOTHING —
     a span join here would hand it a neighbour's stale number and mislead
     the preview. Coverage values are the baseline's; the caller labels them
     stale.
     """
+    require_unambiguous(rows)
+    require_unambiguous(baseline_scored)
+    positions = _overlay_positions(rows)
     by_key: dict[tuple[str, str], list[ScoredRow]] = {}
     for r in baseline_scored:
         if r.flag == "measured":
             by_key.setdefault((r.path, r.long_name), []).append(r)
 
+    shared = _shared_source_spans(rows, lane_scopes, cc_only_scopes)
     scored = []
     for row in rows:
-        cov, flag = (_cov_without_join(row, lane_scopes, cc_only_scopes)
-                     or _named_overlay_cov(row, by_key))
-        scored.append(_finish(row, cov, flag, target=target, scope_targets=scope_targets))
+        verdict = _cov_without_join(row, lane_scopes, cc_only_scopes)
+        cov, flag = verdict or _named_overlay_cov(row, by_key, positions)
+        scored.append(_finish(row, cov, flag, target=target, scope_targets=scope_targets,
+                              shared_span=_on_shared_span(row, verdict, shared)))
     return scored
+
+
+class SharedSpanFold:
+    """The source line spans more than one function declares in one run.
+
+    The join cannot tell whose coverage is whose there, so each such function
+    scores as uncovered and the run names the spans instead of ending. Filled
+    while scoring; the caller reports it once.
+    """
+
+    def __init__(self) -> None:
+        self.sites: list[list[InventoryRow]] = []
+
+    def add(self, members: list[InventoryRow]) -> None:
+        self.sites.append(members)
+
+
+def _identity(row) -> tuple:
+    """What separates two functions on one span: the name, and the occurrence
+    that tells sibling callbacks on a line apart."""
+    return row.long_name, row.occurrence
+
+
+def _join_member(members: list, row) -> None:
+    """A third function on the span joins its members; another copy of one that
+    is already there (the same function in a second scope) does not."""
+    if all(_identity(member) != _identity(row) for member in members):
+        members.append(row)
+
+
+def _shared_source_spans(rows, lane_scopes: set, cc_only_scopes) -> dict:
+    """span -> the distinct functions declaring it, for spans more than one does."""
+    first, collisions = {}, {}
+    for row in rows:
+        if _cov_without_join(row, lane_scopes, cc_only_scopes) is not None:
+            continue
+        span = row.path, row.start, row.end
+        seen = first.setdefault(span, row)
+        if _identity(seen) != _identity(row):
+            _join_member(collisions.setdefault(span, [seen]), row)
+    return collisions
+
+
+def _ambiguous_spans(shared: dict, coverage_by_path: dict, start_index: dict) -> dict:
+    """The shared spans a measurement would speak about, so the join would hand
+    every function on the span one function's number.
+
+    Through 0.7.4 this raised and ended the run. One consumer repo holds 591
+    shared spans, 459 of them measured, so a run died on the first one it met
+    and the repo never finished a coverage run at all. Refusing the ambiguous
+    number is the specified behaviour; ending the run over it was not, the
+    shape _note_unanalyzable settled for unreadable files.
+    """
+    ambiguous = {}
+    for span, members in shared.items():
+        if _span_join_cov(members[0], coverage_by_path, start_index)[1] == "measured":
+            ambiguous[span] = members
+    return ambiguous
+
+
+def _joined_cov(row, ambiguous: dict, coverage_by_path: dict,
+                start_index: dict) -> tuple[float, str]:
+    """Uncovered on an ambiguous span, never the neighbour's number: the honest
+    floor for a function whose measurement cannot be told from another's."""
+    if (row.path, row.start, row.end) in ambiguous:
+        return 0.0, "untested"
+    return _span_join_cov(row, coverage_by_path, start_index)
+
+
+def _on_shared_span(row, verdict, shared: dict) -> bool:
+    """A row some lane measures, on a span it shares. Measured yet or not: tests
+    would only make the span measured, and then it scores as uncovered."""
+    return verdict is None and (row.path, row.start, row.end) in shared
 
 
 def score_rows(
@@ -245,11 +375,18 @@ def score_rows(
     target: int = 6,
     scope_targets: dict[str, int] | None = None,
     cc_only_scopes: frozenset[str] = frozenset(),
+    shared_spans: SharedSpanFold | None = None,
 ) -> list[ScoredRow]:
     start_index = _start_index(coverage_by_path)
+    shared = _shared_source_spans(rows, lane_scopes, cc_only_scopes)
+    ambiguous = _ambiguous_spans(shared, coverage_by_path, start_index)
+    for members in ambiguous.values():
+        if shared_spans is not None:
+            shared_spans.add(members)
     scored = []
     for r in rows:
-        cov, flag = (_cov_without_join(r, lane_scopes, cc_only_scopes)
-                     or _span_join_cov(r, coverage_by_path, start_index))
-        scored.append(_finish(r, cov, flag, target=target, scope_targets=scope_targets))
+        verdict = _cov_without_join(r, lane_scopes, cc_only_scopes)
+        cov, flag = verdict or _joined_cov(r, ambiguous, coverage_by_path, start_index)
+        scored.append(_finish(r, cov, flag, target=target, scope_targets=scope_targets,
+                              shared_span=_on_shared_span(r, verdict, shared)))
     return scored

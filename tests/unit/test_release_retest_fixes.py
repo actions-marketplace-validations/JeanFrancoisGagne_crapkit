@@ -19,11 +19,12 @@ def _lane(**kw):
 
 def test_default_excludes_cover_runner_config_files_at_any_depth():
     """The vitest recipe the docs hand out creates vitest.config.ts, which made
-    doctor FAIL as an unclaimed file. Globs are whole-path, so the root form and
-    the nested form are both needed."""
+    doctor FAIL as an unclaimed file. One glob per extension since 0.5.0: a
+    leading `**/` matches zero or more directories, so the root copy is covered
+    without the duplicate 0.4.12 wrote."""
     for ext in ("ts", "js", "mts"):
-        assert f"*.config.{ext}" in DEFAULT_EXCLUDES
         assert f"**/*.config.{ext}" in DEFAULT_EXCLUDES
+        assert f"*.config.{ext}" not in DEFAULT_EXCLUDES, "the root duplicate is gone"
 
 
 def test_coveragepy_lane_ignores_the_pytest_droppings():
@@ -79,7 +80,7 @@ def test_stale_artifact_note_names_uncommitted_edits_and_the_remedy():
 
 
 def test_test_files_route_to_the_only_templated_scope():
-    from crapkit.cli import _group_files_by_scope
+    from crapkit.cli.verifying import _group_files_by_scope
 
     grouped = _group_files_by_scope(["tests/test_grade.py"],
                                     {"calc": ("calc",)},
@@ -88,7 +89,7 @@ def test_test_files_route_to_the_only_templated_scope():
 
 
 def test_test_files_with_several_templates_error_naming_them():
-    from crapkit.cli import _group_files_by_scope
+    from crapkit.cli.verifying import _group_files_by_scope
 
     with pytest.raises(ConfigError) as err:
         _group_files_by_scope(["tests/test_grade.py"],
@@ -101,7 +102,7 @@ def test_every_json_flagged_mcp_tool_has_a_real_json_flag():
     """The next_item tool shipped appending --json to a command with no such
     flag. Parity between the registry and argparse keeps that class dead."""
     import argparse
-    from crapkit.cli import build_parser
+    from crapkit.cli.parser import build_parser
     from crapkit.mcp_server import TOOLS
 
     parser = build_parser()

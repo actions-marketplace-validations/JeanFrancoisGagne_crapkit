@@ -9,6 +9,7 @@ from collections.abc import Iterable, Iterator
 from typing import NamedTuple
 
 from .merge import FunctionRecord
+from .records import encode_record
 
 
 class InventoryRow(NamedTuple):
@@ -24,17 +25,18 @@ class InventoryRow(NamedTuple):
     params: int
     nesting: int
     cognitive: int = 0  # Sonar-spec cognitive complexity; reporting only, never gated
+    occurrence: int = 0  # Positive source order on one start line; 0 is legacy
 
 
 def build_inventory_rows(by_scope: dict[str, list[FunctionRecord]]) -> list[InventoryRow]:
     rows = [
         InventoryRow(scope, r.path, r.long_name, r.start, r.end,
                      r.ccn_std, r.ccn_mod, r.ccn, r.nloc, r.params, r.nesting,
-                     r.cognitive)
+                     r.cognitive, r.occurrence)
         for scope, records in by_scope.items()
         for r in records
     ]
-    rows.sort(key=lambda r: (r.scope, r.path, r.start, r.end, r.long_name))
+    rows.sort(key=lambda r: (r.scope, r.path, r.start, r.occurrence, r.end, r.long_name))
     return rows
 
 
@@ -48,4 +50,4 @@ def tsv_lines(rows: Iterable[InventoryRow]) -> Iterator[str]:
     """
     yield "\t".join(InventoryRow._fields) + "\n"
     for r in rows:
-        yield "\t".join(str(v) for v in r) + "\n"
+        yield encode_record(r) + "\n"

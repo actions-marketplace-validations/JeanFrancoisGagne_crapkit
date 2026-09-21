@@ -18,6 +18,7 @@ commit`, so it holds three rules the batch commands do not:
 from __future__ import annotations
 
 import tempfile
+from itertools import chain
 from pathlib import Path
 from typing import NamedTuple
 
@@ -54,6 +55,7 @@ class StagedGate(NamedTuple):
     """The verdict on the staged blobs."""
     violations: list[Violation]
     unscoped: list[str] = []  # staged source files no scope claims: ungated, but never silently
+    records: tuple = ()  # full staged identities, including siblings below the ceiling
 
 
 def _touches(record: FunctionRecord, ranges: list[tuple[int, int]]) -> bool:
@@ -76,7 +78,7 @@ def _materialized(tmp: Path, blobs: dict[str, bytes]) -> list[tuple[str, str]]:
     return jobs
 
 
-def staged_records(blobs: dict[str, bytes]) -> dict[str, list]:
+def staged_records(blobs: dict[str, bytes], *, worker_budget: int = 0) -> dict[str, list]:
     """Records for the staged blobs, pooled once a commit touches enough files.
 
     Below the pool threshold lizard is handed the blob text directly: the bytes
@@ -90,16 +92,15 @@ def staged_records(blobs: dict[str, bytes]) -> dict[str, list]:
     with tempfile.TemporaryDirectory() as tmp:
         jobs = _materialized(Path(tmp), blobs)
         return analyze_jobs(jobs, workers=min(len(jobs), _HOOK_MAX_WORKERS),
-                            pool_threshold=_HOOK_POOL_THRESHOLD, chunksize=1)
+                            pool_threshold=_HOOK_POOL_THRESHOLD, chunksize=1, worker_budget=worker_budget)
 
 
 def file_ceilings(cfg, in_scope, checked_files) -> dict[str, int]:
-    """The ccn ceiling each file is judged against: its scope's target, else the
-    repo's. `rescore --gate` decides on this same map, so a mid-session verdict
-    and the commit's cannot disagree."""
-    ceilings = cfg.scope_targets
+    """The ccn ceiling each file is judged against: its scope's, read through
+    `Config.ceiling_of`. `rescore --gate` decides on this same map, so a
+    mid-session verdict and the commit's cannot disagree."""
     scope_of = {f: scope for scope, files in in_scope.items() for f in files}
-    return {rel: ceilings.get(scope_of.get(rel, ""), cfg.target) for rel in checked_files}
+    return {rel: cfg.ceiling_of(scope_of.get(rel, "")) for rel in checked_files}
 
 
 def _file_violations(rel: str, records: list, ranges, ceiling: int) -> list[Violation]:
@@ -152,8 +153,9 @@ def gate_staged(root: Path, cfg: Config, reads=None) -> StagedGate:
     unscoped = _unscoped_sources(sorted(ranges_by_path), set(checked_files), cfg)
     if not checked_files:
         return StagedGate([], unscoped)
-    records_by_path = staged_records(reads.staged_blobs(checked_files))
+    records_by_path = staged_records(reads.staged_blobs(checked_files),
+                                     worker_budget=cfg.analysis_worker_budget)
     return StagedGate(
         _touched_over_ceiling(records_by_path, ranges_by_path, checked_files, cfg, in_scope),
-        unscoped
+        unscoped, tuple(chain.from_iterable(records_by_path.values()))
     )

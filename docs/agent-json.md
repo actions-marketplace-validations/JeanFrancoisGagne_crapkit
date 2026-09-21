@@ -1,6 +1,12 @@
 # The machine surface
 
-Every read-side command has a JSON form. This page is the field contract.
+This page defines payloads from commands with `--json`, the JSON-only `next-item`
+command, and the read-side MCP tools. For the edit sequence, use
+[the agent workflow](../AGENTS.md#1-the-packet). For an existing integration moving
+to a new reader, use [Upgrading](upgrading.md).
+
+Jump to [packets](#brief), [verification](#verify), [errors](#errors),
+[MCP setup](#mcp-server) or [portable exports](portable-records.md).
 
 ## The `schema` field
 
@@ -23,12 +29,24 @@ read.
 
 Two more house rules that hold across every payload:
 
-- **Keys are sorted** and there are no timestamps in scored rows, so the same tree and the
-  same artifacts produce byte-identical JSON.
+- **Keys are sorted** and scored rows carry no timestamps. A new stored run can change
+  envelope fields such as `run_id`; compare row content when comparing measurements.
 - **stdout carries exactly one JSON object.** Warnings, progress, lane chatter and gate
-  findings all go to stderr, so `crapkit ... --json 2>/dev/null` is always parseable.
+  findings all go to stderr, so `crapkit ... --json 2>/dev/null` is always parseable. A
+  command that dies prints one object too: see [Errors](#errors).
 
 `next-item` is the exception to the flag: it has no `--json` because it only ever emits JSON.
+
+TSV exports and portable baselines follow the separate
+[portable record encoding](portable-records.md); JSON fields preserve their original strings.
+
+Function rows carry `occurrence` alongside their real `start` and `end` lines. A new
+measurement numbers functions sharing a start line from 1 in source creation order,
+including functions with different names. `0` means an older row has no such position.
+Use `(path, long_name or function, start, occurrence)` to distinguish rows within a
+run. The raw function signature stays unchanged. This field appears in `next-item`,
+`worklist`, `brief.scored`, `brief.file_functions` and `rescore.functions`; adding it
+does not change JSON schema 1.
 
 ---
 
@@ -61,8 +79,9 @@ $ crapkit next-item
     "flag": "measured",
     "function": "classify( score , attempts , late , bonus )",
     "handle": "classify",
-    "nesting": 6,
+    "nesting": 3,
     "nloc": 24,
+    "occurrence": 1,
     "path": "calc/grade.py",
     "remedy": "decompose",
     "scope": "calc",
@@ -100,15 +119,16 @@ $ crapkit next-item
 | `function` | string | The lizard long name, including the spaced parameter list. `brief` and `explain` also accept the bare identifier. |
 | `handle` | string | The short name form: the bare identifier, or `(anonymous)#N` for a function lizard could not name. Unlike `start` it names a position rather than a line, so it survives the edit this item asks for. `brief`, `explain` and `claims release` all take it. |
 | `start`, `end` | int | 1-based inclusive line span. |
+| `occurrence` | int | Source creation order among functions sharing `start`, from 1; `0` on older rows with no recorded position. |
 | `ccn` | int | `min(ccn_std, ccn_mod)`. This is what the gate and the ratchet judge. |
 | `ccn_std` | int | Standard cyclomatic complexity. |
 | `cognitive` | int | Sonar-spec cognitive complexity, measured in every language crapkit scans. Reporting only, never gated. |
 | `nloc` | int | Non-comment lines of code. |
-| `nesting` | int | Maximum nesting depth. |
+| `nesting` | int | Maximum nesting depth. A Python row reads it off crapkit's cognitive pass: the deepest that pass's nesting stack gets, one level per `if`, `elif`, `else`, `for`, `while`, `except` and comprehension `for`, none for `with`, `try`, `finally`, `match`, `case` or a nested `def` (a nested function's blocks count on its own row). A flat function of seven `if`s reads 1, a three-deep one reads 3, an `if` inside a `with` inside an `if` reads 2. Every other language keeps lizard's ND column. |
 | `cov` | float | Branch coverage in the span, 0.0 to 1.0. |
 | `flag` | string | `measured`, `untested`, `no-lane` or `cc-only`. See the [README](../README.md#flags-why-a-coverage-number-is-missing). |
 | `crap` | float | The score. |
-| `remedy` | string | `decompose`, `add-tests` or `ok`. |
+| `remedy` | string | `decompose`, `split-lines`, `add-tests` or `ok`. `split-lines` means another function shares the source lines, so no test lowers the score until the definitions are separated. |
 | `target` | int | This scope's effective ceiling. |
 | `commits`, `authors` | int | Churn for the file in the window. |
 | `est_splits` | int | `0` when `ccn <= target`, else `ceil(ccn / target)`. Roughly how many functions this needs to become. |
@@ -300,7 +320,7 @@ $ crapkit brief app/parse_csv.py parse_row --json
     "gate": "crapkit rescore app/parse_csv.py --gate",
     "refresh": "crapkit coverage --reuse-unchanged",
     "refresh_writes_run": true,
-    "scoped_tests": "python -m pytest \"app/parse_csv.py\" -q -p no:cacheprovider",
+    "scoped_tests": "crapkit test-scoped app/parse_csv.py",
     "verify": "crapkit verify"
   },
   "commit": "1b7b76bb6c16824a7bcee2d9e4c7f71a69eb4c3d",
@@ -317,10 +337,11 @@ $ crapkit brief app/parse_csv.py parse_row --json
     }
   ],
   "file_functions": [
-    {"ccn": 9, "cov": 0.6, "crap": 14.184000000000001, "end": 16,
-     "long_name": "parse_row( text , strict , sep , header )", "remedy": "decompose", "start": 4},
-    {"ccn": 2, "cov": 1.0, "crap": 2.0, "end": 24,
-     "long_name": "_split( text , sep )", "remedy": "ok", "start": 18}
+    {"ccn": 9, "crap": 14.184000000000001, "end": 16,
+     "function": "parse_row( text , strict , sep , header )", "occurrence": 1,
+     "remedy": "decompose", "start": 4},
+    {"ccn": 2, "crap": 2.0, "end": 24,
+     "function": "_split( text , sep )", "occurrence": 1, "remedy": "ok", "start": 18}
   ],
   "est_splits": 2,
   "est_uncovered_paths": 4,
@@ -353,8 +374,8 @@ $ crapkit brief app/parse_csv.py parse_row --json
   "scored": {
     "ccn": 9, "ccn_mod": 9, "ccn_std": 9, "cognitive": 8, "cov": 0.6,
     "crap": 14.184000000000001, "end": 16, "flag": "measured",
-    "long_name": "parse_row( text , strict , sep , header )", "nesting": 6,
-    "nloc": 13, "params": 4, "path": "app/parse_csv.py", "remedy": "decompose",
+    "long_name": "parse_row( text , strict , sep , header )", "nesting": 2,
+    "nloc": 13, "occurrence": 1, "params": 4, "path": "app/parse_csv.py", "remedy": "decompose",
     "scope": "app", "start": 4
   },
   "source": "def parse_row(text, strict, sep, header):\n    ...\n",
@@ -372,14 +393,14 @@ $ crapkit brief app/parse_csv.py parse_row --json
 | `run_id`, `commit` | int, string | no | The scored run and its commit. |
 | `path`, `function` | string | no | The resolved function. `function` is always the long name, whichever form you asked with. |
 | `handle` | string | no | The short name form for this row: the bare identifier, or `(anonymous)#N`. Same value and same rules as [`next-item`'s](#item-fields), so a packet and a queue item name one function one way. |
-| `remedy` | string | no | `decompose`, `add-tests` or `ok`. Promoted out of `scored` because it is the branch the session takes; `scored.remedy` carries the same value. |
+| `remedy` | string | no | `decompose`, `split-lines`, `add-tests` or `ok`. Promoted out of `scored` because it is the branch the session takes; `scored.remedy` carries the same value. |
 | `est_splits`, `est_uncovered_paths` | int | no | The budget, from the same code `next-item` publishes it with. Formulas under [`item` fields](#item-fields). |
 | `source` | string | no | The function's own text, `start` to `end` inclusive, newlines intact. The packet is editable without a second read of the file. |
 | `params` | array of string | no | Its parameter names, in declaration order, so a new test can call it without opening the file. `scored.params` is the count of these. |
-| `scored` | object | no | The whole scored row: the 16 fields above, including `params` and `ccn_mod`, which `next-item` does not carry. |
+| `scored` | object | no | The whole scored row: the 17 fields above, including `occurrence`, `params` and `ccn_mod`. `next-item` does not carry the latter two. |
 | `target` | int | no | The scope's effective ceiling. |
 | `stale` | bool | no | `true` when `commit` is not HEAD, so every number here describes an older tree. Run `commands.refresh` first. |
-| `file_functions` | array | no | Every scored function in the same file: `long_name`, `start`, `end`, `ccn`, `cov`, `crap`, `remedy`. What an extracted helper lands beside, and what names are already taken. |
+| `file_functions` | array | no | Every scored function in the same file: `function`, `start`, `end`, `occurrence`, `ccn`, `crap`, `remedy`. What an extracted helper lands beside, and what names are already taken. |
 | `file_totals` | object | no | That file rolled up: `functions`, `over_target`, `crap_load`. |
 | `gate_rule` | object | no | What the gate will judge this edit by. Below. |
 | `commands` | object | no | The rest of the loop, filled in for this file and this scope. Below. |
@@ -419,22 +440,23 @@ session need not read the config to learn which number it is aiming at.
 | Key | Type | Meaning |
 |---|---|---|
 | `gate` | string | `rescore --gate` for this file. Step 3 of the loop. |
-| `scoped_tests` | string or null | This scope's own `[crapkit.scoped_tests]` template, with `{files}` already replaced by the packet's file, double-quoted. Not a `crapkit test-scoped` call: the packet hands you the runner the scope declared. `null` when the scope declares no template, and then there is no step 4; `doctor` warns about the gap. |
+| `scoped_tests` | string or null | A `crapkit test-scoped` call for the packet's literal file. It selects the scope's template and executes it from the project root with the inherited environment and literal filename transport. `null` when the scope declares no template; `doctor` warns about the gap. |
 | `scoped_tests_note` | string | Present **only** when `scoped_tests` is `null`, naming the scope that declares no template. |
 | `verify` | string | The `verify` call. Step 5, the only authoritative one. |
-| `refresh` | string | The `coverage --reuse-unchanged` call that makes this packet current: it reruns the lanes whose scope files have moved and parses the rest off the artifacts they already have. Run it first when `stale` is `true`. |
-| `refresh_writes_run` | bool | Always `true`. `refresh` is the only one of the four that writes: it appends a scored run to `.crapkit/crap.sqlite`. A read-only session runs the other three and stops here. |
+| `refresh` | string | The `coverage --reuse-unchanged` call that refreshes this packet. It reuses a lane only at the same clean HEAD with unchanged configuration, inherited environment and coverage/JUnit bytes; otherwise it runs the lane. Run it first when `stale` is `true`. |
+| `refresh_writes_run` | bool | Always `true`. `refresh` appends a scored coverage run to `.crapkit/crap.sqlite`. Other commands can write caches or test artifacts; this field does not promise filesystem read-only execution. |
 
-Each one is a whole command line. Run them as given: a retyped `scoped_tests` loses whatever
-the scope's template carries, and a retyped `refresh` loses `--reuse-unchanged` and reruns
-every lane.
+Each value is a whole command line. Run it as given to preserve filename quoting
+and the refresh reuse policy. Simple paths remain readable. POSIX commands use
+shell quoting; Windows commands support cmd.exe and PowerShell, using an encoded
+PowerShell command when a filename could trigger shell expansion.
 
-Both shapes, captured off one repo. With a template, and with the block removed:
+With a scoped template and without one:
 
 ```json
 {"gate": "crapkit rescore calc/grade.py --gate",
  "refresh": "crapkit coverage --reuse-unchanged", "refresh_writes_run": true,
- "scoped_tests": "python -m pytest \"calc/grade.py\" -q -p no:cacheprovider",
+ "scoped_tests": "crapkit test-scoped calc/grade.py",
  "verify": "crapkit verify"}
 
 {"gate": "crapkit rescore calc/grade.py --gate",
@@ -444,11 +466,10 @@ Both shapes, captured off one repo. With a template, and with the block removed:
  "verify": "crapkit verify"}
 ```
 
-**The three crapkit calls are spelled as the console script**, `crapkit rescore ... --gate`
-and not `python -m crapkit rescore ... --gate` (#37). That is the form the docs promise, and
-the one that resolves from a venv on Windows, where bare `python` reaches the WindowsApps
-stub or the base interpreter the venv wraps. `scoped_tests` is the scope's own string and
-crapkit does not respell it.
+All four commands resolve the `crapkit` console script on PATH, including the
+Windows encoded form. Activate the intended environment before executing them.
+`test-scoped` then runs the owning scope's configured template; a template with
+no `{files}` still runs its declared arguments unchanged.
 
 `refresh` is what `stale: true` asks for, and the only thing that answers it. `stale`
 compares the run's commit against HEAD, so nothing clears it but a run landing on the
@@ -492,9 +513,10 @@ names, which is what turns a half-remembered name into a list of candidates. `br
 and `explain` run the identical rule, so one string cannot name one function in a
 packet and three in a trajectory.
 
-The start line is the disambiguator: it settles a bare name two functions share. `explain`
-resolves it the same way as of 0.4.5, off the newest run that scored the path, so a line
-number read out of a packet opens the same function in either command:
+The start line resolves a function only when that line names one source position.
+When several functions start there, the command refuses the numeric selector and lists
+their handles. Use the handle to select one. `explain` resolves against the newest run
+that scored the path, just as `brief` does:
 
 ```
 $ crapkit explain calc/grade.py 1
@@ -601,18 +623,20 @@ $ crapkit worklist --json
 {
   "active": [
     {
-      "authors": 1, "ccn": 7, "ccn_std": 7, "commits": 2, "end": 15,
-      "flag": "measured", "function": "render( rows , wide , totals , header )",
-      "nloc": 12, "path": "calc/report.py", "remedy": "decompose", "risk": 3.5,
-      "scope": "calc", "start": 4, "weight": 0.5
+      "authors": 1, "ccn": 7, "ccn_std": 7, "commits": 2, "cov": 0.0, "crap": 56.0,
+      "end": 15, "flag": "measured", "function": "render( rows , wide , totals , header )",
+      "nloc": 12, "path": "calc/report.py", "ratchet_mark": null, "remedy": "decompose",
+      "risk": 3.5, "scope": "calc", "start": 4, "weight": 0.5
     },
     {
-      "authors": 1, "ccn": 14, "ccn_std": 14, "commits": 2, "end": 27,
-      "flag": "measured", "function": "classify( score , attempts , late , bonus )",
-      "nloc": 24, "path": "calc/grade.py", "remedy": "decompose", "risk": 0.0252,
-      "scope": "calc", "start": 4, "weight": 0.0018
+      "authors": 1, "ccn": 14, "ccn_std": 14, "commits": 2, "cov": 0.45,
+      "crap": 46.60950000000001, "end": 27, "flag": "measured",
+      "function": "classify( score , attempts , late , bonus )",
+      "nloc": 24, "path": "calc/grade.py", "ratchet_mark": null, "remedy": "decompose",
+      "risk": 0.0252, "scope": "calc", "start": 4, "weight": 0.0018
     }
   ],
+  "active_total": 2,
   "churn_window_months": 12,
   "commit": "8c14f3daa8e88230c5b702d8f452ee2616d4de30",
   "dormant_count": 0,
@@ -631,15 +655,19 @@ $ crapkit worklist --json
 | `floor` | int | The effective `worklist_floor`, echoed so a caller need not read the config. |
 | `churn_window_months` | int | Same. |
 | `active` | array | The queue: files with churn in the window, ranked, capped at `--top` or `worklist_top`. |
+| `active_total` | int | Active rows admitted before the cap: what `--top` or `worklist_top` hid. The plain header prints it as `50 of 3980 active (worklist_top 50)`, or `(--top N)` when the flag set the cap. Not the over-ceiling count `trend` and the coverage summary carry: a row is active for its churn, whatever its score. |
 | `dormant_count` | int | How many ranked entries have zero churn in the window. |
 | `dormant_top` | array | The first 10 dormant entries, same shape. Sleeping hazards, recorded without clogging the queue. |
 | `batches` | array | Only with `--batches N`. |
 
-Each entry carries `scope`, `path`, `function`, `start`, `end`, `ccn`, `ccn_std`, `nloc`,
-`commits`, `authors`, `weight`, `risk`, plus `flag` and `remedy` from the run that scored
-it. Those last two are `null` on an inventory-only run, which scored no verdict. There is no
-`cov` and no `crap`: `worklist` ranks on complexity times churn. Use `next-item` or `brief`
-when you need the scored numbers.
+Each entry carries `scope`, `path`, `function`, `start`, `end`, `occurrence`, `ccn`, `ccn_std`, `nloc`,
+`commits`, `authors`, `weight`, `risk`, plus `flag`, `remedy`, `crap` and `cov` from the
+run that scored it, and `ratchet_mark`: the committed mark's value, or `null` when the
+function carries no mark or the repo has no marks file. The mark is read under the
+function's own ratchet key, so twins sharing a long name report their own marks and not
+each other's. The four run fields are `null` on an inventory-only run, which scored no
+verdict. `worklist` still ranks on complexity times churn, never on `crap`: `next-item` is
+the queue ordered by score, and `brief` the whole packet.
 
 `floor` orders the list and withholds no debt. A function the ranked run scored over its
 ceiling is listed whatever its ccn. An inventory-only run has no such verdict to read, and
@@ -663,7 +691,9 @@ payloads on this page come from one run of one repo: `worklist` leads with `rend
 risk 3.5, `next-item` hands out `classify` at crap 46.6. Neither is wrong.
 
 `risk = ccn * weight`, rounded to four decimals. On a repo whose commits share a timestamp
-every weight rounds to `0.0` and every risk with it; ranking then falls back to ccn.
+there is no range to weight against, so each commit counts once: every file weighs `1.0`,
+the ranking is ccn order, and the hot promotion is off, because a top 10% of equal
+weights would be every file.
 
 ### `--batches N`
 
@@ -714,12 +744,14 @@ $ crapkit verify --json
   "committed_findings": 1,
   "diff_uncovered": [],
   "diff_uncovered_count": 0,
+  "diff_uncovered_max": null,
   "dirty_failures": [],
   "dirty_findings": 0,
   "gate_violations": [],
   "new_failures": [],
   "ok": false,
   "overridden": [],
+  "ratchet_changes": null,
   "ratchet_regressions": [
     {
       "dirty": false,
@@ -732,7 +764,8 @@ $ crapkit verify --json
   "ratchet_sha256": "3d05caa586f1d6e63cfce21b70ac06dc31243f82c9ac3071398f67f463cafe2f",
   "run_id": 9,
   "schema": 1,
-  "tool_versions": {"crapkit": "<version>", "lizard": "1.24.0"}
+  "tool_versions": {"crapkit": "<version>", "lizard": "1.24.0"},
+  "unmarked_over_target": 0
 }
 ```
 
@@ -740,7 +773,7 @@ $ crapkit verify --json
 
 | Key | Type | Meaning |
 |---|---|---|
-| `ok` | bool | The whole verdict. `false` if any finding list is non-empty or the diff-coverage ceiling was breached. |
+| `ok` | bool | The final verdict after allowed overrides and flake retests. It agrees with the stored run verdict and command exit. Remaining findings or an ungranted diff-coverage breach make it `false`. |
 | `run_id` | int | The run this verify wrote. |
 | `baseline_run`, `baseline_commit` | int, string | What it was measured against. |
 | `commit` | string | The commit the verified tree is at. Equal to `baseline_commit` when you are verifying uncommitted work. |
@@ -754,7 +787,9 @@ $ crapkit verify --json
 | `ratchet_regressions` | `{path, long_name, recorded, fresh_crap, dirty}` | 7 |
 | `new_failures` | array of `classname::name` test ids | 8 |
 | `diff_uncovered_count` | int, and `diff_uncovered[]` of `{path, line}` | 9, only when `diff_uncovered_max` is set |
+| `diff_uncovered_max` | int, or `null` when the repo set none | none itself; it is the ceiling `diff_uncovered_count` is judged against, so a reader of exit 9 can name it |
 | `overridden` | gate-violation objects an `--override` exempted | none; the run passes |
+| `unmarked_over_target` | int: functions over their ceiling that carry no ratchet mark, the standing debt neither the gate (touched functions only) nor the ratchet check (marks only) guards | none; the text form prints one `warning: N function(s) over the ceiling carry no ratchet mark ...` line on stderr when it is not zero, naming `ratchet seed` as the fix |
 
 `key_name` on a gate violation is the ratchet key: the `long_name` when one function in
 the file holds that name, and `long_name#2` for the second function holding it. It is the
@@ -797,7 +832,7 @@ A verdict measures the working tree, so a concurrent session's uncommitted edits
 | Key | Meaning |
 |---|---|
 | `dirty` (on each finding) | The finding's file has uncommitted tracked edits. |
-| `committed_findings` | Findings across all three kinds whose file is clean. |
+| `committed_findings` | Gate, ratchet, test-failure and breached diff-coverage findings whose file is clean. |
 | `dirty_findings` | Findings whose file is not. |
 | `dirty_failures` | The subset of `new_failures` whose test id names a file with uncommitted edits. Both the repo-path form and pytest's dotted-module form are matched. |
 
@@ -810,6 +845,7 @@ reasonably look at `committed_findings` alone.
 |---|---|
 | `tool_versions` | `{"crapkit": ..., "lizard": ...}`. The metric identity behind the numbers. |
 | `ratchet_sha256` | Digest of the ratchet file as read. **`null` when the repo has no ratchet file.** Pin it to prove which marks a verdict was measured against. |
+| `ratchet_changes` | `{"dropped": N, "tightened": M}` when this run's tighten rewrote the marks file: `dropped` counts marks whose function is now at or under its ceiling, `tightened` marks that fell. **`null` when the tighten wrote nothing**: a failed run, `--no-tighten`, no marks file, or nothing to move. An override's grant is its own write to the marks file and is listed under `overridden`, not counted here. The text form prints the same two counts on the OK line with the `git add` to run (`restamped` in place of the counts when the only change was the stamp line, `N marks granted` after an override). |
 
 ---
 
@@ -827,12 +863,14 @@ $ crapkit coverage --json
   "by_scope": {"calc": {"crap_load": 124.07, "functions": 3, "grade": "F", "over_target": 2}},
   "cache_hits": 2,
   "cc_only": 0,
+  "ceilings": {"default": 6},
   "commit": "9a1d11895c5ff5b791b497a13294494fdab949ce",
   "crap_load": 124.07,
   "db": "/repo/.crapkit/crap.sqlite",
   "files": 2,
   "functions": 3,
   "grade": "F",
+  "kind": "coverage",
   "lane_failures": {},
   "lanes": {
     "py": {
@@ -848,6 +886,7 @@ $ crapkit coverage --json
   "run_id": 2,
   "schema": 1,
   "skipped_max_bytes": 0,
+  "unmeasured_scopes": [],
   "untested": 1
 }
 ```
@@ -859,19 +898,49 @@ $ crapkit coverage --json
 | `cache_hits` | Files served from the content-hash analysis cache. |
 | `skipped_max_bytes` | Files dropped by `[exclude] max_file_bytes`. |
 | `measured`, `untested`, `no_lane`, `cc_only` | The four flags, counted. They sum to `functions`. |
-| `over_target` | Functions whose `crap` exceeds their scope ceiling. |
+| `over_target` | Functions whose `crap` exceeds their scope ceiling, counted over the measured scopes: on a `partial` run the scopes in `unmeasured_scopes` are left out, since a skipped lane's functions score at cov 0 and would read as this run's debt. On a full run that is every function. The key keeps its name; the ceiling is what the config's `target` sets. |
 | `crap_load` | Sum of every function's CRAP, rounded to 2dp. |
-| `grade` | The letter for over-target density. `A+` only at exactly zero. |
+| `grade` | The letter for over-ceiling density over the same functions `over_target` counts. `A+` only at exactly zero. |
 | `by_scope` | Per scope: `{functions, over_target, crap_load, grade}`. |
-| `lanes` | Provenance per lane that succeeded: `artifact_sha256`, the command's `exit_code` (`null` when the artifact was reused), `parser`, `scopes`, plus `failures`, `tests_total` and `tests_skipped` when the lane declares a `results_artifact`. |
-| `lane_failures` | Lane name to failure text, for lanes that produced no artifact, or one that reaches none of the paths their scopes declare: measured files outside this checkout (another tree), or absolute paths that resolve under it (this tree, spelled absolutely, which the root-relative join still matches nothing of). Non-empty means the run is typed `partial` and cannot be a baseline; `coverage` exits 5 only when every lane failed. |
+| `lanes` | Provenance per lane that succeeded: `artifact_sha256`, the command's `exit_code` (`null` when the artifact was reused), `parser`, `scopes`, plus `results_artifact_sha256`, `failures`, `tests_total` and `tests_skipped` when the lane declares a `results_artifact`. The digests bind coverage and JUnit to the bytes read for this run. |
+| `lane_failures` | Lane name to failure text, for lanes that produced no artifact, or one that reaches none of the paths their scopes declare: measured files outside this checkout (another tree), or absolute paths that resolve under it (this tree, spelled absolutely, which the root-relative join still matches nothing of). Non-empty means the run is typed `partial` and cannot be a baseline; `coverage` exits 5 only when every lane failed, and then the payload is the [error object](#errors). |
+| `kind` | `coverage` for a full run, `partial` when a lane was skipped (`--lane`) or failed: the word `runs` lists it under. A partial run is never a baseline. |
+| `unmeasured_scopes` | Scopes a declared lane measures that no succeeding lane reached this run, in declaration order; `[]` on a full run. A scope no lane declares at all is not listed: that is a configuration `doctor` names, not this run's shape. |
+| `ceilings` | The ceilings in force: `default` (the `[crapkit] target`) and every scope whose own `target` differs from it, `{"default": 6, "reports": 12}`. Scopes at the default are not listed. |
 
 `inventory --json` is the same run summary minus everything coverage adds: `run_id`,
 `commit`, `files`, `functions`, `cache_hits`, `skipped_max_bytes`, `db`.
 
+Coverage attribution uses line spans. When distinct functions share the same path,
+start line and end line, an artifact that overlaps that span cannot distinguish their
+coverage. Every function on such a span scores as `untested` with coverage 0, never the
+number a neighbour's measurement carries, and the run continues. It names on stderr how
+many spans it met, and the path and line of those holding a function its ceiling fails
+at zero coverage, which splitting the definitions onto separate lines measures. Equal
+coverage values do not remove the ambiguity. Copies of one function in several scopes
+are not a collision. `cc-only`, `no-lane`, and functions with no matching artifact keep
+their existing flags.
+
+The plain form prints the same run on one line, zero buckets dropped and the ceiling
+labelled, then the command to run next:
+
+```
+run 2 @ 9a1d11895c5: 3 functions scored: 2 measured / 1 untested, 2 over ceiling 6, CRAP load 124.07, grade F
+-> next: crapkit worklist
+```
+
+With a scope at its own ceiling the label reads `over their ceilings (6; reports 12)`. A
+partial run opens with `partial run (lane py; web unmeasured; not a baseline)`, a failed
+lane named in it as `lane ui failed` and listed after the line as `  lane 'ui' FAILED: ...`,
+counts `over` and the grade over the measured scopes only, and ends with `-> rerun changed
+lanes: crapkit coverage --reuse-unchanged`.
+
 ---
 
 ## `doctor --json`
+
+The captured example below uses analysis version 8. A current `doctor` reports
+version 10; read the field from the running tool when checking a ratchet stamp.
 
 The only health payload crapkit exposes. It works on a repo that has never run anything.
 
@@ -905,13 +974,14 @@ $ crapkit doctor --json
 | `problems` | The FAIL findings, as text. **Non-empty is exit 1.** |
 | `warnings` | The WARN findings: unmeasured directories, scopes a lane measures with no `scoped_tests` template, lanes writing their artifacts at the repo root instead of under `.crapkit/`, and lanes with no `results_artifact`. Exit stays 0. |
 | `versions` | crapkit, lizard, python. `lizard` is `null` when it is not importable, which is also a FAIL. |
-| `analysis_version` | The analysis semantics version, `8` since 0.4.5 (`7` in 0.4.4). It plus `lizard` are the ratchet's metric stamp, so a bump refuses every existing mark until the repo re-seeds. See [ratchet.md](ratchet.md#upgrading-to-045-analysis-version-8). |
+| `analysis_version` | The analysis semantics version, currently `10`. Together with `lizard` it forms the ratchet's metric stamp. Follow [the upgrade checks](upgrading.md#measure-before-changing-marks) before restamping; changed function identity can require a reviewed mapping. |
 | `store` | `.crapkit/crap.sqlite`: whether it exists and how big it is. `present: false` and `size_bytes: 0` on a fresh repo. |
 | `newest_run` | `{id, kind, verdict_ok}`, or `null` when nothing has run. `verdict_ok` is `null` for non-verify runs. |
 | `lanes` | Per declared lane: `name`, `artifact`, whether the artifact is on disk now, and the `commit` and `seconds` from its stamp. `commit` and `seconds` are `null` for a lane that has never run here. |
 
-`note`-level findings (a file over `max_file_bytes`, no lanes declared) appear in the plain
-output only. They are neither problems nor warnings.
+`note`-level findings (a file over `max_file_bytes`, no lanes declared, a coverage.py lane
+an environment manager heads and doctor therefore did not probe) appear in the plain output
+only. They are neither problems nor warnings.
 
 The `results_artifact` warning is new in 0.4.5 (#26), and it names the two checks the lane
 loses rather than the key alone. A repo whose one lane declares neither the artifact nor a
@@ -933,7 +1003,42 @@ once per `doctor` call rather than once per lane.
 `doctor --tune` is a different command shape: it prints TOML lines, not JSON, and it
 respects neither `--json` nor `--show-files`.
 
+The additive `resources` object in ordinary `doctor --json` reports
+`available_cpus`, `cpu_probe`, `requested_analysis_workers`, `shared_pool_limit`,
+`pool_worker_limit`, `default_chunks_per_worker`, `default_source_bytes_per_worker`,
+`inherited_analysis_workers`, `memory_budget_mb`, `worker_memory_estimate_mb`,
+`memory_is_hard_limit`, `estimated_pool_memory_mb`, `budget_directory`,
+`coordination` and `serial_fallback`. It also carries
+`log_max_bytes`, `test_retention_days` and `test_retention_count`. These describe
+the effective policy, not sampled utilization. A memory budget is a pool-sizing
+estimate, not an operating-system allocation limit.
+
+The two automatic sizing fields describe the active multiprocessing start method:
+
+| Field | Returned value | Meaning |
+| --- | --- | --- |
+| `default_chunks_per_worker` | `4` for `spawn`, `1` otherwise | Chunks per worker used to calculate the automatic request, rounded up. |
+| `default_source_bytes_per_worker` | `524288` for `spawn`, `null` otherwise | With `spawn`, source size can raise the request to one worker per 512 KiB, rounded up. |
+
+Runnable chunks, CPU and configured ceilings, and free slots still cap the pool.
+These fields report policy; they are not configuration keys or memory limits.
+
+### `clean --json`
+
+`clean --dry-run --json` previews configured retention and temporary mutation
+recovery. Removing `--dry-run` performs the eligible removals. The response has
+`schema: 1`, `dry_run`, `test_runs` and `temporary_mutations`.
+
+| Field | Shape |
+|---|---|
+| `test_runs` | Object with path arrays `removed`, `planned`, `active`, `unproven` and `changed`. A changed receipt is preserved because its retention eligibility changed during cleanup. |
+| `temporary_mutations` | Array of `{path, status, reason}`. Status is `recovered`, `planned`, `active`, `unproven` or `failed`. A failed recovery exits 1. |
+
+Active leases, unrecognized evidence and caller-managed output are preserved.
+Intentional mutation pools require the existing `mutate --drop-pool` command.
+
 ### `doctor --plugin-root PATH`
+
 
 The plugin and the CLI ship as two artifacts with one version number between them, and
 neither notices when they drift. This is the check, and it reads no repo at all.
@@ -1042,10 +1147,10 @@ How much debt is open, how much was repaid, and whether the configured policy is
 | `runs prune --json` | `{"pruned_runs": 6, "kept_runs": 4, "freed_bytes": 0}`. |
 | `trend --json` | `{"runs": [{run_id, commit, created_at, functions, over_target, crap_load, avg, by_scope}], "target": 6}`, trusted runs only. Reads and fills the `run_rollup` cache; see below. |
 | `overrides --json` | `{"overrides": [{run_id, commit, created_at, path, function, crap, reason}]}`. |
-| `rescore --json` | `{"baseline_run", "baseline_commit", "functions": [{scope, path, function, start, end, ccn, cov, flag, crap, remedy, stale_coverage}], "note"}`. Every row carries `stale_coverage: true`: the complexity is the working tree's, the coverage is the baseline run's. |
+| `rescore --json` | `{"baseline_run", "baseline_commit", "functions": [{scope, path, function, start, end, occurrence, ccn, cov, flag, crap, remedy, stale_coverage}], "note"}`. Every row carries `stale_coverage: true`: the complexity is the working tree's, the coverage is the baseline run's. With `--gate` the payload adds `gate`: `{"ok", "judged", "ceilings": {path: ceiling}, "breaches": [{path, function, start, ccn, cov, crap, remedy, key_name, ceiling}], "untracked": [path]}`. `judged` counts the functions the working tree changed since HEAD (an untracked file in full), `breaches` the judged functions whose `ccn` is over their file's ceiling and that no ratchet mark covers, `ok` is `breaches == []`, and the exit is 6 when it is false. The text form prints `gate: 2 changed function(s) judged, 0 over ceiling 6` on stdout when the gate passes and the GATE lines on stderr when it does not. |
 | `duplication --json` | `{"run_id", "pairs": [{similarity, contained, functions: [{path, long_name, start, end, nloc}, ...]}]}`. Containment scoring: shared shingles over the smaller function. A pair whose two spans nest in one file is dropped, not ranked: a factory and the closure defined inside it score 1.0 by construction and cannot be deduplicated. `contained` is therefore `false` on every pair here, and it is emitted so pairs and `duplication_twins` read as one shape. |
 | `coupling --json` | `{"window_months", "pairs": [{files: [a, b], support, confidence}]}`. `support` is shared commits, `confidence` is the max-direction ratio. It reads raw `git log`, so any path in the history can appear, not only scoped source. Ranked pairs are cached; see below. |
-| `mutate --json` | `{"mutants", "killed", "survived", "survivors": [{path, line, op, original, mutated}]}`. `mutants` is the count **after** `--max-mutants`; the truncation warning goes to stderr only. With `mutation_workers > 1` the worker worktrees are kept under `.crapkit/mutate-pool/`; `crapkit mutate --drop-pool` removes them and exits. |
+| `mutate --json` | `{"mutants", "killed", "survived", "survivors": [{path, line, op, original, mutated}], "outside_corpus": [path]}`. `mutants` is the count **after** `--max-mutants`; the truncation warning goes to stderr only. `outside_corpus` lists the diff's paths (or `--files`' paths) the scored corpus does not hold, a test file, an excluded path, a file over `max_file_bytes` or a file no scope claims, sorted; they grew no mutants, and a run with `mutants` 0 and a non-empty `outside_corpus` never started the suite. Every worker uses a kept worktree, including one; see [mutation worktrees](configuration.md#mutation-worktrees). |
 | `claims --json` | Above. |
 | `digest` | **Never JSON.** Plain lines, and silent when nothing changed. |
 | `report` | No payload of its own. It writes one self-contained HTML page to `.crapkit/report.html` (or `--out PATH`, repo-relative, or an absolute path you name) and prints that path on stdout, rendering the `worklist` and `trend` payloads above at their defaults. Read those two instead of parsing the page. |
@@ -1062,9 +1167,9 @@ on every invocation: 4.3 M rows on the corpus the 0.4.5 work was measured agains
 
 Two consequences for a caller.
 
-- **A read-only checkout is fine, a read-only store is not.** The fill is best effort: if
-  another crapkit process holds the write lock, or the file cannot be written, the command
-  drops the cache and still prints the right answer. It never fails on the write.
+- **The rollup write is best effort.** If another process holds the write lock or
+  the cache cannot be written, the command still prints the calculated totals.
+  Opening an older store can require a schema migration before this cache step.
 - **The cache is keyed on the ceiling the totals were decided against**, repo target plus
   per-scope targets. Change a ceiling in `crapkit.toml` and the next `trend` refills under a
   new key rather than reporting the old numbers.
@@ -1091,6 +1196,29 @@ every pair naming that file. Unreadable or unkeyable content reads as cold, neve
 The paths are decoded. git spells a non-ASCII name in a log with C-style escapes, and since
 0.4.5 all three readers undo that before joining, so a pair names the file `git ls-files`
 names rather than a spelling that joins to nothing.
+
+---
+
+## Errors
+
+Under `--json`, a command that dies still prints one object on stdout, so a wrapper reads
+the sentence that names the fix instead of an empty stream:
+
+```json
+{"error": {"exit": 5, "kind": "tool", "message": "every lane failed (2 of 2); the errors are above"}, "schema": 1}
+```
+
+| `exit` | `kind` | Raised when |
+|---|---|---|
+| 1 | `state` | The store or the tree lacks what the command needs: no run, no scored run, no function matching the name, no open claim. |
+| 3 | `config` | `crapkit.toml` is missing, does not parse, or refuses a value; an unknown `--lane` or `--scope` is this too. |
+| 4 | `git` | A git command failed or a commit is missing: a baseline that is not an ancestor, a shallow clone. |
+| 5 | `tool` | A lane or an external tool failed: every lane failed, an artifact the last attempt never wrote, lizard missing. |
+
+`message` is the stderr line without its `crapkit: ` prefix; that line and the exit code
+are unchanged. Verdict exits are not errors: `verify`'s 6 to 9 and `rescore --gate`'s 6
+print their own payloads, with the verdict inside. Without `--json`, stdout stays empty
+on an error.
 
 ---
 
@@ -1204,6 +1332,14 @@ CLI degrades to silence instead of an argparse usage dump on every edit.
 
 ## MCP server
 
+The server reads cancellation and control messages while a tool is running.
+Each connection admits one active tool call. An overlapping tool call returns
+`isError: true` with a message to retry after the active call finishes.
+Cancelling a request stops its owned CLI descendants. Closing stdin ends the
+session and stops active work, so clients must keep stdin open until they have
+read the replies they need. See [resource policies](resources.md) for process
+ownership, pool limits and cleanup scope.
+
 ```
 crapkit mcp
 ```
@@ -1211,25 +1347,39 @@ crapkit mcp
 A dependency-free stdio MCP server: JSON-RPC 2.0, one message per line. The handshake
 negotiates the protocol revision: a client's offer of `2025-06-18`, `2025-03-26` or
 `2024-11-05` is spoken verbatim, and anything else gets `2025-06-18`, the newest this
-server implements. Read-only, and declared so: every tool carries
-`readOnlyHint`/`idempotentHint` annotations, `initialize` returns `instructions` naming
-the two-command prerequisite, and a tool whose text is a JSON object also carries it
-parsed as `structuredContent`. Every tool shells to the CLI's own surface, so the MCP
+server implements. Read-only, and declared so: every tool carries `readOnlyHint`,
+`idempotentHint` and `destructiveHint: false` annotations, a `title` and an `outputSchema`
+whose fields are described one by one, `initialize` returns `instructions` naming the
+two-command prerequisite and the four tools a session starts with, and a tool whose text
+is a JSON object also carries it parsed as `structuredContent`. Every tool shells to the CLI's own surface, so the MCP
 view cannot drift from what the CLI reports, and nothing here writes a baseline, a
 ratchet, or a mutant.
+
+The CLI child stream is UTF-8, including non-ASCII filenames and error messages,
+on Windows and POSIX. Tool calls can populate disposable caches, open or migrate
+the snapshot store, and fill best-effort rollups. Read-only annotations describe
+the measurement and debt operations exposed, not a promise of zero filesystem
+writes. `get_next_item` takes no claim; `check_gate` runs `rescore` and records no
+verification run.
 
 Answering those calls from one long-lived process instead was measured for 0.4.5 and
 rejected. A kept process serves a `source` the session has already edited, and a packet whose
 `source` is stale is a packet nobody can edit from.
 
-With no `--repo`, the server serves the directory the client started it in, which is what a
-globally registered server sees in each project. In a directory with no `crapkit.toml` the
-server still starts and answers `initialize` and `tools/list`. Each `tools/call` there comes
+With no `--repo`, the server serves the nearest `crapkit.toml` at or above the directory the
+client started it in ([ADR 0002](adr/0002-configuration-is-found-upward-nearest-wins.md)),
+so a globally registered server started in a monorepo workspace serves the root
+configuration that claims the workspace; a tool's `repo` argument is walked the same way,
+and a `.git` entry without a configuration stops the walk. A given `--repo` names an exact
+root, as on every subcommand, and each tool's command runs at the root the server found, so
+`path` stays repo-relative wherever the server was started. In a directory with no
+`crapkit.toml` at or above it the server still starts and answers `initialize` and
+`tools/list`. Each `tools/call` there comes
 back as a tool result, not a JSON-RPC error, and that result carries `isError: true` with
 text naming the missing config and `crapkit init`:
 
 ```json
-{"jsonrpc": "2.0", "id": 3, "result": {"content": [{"type": "text", "text": "no crapkit.toml in .../noconfig — nothing measured here. Run `crapkit init` in the repo you want scored, or pass this tool a `repo` argument (or start the server with --repo) pointing at one."}], "isError": true}}
+{"jsonrpc": "2.0", "id": 3, "result": {"content": [{"type": "text", "text": "no crapkit.toml in .../noconfig - nothing measured here. Run `crapkit init` in the repo you want scored, or pass this tool a `repo` argument (or start the server with --repo) pointing at one."}], "isError": true}}
 ```
 
 Both halves are deliberate. The result keeps the client's session alive, so a global
@@ -1254,21 +1404,44 @@ can serve several checkouts.
 
 | Tool | Arguments | Returns |
 |---|---|---|
-| `worklist` | `top` | JSON text |
-| `runs` | | JSON text |
-| `brief` | `path`, `name` | JSON text |
-| `coupling` | `min_support`, `min_confidence` | JSON text |
-| `duplication` | `similarity` | JSON text |
-| `ratchet_report` | | JSON text |
-| `explain` | `path`, `name` | **plain text**, not JSON |
-| `doctor` | | **plain text**, not JSON |
-| `next_item` | `top` (int), `exclude` (array of strings: one fragment per element, each becoming its own `--exclude`) | JSON text |
+| `list_worklist` | `top` (int), `scope` (array of strings: one declared scope name per element, each becoming its own `--scope`) | JSON text |
+| `list_runs` | | JSON text |
+| `get_trend` | | JSON text (`trend --json`: per-run totals, oldest first) |
+| `get_function_brief` | `path`, `name` | JSON text |
+| `list_coupled_files` | `min_support`, `min_confidence` | JSON text |
+| `list_duplicate_functions` | `similarity` | JSON text |
+| `get_ratchet_report` | | JSON text |
+| `list_claims` | | JSON text (`claims list --json`: the open claims) |
+| `get_function_history` | `path`, `name`, `history` (bool: adds `commits` per function, the CLI's `--history`), `tests` (bool: adds `tests`, the CLI's `--tests`) | JSON text |
+| `check_config` | | JSON text (the `doctor --json` report) |
+| `get_next_item` | `top` (int), `exclude` (array of strings: one fragment per element, each becoming its own `--exclude`), `scope` (array of strings, as on `list_worklist`) | JSON text |
+| `check_gate` | `path` (repo-relative source file) | JSON text: `rescore PATH --gate --json`, whose `gate` block says whether the edited file clears the commit gate (`ok`, `judged`, `ceilings`, `breaches`, `untracked`); a breach exits 6 and answers as a result with `gate.ok` false, not a tool error |
 
-Results arrive as MCP text content. For the seven JSON tools the text is the payload; parse
-it. For `explain` and `doctor` it is the human output, which has no schema. `isError` is
-true whenever the underlying CLI call exited non-zero, and then the text is whatever the CLI
-wrote to stderr. It is true in one case where no CLI call runs at all: the missing-config
-result above.
+Results arrive as MCP text content, and every tool's text is the payload of the CLI's
+`--json` form: parse it, or read `structuredContent`, which carries the same object parsed
+whenever the call exited 0. `isError` is true whenever the underlying CLI call exited
+non-zero, and then the text is what the CLI printed: for `doctor` that is still the JSON
+report (it exits 1 on any FAIL, so a failing `doctor` answers JSON text with `isError: true`
+and no `structuredContent`); for the other `--json` tools it is the [error object](#errors)
+the CLI prints, `{"error": {"exit", "kind", "message"}, "schema": 1}`, whose `message` is
+the stderr line; `get_next_item`, which has no `--json` flag, answers the stderr line itself.
+`check_gate` is the one exception to the exit rule: its exit 6 is the verdict, so a breach answers
+`isError: false` with `structuredContent` attached and `gate.ok` false, while exits 3, 4 and 5
+(and 1, no scored run yet) stay tool errors. `isError` is also
+true in the cases where no CLI call runs at all: the missing-config result above, an
+unknown tool name, and an argument the tool's own table refuses.
+
+Arguments are checked against the served schema before anything is spawned. `tools/list`
+declares `required` from each tool's positionals (`brief` and `explain` require `path` and
+`name`). A missing positional answers `brief needs name (see inputSchema.required)`, an
+undeclared key answers `worklist does not take 'bogus'; accepted: repo, top, scope`, and a
+wrong type answers `top must be an integer (got "three")`. Each is a tool result with
+`isError: true` in the tool's own vocabulary, not the protocol's `-32602` error, following
+the precedent the missing-config answer set; the reason is recorded in
+[ADR 0001](adr/0001-mcp-invalid-arguments-are-tool-results.md). Protocol errors stay
+reserved for the protocol: an unknown method answers `-32601`, and an exception escaping
+the server answers `-32603` and the loop reads on, so no single call ends the session.
+`ping` answers an empty result, so a client's keepalive never reads as an error.
 
 ## Docker
 

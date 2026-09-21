@@ -18,9 +18,10 @@ from ..invocation import _self
 from ..snapshot import build_inventory_rows, tsv_lines
 from ..store import SnapshotStore
 from ..universe import assign_files, scan_files
-from ._shared import (_analysis_tools, _emit_findings, _file_sizer, _gate_line,
+from ..uncovered import DeadLineFold
+from ._shared import (_analysis_tools, _command_root, _emit_findings, _file_sizer, _gate_line,
                       _latest_scored, _load_repo_config, _print_json, _ratchet_entries,
-                      _repo_out_path, _repo_relative,
+                      _repo_out_path, _repo_relative, _stand,
                       _write_tsv)
 
 
@@ -52,13 +53,12 @@ def _records_by_scope(files_by_scope: dict, records_by_path: dict) -> dict:
 
 
 def _analysis_workers(cfg) -> int | None:
-    """[crapkit] analysis_workers, as ProcessPoolExecutor wants it: 0 means
-    'unset', which is one worker per core — the pool's own default."""
+    """Requested pool ceiling; zero delegates to the shared resource policy."""
     return cfg.analysis_workers or None
 
 
 def _analyzed_corpus(root: Path, cache_path: Path, flat: list,
-                     workers: int | None = None) -> tuple[dict, int]:
+                     workers: int | None = None, worker_budget: int = 0) -> tuple[dict, int]:
     """Analyze the whole corpus cache-first and write the rebuilt cache back.
 
     The prior cache dies with this frame on purpose: it holds a second copy of
@@ -66,7 +66,8 @@ def _analyzed_corpus(root: Path, cache_path: Path, flat: list,
     """
     _, analyze_files, load_cache, save_cache = _analysis_tools()
     prior = load_cache(cache_path)
-    records_by_path, cache_hits, new_cache = analyze_files(root, flat, cache=prior, workers=workers)
+    records_by_path, cache_hits, new_cache = analyze_files(
+        root, flat, cache=prior, workers=workers, worker_budget=worker_budget)
     # Saved unmerged on purpose: this rebuild is the one point that evicts the
     # entries for content no longer in the corpus.
     save_cache(cache_path, new_cache, prior=prior)
@@ -82,18 +83,20 @@ class _Corpus(NamedTuple):
 def _build_inventory(root: Path, cfg, git=None) -> tuple[str, list, _Corpus, int, dict]:
     """Shared by inventory/coverage: returns (commit, rows, corpus, cache_hits, tool_versions)."""
     lizard, *_ = _analysis_tools()
+    from ..analyze import ANALYSIS_VERSION
     commit = (git or GitFacts(root)).head_commit()
     universe = scan_files(ls_files(root), cfg, size_of=_file_sizer(root))
     flat = _present_on_disk(root, _tracked_files(universe.by_scope))
     records_by_path, cache_hits = _analyzed_corpus(
-        root, root / ".crapkit" / "cache.json", flat, _analysis_workers(cfg))
+        root, root / ".crapkit" / "cache.json", flat, _analysis_workers(cfg), cfg.analysis_worker_budget)
     rows = build_inventory_rows(_records_by_scope(universe.by_scope, records_by_path))
-    tool_versions = {"crapkit": __version__, "lizard": lizard.version}
+    tool_versions = {"crapkit": __version__, "lizard": lizard.version,
+                     "analysis_version": str(ANALYSIS_VERSION)}
     return commit, rows, _Corpus(len(flat), len(universe.oversized)), cache_hits, tool_versions
 
 
 def cmd_inventory(args: argparse.Namespace) -> int:
-    root = Path(args.repo).resolve()
+    root = _command_root(args.repo)
     cfg = _load_repo_config(root)
     commit, rows, corpus, cache_hits, tool_versions = _build_inventory(root, cfg)
     state_dir = root / ".crapkit"
@@ -123,14 +126,13 @@ def cmd_inventory(args: argparse.Namespace) -> int:
     return 0
 
 
-def _lane_reuse(root: Path, lane, scope_paths: dict, reuse_artifacts: bool, reuse_unchanged: bool,
-                git) -> bool:
+def _lane_reuse(root: Path, lane, reuse_artifacts: bool, reuse_unchanged: bool) -> bool:
     from ..lanes import lane_unchanged
 
     if reuse_artifacts:
         return True
-    if reuse_unchanged and lane_unchanged(root, lane, scope_paths, git):
-        print(f"crapkit: lane {lane.name!r}: artifact still matches its scopes; reusing without rerun",
+    if reuse_unchanged and lane_unchanged(root, lane):
+        print(f"crapkit: lane {lane.name!r}: measurement inputs unchanged; reusing without rerun",
               file=sys.stderr)
         return True
     return False
@@ -141,47 +143,61 @@ def _progress(message: str) -> None:
     sys.stderr.write(f"crapkit: {message}\n")
 
 
-def _run_one_lane(root: Path, lane, reuse: bool, scope_paths: dict | None, git):
-    """One lane's outcome or its error text; a failed lane never sinks the run."""
+def _run_one_lane(root: Path, lane, reuse: bool, scope_paths: dict | None, git, dead_lines=None, owner=None):
+    """One lane's outcome or the error that failed it; a failed lane never sinks
+    the run. The error object, not its text: a refusal carries the modification
+    times of the files the attempt left unwritten, which the fold persists."""
     from ..lanes import run_lane
 
     try:
-        return run_lane(root, lane, reuse_artifact=reuse, scope_paths=scope_paths, git=git), ""
+        return run_lane(root, lane, reuse_artifact=reuse, scope_paths=scope_paths, git=git,
+                        dead_lines=dead_lines, owner=owner), ""
     except ToolError as exc:
-        return None, str(exc)
+        return None, exc
 
 
-def _traced_lane(root: Path, lane, reuse: bool, scope_paths: dict | None, git):
+def _traced_lane(root: Path, lane, reuse: bool, scope_paths: dict | None, git, dead_lines=None, owner=None):
     _progress(f"lane {lane.name!r} started")
-    outcome = _run_one_lane(root, lane, reuse, scope_paths, git)
+    outcome = _run_one_lane(root, lane, reuse, scope_paths, git, dead_lines, owner)
     _progress(f"lane {lane.name!r} finished")
     return outcome
 
 
-def _execute_parallel(root: Path, ordered, reuse: dict, scope_paths, git, max_parallel: int) -> dict:
+def _execute_parallel(root: Path, ordered, reuse: dict, scope_paths, git, max_parallel: int,
+                      dead_lines=None, owner=None) -> dict:
     """Lanes are subprocess-bound, so threads are enough: subprocess.run drops the
     GIL for the whole command and each lane streams to its own log file."""
     from concurrent.futures import ThreadPoolExecutor
 
     with ThreadPoolExecutor(max_workers=max_parallel) as pool:
-        futures = {lane: pool.submit(_traced_lane, root, lane, reuse[lane], scope_paths, git)
+        futures = {lane: pool.submit(_traced_lane, root, lane, reuse[lane], scope_paths, git, dead_lines, owner)
                    for lane in ordered}
     return {lane: future.result() for lane, future in futures.items()}
 
 
-def _execute_lanes(root: Path, ordered, reuse: dict, scope_paths, git, max_parallel: int) -> dict:
-    """lane -> (outcome, error text), keyed by the Lane itself rather than its
-    name, which the config does not force to be unique. Serial below 2, which is
-    the default: same thread, same order, none of the started/finished chatter."""
+def _execute_lanes(root: Path, ordered, reuse: dict, scope_paths, git, max_parallel: int,
+                   dead_lines=None, owner=None) -> dict:
+    """Lane outcomes, serial below 2 and parallel otherwise."""
     if max_parallel < 2:
-        return {lane: _run_one_lane(root, lane, reuse[lane], scope_paths, git) for lane in ordered}
-    return _execute_parallel(root, ordered, reuse, scope_paths, git, max_parallel)
+        return {lane: _run_one_lane(root, lane, reuse[lane], scope_paths, git, dead_lines, owner)
+                for lane in ordered}
+    return _execute_parallel(root, ordered, reuse, scope_paths, git, max_parallel, dead_lines, owner)
+
+
+def _refuse_all_failed(lanes, lane_errors: dict, succeeded: list) -> None:
+    # `lane_errors` and not `lanes`: a cc-only repo declares no lanes, so nothing
+    # succeeded and nothing failed either, and that run is still a scored run.
+    if lane_errors and not succeeded:
+        failed = len(lane_errors)
+        raise ToolError(f"every lane failed ({failed} of {len(lanes)}); the errors are above")
 
 
 def _collect_lanes(root: Path, lanes, outcomes: dict):
     """Fold the outcomes back together in DECLARATION order, whatever order they
-    finished in, and persist every stamp in one write."""
-    from ..lanes import write_stamps
+    finished in, and persist every stamp in one write: the fresh stamps of the
+    lanes that succeeded, and the refusal each failed lane's error carries for
+    the artifact its attempt left unwritten."""
+    from ..lanes import refusal_stamp, write_stamps
 
     coverage_by_path: dict[str, list] = {}
     provenance: dict[str, dict] = {}
@@ -191,8 +207,9 @@ def _collect_lanes(root: Path, lanes, outcomes: dict):
     for lane in lanes:
         outcome, error = outcomes[lane]
         if error:
-            lane_errors[lane.name] = error
+            lane_errors[lane.name] = str(error)
             print(f"crapkit: lane {lane.name!r} FAILED: {error}", file=sys.stderr)
+            stamps.update(refusal_stamp(root, lane, error))
             continue
         for path, fns in outcome.coverage.items():
             coverage_by_path.setdefault(path, []).extend(fns)
@@ -200,21 +217,21 @@ def _collect_lanes(root: Path, lanes, outcomes: dict):
         stamps[lane.artifact] = outcome.stamp
         succeeded.append(lane)
     write_stamps(root, stamps)
-    # `lane_errors` and not `lanes`: a cc-only repo declares no lanes, so nothing
-    # succeeded and nothing failed either, and that run is still a scored run.
-    if lane_errors and not succeeded:
-        # A count and a pointer, not the errors again: every one of them has
-        # already printed above, and quoting them here made the reader read the
-        # same block twice. Counted off `lanes`, not the error dict: the config
-        # does not force lane names to be unique, and two failed lanes sharing
-        # a name would collapse to one key.
-        failed = len(lanes) - len(succeeded)
-        raise ToolError(f"every lane failed ({failed} of {len(lanes)}); the errors are above")
+    _refuse_all_failed(lanes, lane_errors, succeeded)
     return coverage_by_path, provenance, lane_errors, succeeded
 
 
 def _run_lanes(root: Path, lanes, reuse_artifacts: bool, scope_paths: dict | None = None,
-               reuse_unchanged: bool = False, max_parallel: int = 1, git=None):
+               reuse_unchanged: bool = False, max_parallel: int = 1, git=None, dead_lines=None):
+    from ..lanes import measurement_owner
+
+    with measurement_owner(root, lanes) as owner:
+        return _run_owned_lanes(root, lanes, reuse_artifacts, scope_paths, reuse_unchanged,
+                                max_parallel, git, dead_lines, owner)
+
+
+def _run_owned_lanes(root, lanes, reuse_artifacts, scope_paths, reuse_unchanged,
+                      max_parallel, git, dead_lines, owner):
     """Run each lane; a failed lane is recorded and skipped, never fatal alone.
 
     Every reuse decision is taken up front, on one thread: it reads the working
@@ -226,12 +243,14 @@ def _run_lanes(root: Path, lanes, reuse_artifacts: bool, scope_paths: dict | Non
     from ..lanes import lane_order
 
     facts = git or GitFacts(root)
-    reuse = {lane: _lane_reuse(root, lane, scope_paths or {}, reuse_artifacts,
-                               reuse_unchanged, facts)
+    reuse = {lane: _lane_reuse(root, lane, reuse_artifacts, reuse_unchanged)
              for lane in lanes}
     ordered = lane_order(root, list(lanes)) if max_parallel > 1 else list(lanes)
-    return _collect_lanes(root, lanes,
-                          _execute_lanes(root, ordered, reuse, scope_paths, facts, max_parallel))
+    outcomes = _execute_lanes(root, ordered, reuse, scope_paths, facts, max_parallel,
+                              dead_lines, owner)
+    if owner is not None:
+        owner.check()
+    return _collect_lanes(root, lanes, outcomes)
 
 
 class _ScoredRun(NamedTuple):
@@ -252,6 +271,7 @@ class _ScoredRun(NamedTuple):
     tool_versions: dict
     corpus: _Corpus
     cache_hits: int
+    dead_lines: DeadLineFold | None = None
 
 
 def _scored_run(root: Path, cfg, lanes, *, reuse_artifacts: bool, reuse_unchanged: bool = False,
@@ -261,24 +281,66 @@ def _scored_run(root: Path, cfg, lanes, *, reuse_artifacts: bool, reuse_unchange
     `git` is the caller's GitFacts when it already has one — verify asks for the
     dirty set before this runs, and that answer is the one the lanes must see too.
     """
-    from ..score import score_rows
+    from ..score import SharedSpanFold, score_rows
 
     git = git or GitFacts(root)
     commit, rows, corpus, cache_hits, tool_versions = _build_inventory(root, cfg, git)
+    dead_lines = DeadLineFold()
 
     coverage_by_path, provenance, lane_errors, succeeded = _run_lanes(
         root, lanes, reuse_artifacts, cfg.scope_paths, reuse_unchanged,
-        cfg.max_parallel_lanes, git)
+        cfg.max_parallel_lanes, git, dead_lines)
 
     # Only scopes a SUCCESSFUL lane covers count as measured; a failed lane's
     # scopes fall back to no-lane flags rather than reading as untested code.
     lane_scopes = {s for lane in succeeded for s in lane.scopes}
+    shared_spans = SharedSpanFold()
     scored = score_rows(rows, coverage_by_path, lane_scopes=lane_scopes, target=cfg.target,
                         scope_targets=cfg.scope_targets,
-                        cc_only_scopes=cfg.coverage_optional_scopes)
+                        cc_only_scopes=cfg.coverage_optional_scopes,
+                        shared_spans=shared_spans)
+    _note_shared_spans(shared_spans, cfg)
     test_failures = {f for prov in provenance.values() for f in prov.get("failures", ())}
     return _ScoredRun(commit, scored, provenance, lane_errors, test_failures, tool_versions,
-                      corpus, cache_hits)
+                      corpus, cache_hits, dead_lines)
+
+
+_SPANS_NAMED = 3
+
+
+def _over_target_at_zero(members, cfg):
+    """The worst function on each shared span that its ceiling can fail.
+
+    Every function on a shared span scores as uncovered, and a function of
+    complexity 2 scores 6 at zero coverage, so no ceiling of 6 can fail it.
+    The count carries those; the named lines are the ones worth splitting.
+    """
+    from ..score import crap
+
+    for span in members:
+        worst = max(span, key=lambda row: row.ccn)
+        if crap(worst.ccn, 0.0) > cfg.ceiling_of(worst.scope):
+            yield worst
+
+
+def _note_shared_spans(fold, cfg) -> None:
+    """Name the source line spans more than one function declares.
+
+    Loud but not fatal, the shape `_note_unanalyzable` settled for unreadable
+    files: the join cannot tell whose coverage is whose on such a span, and
+    ending the run over it left the consumer repo with no coverage run at all.
+    """
+    if not fold.sites:
+        return
+    over = sorted(_over_target_at_zero(fold.sites, cfg), key=lambda row: (-row.ccn, row.path))
+    tail = f"; {len(over)} of them hold a function over its target:" if over else ""
+    print(f"crapkit: {len(fold.sites)} source line span(s) hold more than one function; "
+          "coverage cannot say whose is whose, so those functions score as uncovered, and "
+          f"splitting the definitions onto separate lines measures them{tail}", file=sys.stderr)
+    for row in over[:_SPANS_NAMED]:
+        print(f"crapkit:   {row.path}:{row.start} (complexity {row.ccn})", file=sys.stderr)
+    if len(over) > _SPANS_NAMED:
+        print(f"crapkit:   ... and {len(over) - _SPANS_NAMED} more", file=sys.stderr)
 
 
 def _run_kind(lanes, cfg, failures) -> str:
@@ -287,6 +349,34 @@ def _run_kind(lanes, cfg, failures) -> str:
     pre-existing failure in the missing lanes would read as NEW forever."""
     full = not failures and {l.name for l in lanes} == {l.name for l in cfg.lanes}
     return "coverage" if full else "partial"
+
+
+class _RunShape(NamedTuple):
+    """What the summary says about the run's own shape, on every path: the
+    kind `runs list` files it under, the lanes that ran and failed, and the
+    scopes a declared lane measures that no succeeding lane reached."""
+    kind: str
+    ran: list[str]
+    failed: list[str]
+    unmeasured: list[str]
+
+
+def _measured_scopes(provenance: dict) -> set[str]:
+    """The scopes the lanes that succeeded this run cover."""
+    return {s for prov in provenance.values() for s in prov.get("scopes", ())}
+
+
+def _unmeasured_scopes(cfg, provenance: dict) -> list[str]:
+    """Scopes a declared lane measures that this run did not, in declaration
+    order. A scope no lane declares is `no-lane` on every run and is not
+    listed: it is a configuration `doctor` names, not this run's shape."""
+    declared = {s for lane in cfg.lanes for s in lane.scopes} - _measured_scopes(provenance)
+    return [s.name for s in cfg.scopes if s.name in declared]
+
+
+def _run_shape(lanes, cfg, run: _ScoredRun) -> _RunShape:
+    return _RunShape(_run_kind(lanes, cfg, run.lane_errors), list(run.provenance),
+                     list(run.lane_errors), _unmeasured_scopes(cfg, run.provenance))
 
 
 def _refuse_empty_lane_run(cfg, requested) -> None:
@@ -336,34 +426,94 @@ def _by_scope(scored, cfg) -> dict[str, dict]:
                                      scope_targets=cfg.scope_targets))
 
 
-def _coverage_summary(run_id, commit, scored, cfg, provenance, failures, corpus, cache_hits, db_path):
+def _judged_rows(scored, unmeasured: list[str]) -> list:
+    """The rows the run's over-ceiling count and grade are taken over: every
+    scope but the ones no lane measured this run. A skipped lane's functions
+    score at cov 0 and read as debt; they are the scope's to report under
+    `by_scope`, not this run's grade. On a full run this is every row."""
+    left_out = set(unmeasured)
+    return [r for r in scored if r.scope not in left_out]
+
+
+def _coverage_summary(run_id: int, run: _ScoredRun, cfg, shape: _RunShape, db_path) -> dict:
     from ..score import grade
 
-    flags = _flag_counts(scored)
-    over = sum(1 for r in scored if r.crap > cfg.scope_targets.get(r.scope, cfg.target))
+    flags = _flag_counts(run.scored)
+    judged = _judged_rows(run.scored, shape.unmeasured)
+    over = sum(1 for r in judged if r.crap > cfg.ceiling_of(r.scope))
     return {
-        "run_id": run_id, "commit": commit, "files": corpus.files, "functions": len(scored),
-        "cache_hits": cache_hits, "measured": flags["measured"], "untested": flags["untested"],
+        "run_id": run_id, "commit": run.commit, "files": run.corpus.files,
+        "functions": len(run.scored), "cache_hits": run.cache_hits,
+        "measured": flags["measured"], "untested": flags["untested"],
         "no_lane": flags["no-lane"], "cc_only": flags["cc-only"],
-        "skipped_max_bytes": corpus.skipped_max_bytes,
-        "over_target": over, "grade": grade(over, len(scored)),
-        "by_scope": _by_scope(scored, cfg),
-        "crap_load": round(sum(r.crap for r in scored), 2), "lanes": provenance,
-        "lane_failures": failures, "db": str(db_path),
+        "skipped_max_bytes": run.corpus.skipped_max_bytes,
+        "over_target": over, "grade": grade(over, len(judged)),
+        "by_scope": _by_scope(run.scored, cfg),
+        "crap_load": round(sum(r.crap for r in run.scored), 2), "lanes": run.provenance,
+        "lane_failures": run.lane_errors, "db": str(db_path),
+        "kind": shape.kind, "unmeasured_scopes": shape.unmeasured, "ceilings": cfg.ceilings,
     }
 
 
-def _print_coverage(as_json: bool, summary: dict, cfg, failures: dict) -> None:
+def _lanes_word(names: list[str]) -> str:
+    plural = "s" if len(names) > 1 else ""
+    return f"lane{plural} {', '.join(names)}"
+
+
+def _partial_opening(shape: _RunShape) -> str:
+    """The first line of a partial run's text, so a `--lane` run is never
+    mistaken for a baseline: what ran, what failed, what went unmeasured."""
+    parts = [_lanes_word(shape.ran)]
+    if shape.failed:
+        parts.append(f"{_lanes_word(shape.failed)} failed")
+    if shape.unmeasured:
+        parts.append(f"{', '.join(shape.unmeasured)} unmeasured")
+    return f"partial run ({'; '.join(parts)}; not a baseline)"
+
+
+def _bucket_text(summary: dict) -> str:
+    """The four flags counted, zero buckets dropped: `2 measured / 1 no-lane`."""
+    buckets = [(summary["measured"], "measured"), (summary["untested"], "untested"),
+               (summary["no_lane"], "no-lane"), (summary["cc_only"], "cc-only")]
+    return " / ".join(f"{n} {word}" for n, word in buckets if n)
+
+
+def _ceiling_label(ceilings: dict[str, int]) -> str:
+    """`ceiling 6`, or `their ceilings (6; reports 12, util 4)` when a scope
+    sets its own."""
+    own = ", ".join(f"{scope} {c}" for scope, c in ceilings.items() if scope != "default")
+    if not own:
+        return f"ceiling {ceilings['default']}"
+    return f"their ceilings ({ceilings['default']}; {own})"
+
+
+def _summary_line(summary: dict) -> str:
+    buckets = _bucket_text(summary)
+    counted = f": {buckets}" if buckets else ""
+    return (f"run {summary['run_id']} @ {summary['commit'][:11]}: "
+            f"{summary['functions']} functions scored{counted}, "
+            f"{summary['over_target']} over {_ceiling_label(summary['ceilings'])}, "
+            f"CRAP load {summary['crap_load']}, grade {summary['grade']}")
+
+
+def _next_command(kind: str) -> str:
+    """What to run next: the ranking after a trusted run, the lanes a partial
+    run skipped after a partial one."""
+    if kind == "partial":
+        return f"-> rerun changed lanes: {_self()} coverage --reuse-unchanged"
+    return f"-> next: {_self()} worklist"
+
+
+def _print_coverage(as_json: bool, summary: dict, shape: _RunShape) -> None:
     if as_json:
         _print_json(summary)
         return
-    print(f"run {summary['run_id']} @ {summary['commit'][:11]}: {summary['functions']} functions scored — "
-          f"{summary['measured']} measured / {summary['untested']} untested / "
-          f"{summary['no_lane']} no-lane / {summary['cc_only']} cc-only, "
-          f"{summary['over_target']} over target {cfg.target}, CRAP load {summary['crap_load']}, "
-          f"grade {summary['grade']}")
-    for name, err in failures.items():
+    if shape.kind == "partial":
+        print(_partial_opening(shape))
+    print(_summary_line(summary))
+    for name, err in summary["lane_failures"].items():
         print(f"  lane {name!r} FAILED: {err}")
+    print(_next_command(shape.kind))
 
 
 def _warn_suite_drop(store: SnapshotStore, provenance: dict) -> None:
@@ -385,7 +535,7 @@ def _warn_suite_drop(store: SnapshotStore, provenance: dict) -> None:
 
 
 def cmd_coverage(args: argparse.Namespace) -> int:
-    root = Path(args.repo).resolve()
+    root = _command_root(args.repo)
     cfg = _load_repo_config(root)
     lanes = _select_lanes(cfg, args.lane)
 
@@ -396,16 +546,14 @@ def cmd_coverage(args: argparse.Namespace) -> int:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     store = SnapshotStore(db_path)
     _warn_suite_drop(store, run.provenance)
+    shape = _run_shape(lanes, cfg, run)
     run_id = store.write_run(commit=run.commit, tool_versions=run.tool_versions, rows=run.scored,
-                             lanes=run.provenance,
-                             kind=_run_kind(lanes, cfg, run.lane_errors))
+                             lanes=run.provenance, kind=shape.kind)
     if args.export:
         _export_scored(root, args.export, run.scored)
     _emit_coverage_findings(root, args, run.scored, cfg)
 
-    summary = _coverage_summary(run_id, run.commit, run.scored, cfg, run.provenance,
-                                run.lane_errors, run.corpus, run.cache_hits, db_path)
-    _print_coverage(args.json, summary, cfg, run.lane_errors)
+    _print_coverage(args.json, _coverage_summary(run_id, run, cfg, shape, db_path), shape)
     return 5 if run.lane_errors else 0
 
 
@@ -419,7 +567,7 @@ def _emit_coverage_findings(root: Path, args, scored, cfg) -> None:
 
 
 def _rescored_records(root: Path, cache_path: Path, flat: list,
-                      workers: int | None = None) -> dict:
+                      workers: int | None = None, worker_budget: int = 0) -> dict:
     """Fresh records for `flat`, folded INTO the shared cache rather than over it.
 
     A rescore knows about a handful of files; writing its entry map straight out
@@ -427,20 +575,35 @@ def _rescored_records(root: Path, cache_path: Path, flat: list,
     """
     _, analyze_files, load_cache, save_cache = _analysis_tools()
     prior = load_cache(cache_path)
-    records_by_path, _, new_cache = analyze_files(root, flat, cache=prior, workers=workers)
+    records_by_path, _, new_cache = analyze_files(
+        root, flat, cache=prior, workers=workers, worker_budget=worker_budget)
     save_cache(cache_path, merged_cache(prior, new_cache), prior=prior)
     return records_by_path
 
 
-def _rescore_analyze(root: Path, cfg, files) -> tuple[list, list, dict]:
-    """Fresh complexity for the named files; the shared cache is merged, never truncated."""
+def _refuse_missing(root: Path, rel_paths: list) -> None:
+    """A path crapkit cannot open is refused the way one it cannot place is.
+
+    Unchecked, a typo reached the analyzer and came back as a FileNotFoundError
+    traceback with exit 1; through the MCP server that traceback was the whole
+    answer. A config error says which path, and exits 3 like every other
+    argument the command cannot act on."""
+    missing = [rel for rel in rel_paths if not (root / rel).exists()]
+    if missing:
+        raise ConfigError(f"{', '.join(missing)} does not exist under {root}")
+
+
+def _rescore_analyze(root: Path, cfg, files, cwd: Path | None = None) -> tuple[list, list, dict]:
+    """Fresh complexity for the named files, said from `cwd` where the user
+    stands; the shared cache is merged, never truncated."""
     from ..hook import file_ceilings
 
-    rel_paths = sorted({_repo_relative(p, root) for p in files})
+    rel_paths = sorted({_repo_relative(p, root, cwd) for p in files})
+    _refuse_missing(root, rel_paths)
     files_by_scope = assign_files(rel_paths, cfg, size_of=_file_sizer(root))
     flat = sorted(set().union(*files_by_scope.values())) if files_by_scope else []
     records_by_path = _rescored_records(root, root / ".crapkit" / "cache.json", flat,
-                                        _analysis_workers(cfg))
+                                        _analysis_workers(cfg), cfg.analysis_worker_budget)
     by_scope = {scope: [r for f in scope_files for r in records_by_path[f]]
                 for scope, scope_files in files_by_scope.items()}
     return build_inventory_rows(by_scope), flat, file_ceilings(cfg, files_by_scope, flat)
@@ -475,16 +638,22 @@ def _rescore_overlay(store: SnapshotStore, latest: dict, rows: list, flat: list,
                                   cc_only_scopes=cfg.coverage_optional_scopes)
 
 
-def _rescore_json(overlay, latest: dict) -> None:
-    _print_json({
+def _rescore_json(overlay, latest: dict, gate: dict | None = None) -> None:
+    """The functions, and under --gate the verdict beside them: one object,
+    so an agent reading the payload never has to read stderr for the finding."""
+    payload = {
         "baseline_run": latest["id"], "baseline_commit": latest["commit"],
         "functions": [{
             "scope": r.scope, "path": r.path, "function": r.long_name, "start": r.start,
+            "occurrence": r.occurrence,
             "end": r.end, "ccn": r.ccn, "cov": r.cov, "flag": r.flag, "crap": r.crap,
             "remedy": r.remedy, "stale_coverage": True,
         } for r in overlay],
         "note": "coverage is the baseline run's; complexity is the working tree's. Run verify for the real verdict.",
-    })
+    }
+    if gate is not None:
+        payload["gate"] = gate
+    _print_json(payload)
 
 
 def _ceiling_breaches(rows, ceilings: dict[str, int], keys: dict | None = None) -> list:
@@ -556,28 +725,70 @@ def _warn_untracked(untracked: set[str]) -> None:
               file=sys.stderr)
 
 
-def _rescore_gate(root: Path, cfg, overlay, ceilings: dict[str, int]) -> int:
-    """The commit's verdict, hours before the commit. Reported on stderr so
-    `--json` stdout stays one parseable object."""
+class _GateVerdict(NamedTuple):
+    """The commit's verdict, hours before the commit: what was judged, against
+    which ceiling per file, and the breaches no ratchet mark covers."""
+    judged: int
+    ceilings: dict[str, int]
+    breaches: list
+    untracked: list[str]
+
+    @property
+    def ok(self) -> bool:
+        return not self.breaches
+
+
+def _gate_verdict(root: Path, cfg, overlay, ceilings: dict[str, int]) -> _GateVerdict:
     from ..keys import key_names
 
     untracked = _untracked_of(root, overlay)
-    _warn_untracked(untracked)
     candidates = _gate_candidates(root, overlay) + [r for r in overlay if r.path in untracked]
     touched = _ceiling_breaches(candidates, ceilings, key_names(overlay))
-    breaches = _unmarked_breaches(touched, _ratchet_entries(root, cfg) or [])
-    if not breaches:
+    breaches = _unmarked_breaches(touched, _ratchet_entries(root, cfg, overlay) or [])
+    return _GateVerdict(len(candidates), ceilings, breaches, sorted(untracked))
+
+
+def _breach_json(v, ceilings: dict[str, int]) -> dict:
+    return {"path": v.path, "function": v.long_name, "start": v.start, "ccn": v.ccn,
+            "cov": v.cov, "crap": v.crap, "remedy": v.remedy, "key_name": v.key_name,
+            "ceiling": ceilings[v.path]}
+
+
+def _gate_json(verdict: _GateVerdict) -> dict:
+    """The `gate` block of `rescore --gate --json`: the fields a wrapper needs
+    to say which function, which rule, and whether the tree clears the gate."""
+    return {"ok": verdict.ok, "judged": verdict.judged, "ceilings": verdict.ceilings,
+            "breaches": [_breach_json(v, verdict.ceilings) for v in verdict.breaches],
+            "untracked": verdict.untracked}
+
+
+def _gate_ceiling_label(ceilings: dict[str, int]) -> str:
+    """`ceiling 6` when every rescored file is judged at one number, else
+    `their ceilings` (the per-file map is in the JSON)."""
+    distinct = sorted(set(ceilings.values()))
+    return f"ceiling {distinct[0]}" if len(distinct) == 1 else "their ceilings"
+
+
+def _report_gate(verdict: _GateVerdict, as_json: bool) -> int:
+    """The verdict on stderr when it fails, so `--json` stdout stays one
+    parseable object; one stdout line when it passes, so the exit code is
+    not the only signal."""
+    _warn_untracked(set(verdict.untracked))
+    if verdict.ok:
+        if not as_json:
+            print(f"gate: {verdict.judged} changed function(s) judged, "
+                  f"0 over {_gate_ceiling_label(verdict.ceilings)}")
         return 0
-    print(f"crapkit gate: {len(breaches)} rescored function(s) over their scope ceiling:",
+    print(f"crapkit gate: {len(verdict.breaches)} rescored function(s) over their scope ceiling:",
           file=sys.stderr)
-    for v in breaches:
+    for v in verdict.breaches:
         print(_gate_line(v), file=sys.stderr)
     return 6
 
 
-def cmd_rescore(args: argparse.Namespace) -> int:
-    root = Path(args.repo).resolve()
-    cfg = _load_repo_config(root)
+def _rescore_baseline(root: Path) -> tuple[SnapshotStore, dict]:
+    """The store and the newest scored run a rescore overlays on, or the
+    refusal naming the command that makes one."""
     db_path = root / ".crapkit" / "crap.sqlite"
     if not db_path.is_file():
         raise CrapkitError(f"no snapshot in {root} — run `{_self()} coverage` first")
@@ -585,19 +796,27 @@ def cmd_rescore(args: argparse.Namespace) -> int:
     latest = _latest_scored(store)
     if latest is None:
         raise CrapkitError(f"no scored run in {root} — run `{_self()} coverage` first")
+    return store, latest
 
-    rows, flat, ceilings = _rescore_analyze(root, cfg, args.files)
+
+def cmd_rescore(args: argparse.Namespace) -> int:
+    root = _command_root(args.repo)
+    cfg = _load_repo_config(root)
+    store, latest = _rescore_baseline(root)
+
+    rows, flat, ceilings = _rescore_analyze(root, cfg, args.files, cwd=_stand(args.repo))
     overlay = _rescore_overlay(store, latest, rows, flat, cfg)
+    verdict = _gate_verdict(root, cfg, overlay, ceilings) if args.gate else None
     if args.json:
-        _rescore_json(overlay, latest)
+        _rescore_json(overlay, latest, None if verdict is None else _gate_json(verdict))
     else:
         _print_rescore_table(overlay, latest)
-    return _rescore_gate(root, cfg, overlay, ceilings) if args.gate else 0
+    return 0 if verdict is None else _report_gate(verdict, args.json)
 
 
 def _print_rescore_table(overlay, latest: dict) -> None:
     """The refactor loop's view: fresh ccn, worst first, stale cov labeled."""
     print(f"rescore vs run {latest['id']} @ {latest['commit'][:11]} (coverage STALE, complexity fresh)")
-    print(f"  {'ccn':>4} {'cov':>5} {'crap':>8}  {'remedy':10} function")
+    print(f"  {'ccn':>4} {'cov':>5} {'crap':>8}  {'remedy':11} function")
     for r in sorted(overlay, key=lambda x: (-x.ccn, x.path, x.start)):
-        print(f"  {r.ccn:>4} {r.cov:>5.0%} {r.crap:>8.1f}  {r.remedy:10} {r.path}:{r.start}  {r.long_name}")
+        print(f"  {r.ccn:>4} {r.cov:>5.0%} {r.crap:>8.1f}  {r.remedy:11} {r.path}:{r.start}  {r.long_name}")

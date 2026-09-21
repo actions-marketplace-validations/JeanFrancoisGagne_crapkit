@@ -1,13 +1,13 @@
-"""Content-hash analysis cache. Pure partition/update; the shell owns file I/O.
+"""Reader-and-content analysis cache. Pure partition/update; the shell owns file I/O.
 
-Keys are file content hashes, never mtimes (checkout resets mtimes). The
+Keys identify the reader, extension chain and content hash. The
 fingerprint bundles everything that changes analysis output for identical
 content (lizard pin, crapkit analysis version); a fingerprint change drops
 the whole cache rather than serving stale records.
 """
 from __future__ import annotations
 
-from .merge import FunctionRecord
+from .merge import FunctionRecord, UnanalyzableFile
 
 
 def partition_by_cache(
@@ -33,11 +33,20 @@ def updated_cache(
     records_by_path: dict[str, list[FunctionRecord]],
     *,
     fingerprint: str,
-    stale_hashes: list[str] | None = None,
 ) -> dict:
+    """A refused file is left out, so the next run attempts it and names it again.
+
+    Caching the empty record set of an UnanalyzableFile would be indistinguishable
+    from a real file of zero functions: the refusal would be announced once and
+    then go quiet forever while its functions stayed unscored and ungated.
+    """
     return {
         "fp": fingerprint,
-        "entries": {hashes[path]: records for path, records in sorted(records_by_path.items())},
+        "entries": {
+            hashes[path]: records
+            for path, records in sorted(records_by_path.items())
+            if not isinstance(records, UnanalyzableFile)
+        },
     }
 
 

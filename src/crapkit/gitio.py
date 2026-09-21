@@ -1,6 +1,7 @@
 """Git shell layer: the tracked-file universe and the current commit."""
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -13,6 +14,7 @@ from pathlib import Path
 from .errors import GitError
 
 _OBJECT_NAME = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+_LOG_HEADER = re.compile(r"^\0(-?\d+)\n", re.MULTILINE)
 
 # Every path this module hands out is joined against root-relative rows, because
 # `git ls-files` answers relative to the cwd. Diffs do not: git names their files
@@ -30,12 +32,23 @@ _OBJECT_NAME = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 # diff_names_since, unstaged_paths, churn_log_lines and the `diff -U0` headers
 # all spell the path the way ls-files does. git still quotes a path holding a
 # double-quote or a control character whatever this says, which is why
-# churn._unquote_git_path stays.
+# gitpaths.unquote_path stays for line-oriented history and diff headers.
 _RELATIVE = ("-c", "diff.relative=true", "-c", "core.quotePath=false")
+# Parsed patches are a protocol, independent of display settings and converters.
+_PATCH = ("-U0", "--no-renames", "--no-color", "--src-prefix=a/", "--dst-prefix=b/",
+          "--no-ext-diff", "--no-textconv", "--inter-hunk-context=0",
+          "--output-indicator-new=+", "--output-indicator-old=-", "--output-indicator-context= ")
 
 
-def _git(root: Path, *args: str) -> str:
-    return _run(root, (*_RELATIVE, *args), args)
+def _environment() -> dict[str, str]:
+    """GIT_DIFF_OPTS overrides even explicit -U0; it is display state."""
+    environment = dict(os.environ)
+    environment.pop("GIT_DIFF_OPTS", None)
+    return environment
+
+
+def _git(root: Path, *args: str, binary: bool = False) -> str:
+    return _run(root, (*_RELATIVE, *args), args, binary=binary)
 
 
 def _git_unflagged(root: Path, *args: str) -> str:
@@ -48,17 +61,24 @@ def _git_unflagged(root: Path, *args: str) -> str:
     return _run(root, args, args)
 
 
-def _run(root: Path, argv: tuple[str, ...], named: tuple[str, ...]) -> str:
+def _run(root: Path, argv: tuple[str, ...], named: tuple[str, ...], *, binary: bool = False) -> str:
     """`named` is what the error says ran — the injected flags are crapkit's
     business, not the caller's."""
     try:
-        res = subprocess.run(["git", *argv], cwd=root,
-                             capture_output=True, text=True, encoding="utf-8")
+        res = subprocess.run(["git", *argv], cwd=root, env=_environment(),
+                             capture_output=True, text=not binary, encoding=None if binary else "utf-8")
     except FileNotFoundError as exc:
         raise GitError("git executable not found") from exc
     if res.returncode != 0:
-        raise GitError(f"git {' '.join(named)} failed in {root}: {res.stderr.strip()}")
-    return res.stdout
+        error = res.stderr.decode("utf-8", "replace") if binary else res.stderr
+        raise GitError(f"git {' '.join(named)} failed in {root}: {error.strip()}")
+    return res.stdout.decode("utf-8") if binary else res.stdout
+
+
+def _git_paths(root: Path, *args: str) -> list[str]:
+    """NUL records decoded without newline conversion, quoting, or trimming."""
+    out = _run(root, (*_RELATIVE, *args), args, binary=True)
+    return [path for path in out.split("\0") if path]
 
 
 def _git_lines(root: Path, *args: str) -> Iterator[str]:
@@ -68,7 +88,7 @@ def _git_lines(root: Path, *args: str) -> Iterator[str]:
     consumer never mistakes an empty stream for an empty history.
     """
     try:
-        proc = subprocess.Popen(["git", *_RELATIVE, *args], cwd=root, stdout=subprocess.PIPE,
+        proc = subprocess.Popen(["git", *_RELATIVE, *args], cwd=root, env=_environment(), stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, encoding="utf-8")
     except FileNotFoundError as exc:
         raise GitError("git executable not found") from exc
@@ -85,8 +105,7 @@ def stage_path(root: Path, rel_path: str) -> None:
 
 
 def ls_files(root: Path) -> list[str]:
-    out = _git(root, "ls-files", "-z")
-    return [p for p in out.split("\0") if p]
+    return _git_paths(root, "ls-files", "-z")
 
 
 def untracked_files(root: Path) -> list[str]:
@@ -95,8 +114,7 @@ def untracked_files(root: Path) -> list[str]:
     git applies the ignore rules, so a build directory never reads as source
     somebody forgot to add.
     """
-    out = _git(root, "ls-files", "--others", "--exclude-standard", "-z")
-    return [p for p in out.split("\0") if p]
+    return _git_paths(root, "ls-files", "--others", "--exclude-standard", "-z")
 
 
 def config_value(root: Path, key: str) -> str:
@@ -122,12 +140,11 @@ def index_modes(root: Path, pathspec: str) -> dict[str, str]:
     Windows, where the filesystem has no such bit and the working copy always
     looks 0644.
     """
-    out = _git(root, "ls-files", "-s", "-z", "--", pathspec)
+    records = _git_paths(root, "ls-files", "-s", "-z", "--", pathspec)
     modes = {}
-    for record in out.split("\0"):
-        if record:
-            meta, _, path = record.partition("\t")
-            modes[path.replace("\\", "/")] = meta.split(" ", 1)[0]
+    for record in records:
+        meta, _, path = record.partition("\t")
+        modes[path] = meta.split(" ", 1)[0]
     return modes
 
 
@@ -135,7 +152,7 @@ def staged_diff(root: Path) -> str:
     # --no-renames: a renamed file becomes delete+add, so a rename stays a
     # touched file and its functions still face the gate (and the old ratchet
     # entry's drop is matched by fresh gating at the new path).
-    return _git(root, "diff", "--cached", "-U0", "--no-renames")
+    return _read_source_patch(root, "--cached")
 
 
 def unstaged_paths(root: Path) -> set[str]:
@@ -150,13 +167,12 @@ def unstaged_paths(root: Path) -> set[str]:
 
 
 def _diff_names(root: Path, *args: str) -> list[str]:
-    """One `git diff --name-only` answer, slash-normalized."""
-    out = _git(root, "diff", "--name-only", "--no-renames", *args)
-    return [line.strip().replace("\\", "/") for line in out.splitlines() if line.strip()]
+    """One `git diff --name-only` answer with exact root-relative paths."""
+    return _git_paths(root, "diff", "--name-only", "--no-renames", "-z", *args)
 
 
 def diff_since(root: Path, commit: str) -> str:
-    return _git(root, "diff", commit, "-U0", "--no-renames")
+    return _read_source_patch(root, commit)
 
 
 def diff_names_since(root: Path, commit: str) -> list[str]:
@@ -176,7 +192,7 @@ def _rename_pairs(fields: list[str]) -> dict[str, str]:
         status = fields[i]
         paths = 2 if status[0] in ("R", "C") else 1
         if status[0] == "R":
-            pairs[fields[i + 1].replace("\\", "/")] = fields[i + 2].replace("\\", "/")
+            pairs[fields[i + 1]] = fields[i + 2]
         i += 1 + paths
     return pairs
 
@@ -192,8 +208,8 @@ def renamed_paths(root: Path, since: str, *, similarity: int = 50) -> dict[str, 
     so only renames wholly inside the root pair up here; a mark on a file moved
     in from above the root reads as new.
     """
-    out = _git(root, "diff", "--name-status", f"-M{similarity}", "-z", since, "HEAD")
-    return _rename_pairs(out.split("\0"))
+    fields = _git_paths(root, "diff", "--name-status", f"-M{similarity}", "-z", since, "HEAD")
+    return _rename_pairs(fields)
 
 
 def status_names(root: Path) -> list[str]:
@@ -234,6 +250,14 @@ def is_ancestor(root: Path, commit: str, other: str = "HEAD") -> bool:
     except FileNotFoundError as exc:
         raise GitError("git executable not found") from exc
     return res.returncode == 0
+
+
+def is_shallow(root: Path) -> bool:
+    """True when this checkout is a depth-limited clone: one that does not hold
+    every commit its history names. The ancestor check reads it to blame the
+    right thing, since a commit a shallow clone never fetched is not one a
+    rebase rewrote. `rev-parse` answers with the word `true` or `false`."""
+    return _git(root, "rev-parse", "--is-shallow-repository").strip() == "true"
 
 
 def _batch_stream(root: Path, requests: bytes) -> bytes:
@@ -281,7 +305,19 @@ def staged_blobs(root: Path, rel_paths: list[str]) -> dict[str, bytes]:
     """
     if not rel_paths:
         return {}
+    if _line_paths(rel_paths):
+        return _individual_blobs(root, rel_paths)
     return _framed_blobs(_batch_stream(root, _batch_requests(rel_paths)), rel_paths)
+
+
+def _line_paths(paths: list[str]) -> bool:
+    return any("\n" in path or "\r" in path for path in paths)
+
+
+def _individual_blobs(root: Path, paths: list[str]) -> dict[str, bytes]:
+    """Line-bearing names cannot use line-framed requests on older Git versions."""
+    return {path: _Started(root, ("show", f":./{path}"), text=False, stdin=False).result()
+            for path in paths}
 
 
 def _batch_requests(rel_paths: list[str]) -> bytes:
@@ -306,7 +342,7 @@ class _Started:
         self._args, self._root, self._text = args, root, text
         try:
             self._proc = subprocess.Popen(
-                ["git", *_RELATIVE, *args], cwd=root,
+                ["git", *_RELATIVE, *args], cwd=root, env=_environment(),
                 stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=text, encoding="utf-8" if text else None)
@@ -326,6 +362,73 @@ class _Started:
         if self._proc.returncode is None:
             self._proc.kill()
             self._proc.communicate()
+
+
+def _source_diff_args(basis: tuple[str, ...], paths: tuple[str, ...], *,
+                      force_text: bool = False) -> tuple[str, ...]:
+    # Source body bytes need no character decoding to count hunk lines.
+    text = ("--text",) if force_text else ()
+    return ("--literal-pathspecs", "diff", *basis,
+            *_PATCH, *text, "--", *paths)
+
+
+def _binary_source_path(record: str, extensions: tuple[str, ...]) -> str | None:
+    added, removed, path = record.split("\t", 2)
+    if added == removed == "-" and path.endswith(extensions):
+        return path
+    return None
+
+
+def _binary_source_paths(root: Path, basis: tuple[str, ...],
+                         paths: tuple[str, ...]) -> tuple[str, ...]:
+    from .universe import LANGUAGE_EXTENSIONS
+
+    extensions = tuple(ext for group in LANGUAGE_EXTENSIONS.values() for ext in group)
+    records = _git_paths(root, "--literal-pathspecs", "diff", *basis, "--numstat", "-z",
+                         "--no-renames", "--no-ext-diff", "--no-textconv", "--", *paths)
+    return tuple(path for record in records if (path := _binary_source_path(record, extensions)))
+
+
+class SourcePatch:
+    """A parsed source patch, started before analysis imports need its answer.
+
+    Ordinary patches cost one process. A binary display attribute can hide an
+    analyzable source file, so only a binary summary triggers exact NUL metadata
+    and a forced patch for supported source paths. PNG/ZIP payloads stay binary.
+
+    UTF-8 surrogateescape preserves opaque body bytes, including admitted cp1252
+    source. It does not replace bytes or relax path decoding: gitpaths and NUL
+    metadata retain the strict UTF-8 identity contract.
+    """
+
+    def __init__(self, root: Path, *basis: str, paths: tuple[str, ...] = ()) -> None:
+        self._root, self._basis, self._paths = root, basis, paths
+        self._read = _Started(root, _source_diff_args(basis, paths), text=False, stdin=False)
+
+    def result(self) -> str:
+        patch = self._read.result().decode("utf-8", "surrogateescape")
+        if "\nBinary files " not in patch:
+            return patch
+        paths = _binary_source_paths(self._root, self._basis, self._paths)
+        if not paths:
+            return patch
+        forced = _Started(self._root, _source_diff_args(self._basis, paths, force_text=True),
+                          text=False, stdin=False)
+        try:
+            return patch + forced.result().decode("utf-8", "surrogateescape")
+        finally:
+            forced.close()
+
+    def close(self) -> None:
+        self._read.close()
+
+
+def _read_source_patch(root: Path, *basis: str) -> str:
+    read = SourcePatch(root, *basis)
+    try:
+        return read.result()
+    finally:
+        read.close()
 
 
 class GitReads:
@@ -349,9 +452,10 @@ class _StartedReads:
     costs more than both spawns together, so the spawns belong underneath it.
     """
 
-    def __init__(self, root: Path) -> None:
-        self._diff = _Started(root, ("diff", "--cached", "-U0", "--no-renames"),
-                              text=True, stdin=False)
+    def __init__(self, root: Path, base: str | None = None) -> None:
+        self._root = root
+        basis = (merge_base(root, base),) if base is not None else ()
+        self._diff = SourcePatch(root, "--cached", *basis)
         self._batch = _Started(root, ("cat-file", "--batch"), text=False, stdin=True)
 
     def staged_diff(self) -> str:
@@ -360,6 +464,8 @@ class _StartedReads:
     def staged_blobs(self, rel_paths: list[str]) -> dict[str, bytes]:
         if not rel_paths:
             return {}
+        if _line_paths(rel_paths):
+            return _individual_blobs(self._root, rel_paths)
         stream = self._batch.result(_batch_requests(rel_paths))
         return _framed_blobs(stream, rel_paths)
 
@@ -369,14 +475,14 @@ class _StartedReads:
 
 
 @contextmanager
-def staged_reads(root: Path):
+def staged_reads(root: Path, base: str | None = None):
     """The gate's two git reads, started before the caller needs either.
 
     Both processes are shut down on the way out, whichever of them the caller got
     around to reading: a commit with nothing staged never asks for a blob, and a
     machine with no lizard never asks for anything at all.
     """
-    reads = _StartedReads(root)
+    reads = _StartedReads(root, base)
     try:
         yield reads
     finally:
@@ -395,13 +501,25 @@ def file_log_patches(root: Path, rel_path: str) -> list[tuple[int, str]]:
     is that renaming the ratchet file restarts its burn-down history at the
     rename.
     """
-    out = _git(root, "log", "--reverse", "--format=%x01%at", "-p", "-U0", "--", rel_path)
+    # A path may hold U+0001, the old separator. Body NULs have +/- prefixes;
+    # only a physical header line starts with the NUL timestamp marker. Raw LF
+    # framing prevents CR in a legacy field from manufacturing a header line.
+    out = _git(root, "--literal-pathspecs", "log", "--reverse", "--format=%x00%at",
+               "-p", *_PATCH, "--text", "--", rel_path, binary=True)
+    return _history_patches(out)
+
+
+def _history_patches(out: str) -> list[tuple[int, str]]:
     patches = []
-    for block in out.split("\x01"):
-        if not block.strip():
-            continue
-        head, _, patch = block.partition("\n")
-        patches.append((int(head.strip()), patch))
+    stamp, start = None, 0
+    for header in _LOG_HEADER.finditer(out):
+        if stamp is not None:
+            patches.append((stamp, out[start:header.start()]))
+        stamp, start = int(header.group(1)), header.end()
+    if stamp is not None:
+        patches.append((stamp, out[start:]))
+    elif out:
+        raise GitError("Git patch history has no timestamp header")
     return patches
 
 
@@ -429,7 +547,21 @@ def churn_log_lines(root: Path, months: int) -> Iterator[str]:
 _LONGPATHS = ("-c", "core.longpaths=true")
 
 
-def worktree_add(root: Path, path: Path) -> None:
+def _worktree_git(root: Path, *args: str, owner=None) -> str:
+    if owner is None:
+        return _git(root, *args)
+    from .procs import run_owned
+    try:
+        result = run_owned(["git", *_RELATIVE, *args], cwd=root, env=_environment(),
+                           capture_output=True, owner=owner)
+    except FileNotFoundError as error:
+        raise GitError("git executable not found") from error
+    if result.returncode != 0:
+        raise GitError(f"git {' '.join(args)} failed in {root}: {result.stderr.strip()}")
+    return result.stdout
+
+
+def worktree_add(root: Path, path: Path, *, owner=None) -> None:
     """A detached checkout of HEAD at `path`: a second working tree that shares
     the object store, so a worker can edit files without touching the real one.
 
@@ -445,30 +577,30 @@ def worktree_add(root: Path, path: Path) -> None:
     add that dies in the scan leaves neither the target directory nor an entry.
     """
     try:
-        _git(root, *_LONGPATHS, "worktree", "add", "--detach", str(path))
+        _worktree_git(root, *_LONGPATHS, "worktree", "add", "--detach", str(path), owner=owner)
         return
     except GitError as first:
         message = str(first)
         if "worktrees/" not in message or "commondir" not in message:
             raise
     time.sleep(0.05)
-    _git(root, *_LONGPATHS, "worktree", "add", "--detach", str(path))
+    _worktree_git(root, *_LONGPATHS, "worktree", "add", "--detach", str(path), owner=owner)
 
 
-def worktree_remove(root: Path, path: Path) -> None:
+def worktree_remove(root: Path, path: Path, *, owner=None) -> None:
     """Teardown. --force because the worker's tree is dirty by construction, and
     it never raises: a cleanup error must not mask the failure that caused it.
     `prune` is the fallback that drops the admin entry a stuck directory leaves.
     Parallel removes survive the same admin-entry enumeration that kills a
     parallel add (0 failures in 320 concurrent removes measured), so no retry."""
     try:
-        _git(root, *_LONGPATHS, "worktree", "remove", "--force", str(path))
+        _worktree_git(root, *_LONGPATHS, "worktree", "remove", "--force", str(path), owner=owner)
     except GitError:
         shutil.rmtree(path, ignore_errors=True)
-        _prune_quietly(root)
+        _prune_quietly(root, owner=owner)
 
 
-def worktree_reset(tree: Path, commit: str) -> None:
+def worktree_reset(tree: Path, commit: str, *, owner=None) -> None:
     """A worktree back to `commit`, content and all, without a fresh checkout.
     30.6 s of `worktree add` on a 31,459-file tree against 0.46 s here.
 
@@ -500,13 +632,13 @@ def worktree_reset(tree: Path, commit: str) -> None:
     """
     if not (tree / ".git").exists():
         raise GitError(f"{tree} is not a git worktree")
-    _git(tree, *_LONGPATHS, "checkout", "--force", commit)
-    _git(tree, *_LONGPATHS, "clean", "-xdff")
+    _worktree_git(tree, *_LONGPATHS, "checkout", "--force", commit, owner=owner)
+    _worktree_git(tree, *_LONGPATHS, "clean", "-xdff", owner=owner)
 
 
-def _prune_quietly(root: Path) -> None:
+def _prune_quietly(root: Path, *, owner=None) -> None:
     try:
-        _git(root, "worktree", "prune")
+        _worktree_git(root, "worktree", "prune", owner=owner)
     except GitError:
         pass
 
@@ -611,6 +743,11 @@ def head_commit(root: Path) -> str:
     return out
 
 
+def worktree_root(root: Path) -> Path:
+    """The checkout containing root, including a linked or nested worktree."""
+    return Path(_git_unflagged(root, "rev-parse", "--show-toplevel").strip()).resolve()
+
+
 class GitFacts:
     """One command's answers to the three questions every lane asks.
 
@@ -636,6 +773,7 @@ class GitFacts:
         self._status: tuple[str, ...] | None = None
         self._diffs: dict[str, tuple[str, ...]] = {}
         self._ancestry: dict[tuple[str, str], bool] = {}
+        self._shallow: bool | None = None
 
     def head_commit(self) -> str:
         with self._lock:
@@ -664,3 +802,10 @@ class GitFacts:
             if key not in self._ancestry:
                 self._ancestry[key] = is_ancestor(self.root, commit, other)
             return self._ancestry[key]
+
+    def is_shallow(self) -> bool:
+        """Asked once: a clone does not deepen under a running command."""
+        with self._lock:
+            if self._shallow is None:
+                self._shallow = is_shallow(self.root)
+            return self._shallow

@@ -6,15 +6,19 @@ the lane that measures the scope, and re-derived the commands to run. Each of
 those is a value some caller already holds, so each is a field here instead of a
 round trip.
 
-Every function in this module is pure: values in, a dict or a list out. The
-reads that feed them — the store, git, the config, the file texts — belong to
-the caller, which is what lets one batch of packets pay for them once. Nothing
-here removes or retypes a field `brief --json` already published; the packet is
-what was added around it.
+The caller reads the store, git, configuration and file texts once per batch.
+This module formats those values; command quoting follows the host platform's
+shells. The packet keeps the existing `brief --json` field types.
 """
 from __future__ import annotations
 
-from .ratchet_report import DAY
+import base64
+import os
+import re
+import shlex
+
+from .ratchet_report import DAY, mark_age_days
+from .keys import lookup, position, require_unambiguous
 
 # What the gate actually enforces, said once. A session that reads a ceiling of
 # 6 beside a standing mark of 72 otherwise reads a contradiction and either
@@ -62,7 +66,7 @@ def file_functions(rows) -> list[dict]:
     twin beside it, the row that is already at its ceiling and must stay there.
     """
     return [{"function": r.long_name, "start": r.start, "end": r.end, "ccn": r.ccn,
-             "crap": r.crap, "remedy": r.remedy} for r in rows]
+             "crap": r.crap, "remedy": r.remedy, "occurrence": position(r)[1]} for r in rows]
 
 
 def file_totals(rows, scope_targets: dict, target: int) -> dict:
@@ -81,22 +85,6 @@ def gate_rule(*, ceiling: int, mark: float | None, mark_age_days: int | None,
     """The rule this function will be judged by, spelled out rather than implied."""
     return {"ceiling": ceiling, "binds": GATE_BINDS, "ratchet_mark": mark,
             "mark_age_days": mark_age_days, "diff_uncovered_max": diff_uncovered_max}
-
-
-def mark_age_days(events: list[tuple], key: tuple) -> int | None:
-    """How long this function's mark has stood, in the ratchet history's own time.
-
-    Anchored on the newest commit in the history, never the wall clock, so a
-    fixed history reports the same age forever. A mark that was repaid and later
-    re-added is aged from its return: the debt is the one standing now.
-    """
-    entered = None
-    anchor = 0
-    for ts, event_key, kind, _ in events:
-        anchor = max(anchor, ts)
-        if event_key == key:
-            entered = ts if kind == "added" else None
-    return None if entered is None else (anchor - entered) // DAY
 
 
 def lane_for(scope: str | None, lanes):
@@ -119,19 +107,49 @@ def lane_record(lane) -> dict | None:
             "timeout_seconds": lane.timeout_seconds}
 
 
-def commands(path: str, scoped: str | None, note: str = "") -> dict:
+def _windows_encoded(arguments: list[str]) -> str:
+    """Cross cmd expansion and PowerShell parsing without exposing path text."""
+    quoted = " ".join("'" + arg.replace("'", "''") + "'" for arg in arguments)
+    script = ("$command = Get-Command crapkit -CommandType Application -TotalCount 1 -ErrorAction Stop; "
+              "$LASTEXITCODE = 1; & $command.Source " + quoted + "; exit $LASTEXITCODE")
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    return "powershell -NoProfile -NonInteractive -EncodedCommand " + encoded
+
+
+def _windows_argument(argument: str) -> str:
+    if argument in ("--", "--gate") or re.fullmatch(r"[\w./:\\][-\w./:\\]*", argument, re.ASCII):
+        return argument
+    return '"' + argument + '"'
+
+
+def _console_command(arguments: list[str]) -> str:
+    if os.name != "nt":
+        return "crapkit " + " ".join(shlex.quote(arg) for arg in arguments)
+    interpreted = set('%!$`\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029')
+    if any(interpreted.intersection(arg) for arg in arguments):
+        return _windows_encoded(arguments)
+    return "crapkit " + " ".join(_windows_argument(arg) for arg in arguments)
+
+
+def _file_command(command: str, path: str, flags=()) -> str:
+    arguments = [command, path, *flags]
+    if path.startswith("-"):
+        arguments = [command, *flags, "--", path]
+    return _console_command(arguments)
+
+
+def commands(path: str, scoped: bool, note: str = "") -> dict:
     """The four commands a session runs next, with the paths already filled in.
 
-    `refresh_writes_run` rides beside `refresh` because the other three change
-    nothing on disk and that one does: a read-only session, or one holding a
-    tree it is not allowed to score, has to know which of the four it may run.
+    `refresh_writes_run` says refresh creates a coverage run. The other commands
+    can also write artifacts, caches or verification records.
     """
-    out = {"gate": f"crapkit rescore {path} --gate",
-           "scoped_tests": scoped,
+    out = {"gate": _file_command("rescore", path, ["--gate"]),
+           "scoped_tests": _file_command("test-scoped", path) if scoped else None,
            "verify": "crapkit verify",
            "refresh": REFRESH,
            "refresh_writes_run": True}
-    if scoped is None and note:
+    if not scoped and note:
         out["scoped_tests_note"] = note
     return out
 
@@ -181,25 +199,41 @@ def matching_names(names, name: str) -> list[str]:
     return exact_names(names, name) or [n for n in names if name in n]
 
 
-def anonymous_starts(rows) -> list[int]:
-    """Where the file's anonymous functions open, in file order."""
-    return sorted(r.start for r in rows if not bare_name(r.long_name))
+def anonymous_positions(rows) -> list[tuple]:
+    """Anonymous locations in source order, with scope copies shared."""
+    rows = list(rows)
+    require_unambiguous(rows)
+    return sorted({lookup(r) for r in rows if not bare_name(r.long_name)},
+                  key=lambda place: (place[2], place[3], place[1]))
 
 
-def handles(rows) -> dict[int, str]:
-    """The handle for every row in one file, keyed by the line it opens on.
+def handles(rows) -> dict[tuple, str]:
+    """The handle for every row in one file, keyed by its full stored location.
 
-    A named function is its own handle. An anonymous one is `(anonymous)#N`,
-    counted over the file's anonymous functions in start order — a position, not
-    a line, so the string a session copies out of a packet still names the same
-    function after an edit above it moves every line below.
+    Named twins carry #N, including #1; overloads retain their full signature.
+    Anonymous handles count all anonymous spans in file order. Duplicate scopes
+    share a span and a handle. Moving lines above a function keeps its ordinal.
 
-    Keyed by start because no two functions in a file open on the same line,
-    which makes it the one per-file key a row already carries.
     """
-    ordinals = {start: n for n, start in enumerate(anonymous_starts(rows), 1)}
-    return {r.start: bare_name(r.long_name) or f"{ANONYMOUS}#{ordinals[r.start]}"
-            for r in rows}
+    rows = list(rows)
+    require_unambiguous(rows)
+    groups: dict[str, dict[str, set[tuple]]] = {}
+    for row in rows:
+        groups.setdefault(bare_name(row.long_name), {}).setdefault(row.long_name, set()).add(lookup(row))
+    found = _named_handles(groups)
+    found.update({place: f"{ANONYMOUS}#{n}"
+                  for n, place in enumerate(anonymous_positions(rows), 1)})
+    return found
+
+
+def _named_handles(groups: dict) -> dict[tuple, str]:
+    found = {}
+    for siblings in groups.values():
+        for name, starts in siblings.items():
+            label = name if len(siblings) > 1 else bare_name(name)
+            for n, start in enumerate(sorted(starts), 1):
+                found[start] = f"{label}#{n}" if len(starts) > 1 else label
+    return found
 
 
 def handle_names(rows) -> list[str]:
@@ -209,7 +243,7 @@ def handle_names(rows) -> list[str]:
     needs the two that exist, the same way a wrong bare name gets the file's
     real names back.
     """
-    return [f"{ANONYMOUS}#{n}" for n in range(1, len(anonymous_starts(rows)) + 1)]
+    return [f"{ANONYMOUS}#{n}" for n in range(1, len(anonymous_positions(rows)) + 1)]
 
 
 def handle_ordinal(name: str) -> int | None:

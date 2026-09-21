@@ -160,9 +160,9 @@ def test_the_packet_carries_every_function_in_the_file_not_just_this_one(repo: P
 
     assert out["file_functions"] == [
         {"function": "beta( a , b )", "start": 1, "end": 13, "ccn": 6, "crap": 42.0,
-         "remedy": "add-tests"},
+         "remedy": "add-tests", "occurrence": 1},
         {"function": "helper( a )", "start": 16, "end": 19, "ccn": 2, "crap": 6.0,
-         "remedy": "ok"},
+         "remedy": "ok", "occurrence": 1},
     ]
     assert out["file_totals"] == {"functions": 2, "over_target": 1, "crap_load": 48.0}, \
         "helper sits exactly at the ceiling of 6, which is not over it"
@@ -198,7 +198,7 @@ def test_the_packet_carries_the_commands_to_run_next(repo: Path):
 
     assert out["commands"] == {
         "gate": "crapkit rescore core/alpha.py --gate",
-        "scoped_tests": 'python -m pytest "core/alpha.py"',
+        "scoped_tests": 'crapkit test-scoped core/alpha.py',
         "verify": "crapkit verify",
         "refresh": "crapkit coverage --reuse-unchanged",
         "refresh_writes_run": True,
@@ -298,7 +298,8 @@ def test_the_text_brief_keeps_its_lines_and_appends_the_new_ones(repo: Path):
     assert lines[0] == "core/alpha.py:1  alpha( a , b )"
     assert "uncovered lines: 4, 6" in res.stdout
     assert "gate ceiling 6  lane py" in res.stdout
-    assert "1 function(s), 1 over target, crap load 72.0" in res.stdout
+    assert "crap 72.0 vs ceiling 6  -> decompose" in res.stdout, res.stdout
+    assert "1 function(s), 1 over ceiling, crap load 72.0" in res.stdout
 
 
 # --- the start line as a name ----------------------------------------------------

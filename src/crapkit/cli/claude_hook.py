@@ -27,13 +27,10 @@ Two constraints shape the code rather than the contract:
 - Module scope is stdlib only, and stays that way. `_Handler` imports this
   module before the body runs, so anything imported here is paid by every edit
   on the machine, including the ones in repos crapkit never measures.
-- The snapshot store is never opened. `SnapshotStore.__init__` has no read-only
-  path: it runs the schema script, seeds, and applies ALTER TABLE migrations, so
-  a per-edit hook would migrate whatever store it touched, and with two crapkit
-  versions installed whichever fired first would rewrite the schema. It has no
-  busy timeout either, so a store the weekly job holds means an uncaught
-  OperationalError and a multi-second stall that PostToolUse renders invisible.
-  Nothing here writes anything, for the same reason.
+- The snapshot store is never opened. The advisory needs source, configuration
+  and committed ratchet marks; opening a store would add schema inspection and
+  database I/O to every edit. Old stores can still need a migration. The hook
+  stays independent of that lifecycle and writes nothing.
 """
 from __future__ import annotations
 
@@ -48,10 +45,6 @@ PROTOCOL = "1"
 
 # Git state meaning the working tree holds content this edit did not author.
 _SEQUENCING_MARKERS = ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD")
-
-# Deeper than any real checkout, bounded so a pathological path cannot turn the
-# root walk into a filesystem scan.
-_MAX_LEVELS = 64
 
 # The Bash fallback's freshness window: a dirty *.py whose mtime is older than
 # this was not written by the command this event reports, so advising it again
@@ -236,18 +229,16 @@ def _fresh(path: Path, cutoff: float) -> bool:
 def _repo_root(start: Path) -> Path | None:
     """The crapkit root above an edited file, or None when there is none.
 
-    First directory holding `crapkit.toml` wins. A `.git` entry without one stops
-    the walk: a linked worktree carries `.git` as a FILE, and walking past it
-    would lend that worktree its parent checkout's config and its parent's store.
-    That refusal is the same one `_load_repo_config` makes by never walking up at
-    all. Each level costs one stat.
+    `rootfind.find_root`, the walk every command makes (ADR 0002): the nearest
+    `crapkit.toml` wins and a `.git` entry without one stops the walk, so a
+    linked worktree never borrows its parent checkout's config and store. The
+    walk was born here and moved out when the commands adopted it; the import
+    stays inside the function so this module's scope remains stdlib-only, and
+    rootfind itself imports nothing of crapkit's.
     """
-    for directory in [start, *start.parents][:_MAX_LEVELS]:
-        if (directory / "crapkit.toml").is_file():
-            return directory
-        if (directory / ".git").exists():
-            return None
-    return None
+    from ..rootfind import find_root
+
+    return find_root(start)
 
 
 def _sequencing(root: Path) -> bool:
@@ -274,18 +265,30 @@ def _judge(root: Path, rel: str) -> int:
     if in_scope is None:
         return 0
     diff = _diff_proc(root, rel)
-    records = _records(root, rel)
-    ranges = _changed(root, rel, diff.communicate()[0])
+    try:
+        records = _records(root, rel)
+        ranges = _changed(root, rel, _diff_text(diff))
+    finally:
+        diff.close()
     breaches, ceiling = _verdict(cfg, in_scope, rel, records, ranges)
-    return _report(root, cfg, rel, breaches, ceiling, _keys(records))
+    return _report(root, cfg, rel, breaches, ceiling, records)
 
 
 def _config(root: Path):
     """crapkit.toml, parsed straight rather than through `cli._shared`, whose
-    module scope imports the snapshot store this hook must never open."""
-    from ..config import load_config_text
+    module scope imports the snapshot store this hook must never open.
 
-    return load_config_text((root / "crapkit.toml").read_text(encoding="utf-8"))
+    The read is `repotext.repo_text`, the one reader every command uses, and a
+    core module that imports nothing but `errors`: a config PowerShell's
+    `Out-File -Encoding utf8` wrote carries a BOM, and reading it strictly made
+    every advisory in that repo exit 0 on a `does not parse` the catch-all
+    swallowed. A UTF-16 file is the reader's configuration error, and the
+    catch-all still turns that into silence; `crapkit doctor` is where that
+    file gets named."""
+    from ..config import load_config_text
+    from ..repotext import repo_text
+
+    return load_config_text(repo_text(root / "crapkit.toml", "crapkit.toml"), root=root)
 
 
 def _scoped(cfg, rel: str) -> dict | None:
@@ -304,21 +307,22 @@ def _scoped(cfg, rel: str) -> dict | None:
 def _diff_proc(root: Path, rel: str):
     """`git diff HEAD` for one file, started and not awaited.
 
-    Scoped to the path on purpose: 31.4 ms against 92.4 for the whole tree. Its
-    stderr is dropped because every way this fails (no HEAD, no git, a path git
-    dislikes) is the same answer, silence.
-
-    diff.relative because `rel` is relative to the crapkit root and git names a
-    diff's files relative to the repo TOP: under a root one directory down the
-    lookup in `_changed` missed every time and read as "nothing touched", so a
-    breaching edit drew silence. This spawn is its own, not gitio's, so it needs
-    its own flag.
+    Scoped to the path on purpose: 31.4 ms against 92.4 for the whole tree.
+    The commit gate's adapter owns display flags, exact paths and binary-marked
+    source fallback. A failed diff leaves the untracked-file decision to _changed.
     """
-    return subprocess.Popen(
-        ["git", "-c", "diff.relative=true", "diff", "HEAD", "-U0", "--no-renames", "--", rel],
-        cwd=root,
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-        encoding="utf-8", errors="replace")
+    from ..gitio import SourcePatch
+
+    return SourcePatch(root, "HEAD", paths=(rel,))
+
+
+def _diff_text(diff) -> str:
+    from ..errors import GitError
+
+    try:
+        return diff.result()
+    except GitError:
+        return ""
 
 
 def _records(root: Path, rel: str) -> list:
@@ -329,9 +333,9 @@ def _records(root: Path, rel: str) -> list:
     therefore zero breaches, which is the right failure direction for a hook that
     fires while an agent is still typing.
     """
-    from ..analyze import analyze_source
+    from ..analyze import analyze_source, read_source
 
-    return analyze_source(rel, (root / rel).read_text(encoding="utf-8", errors="replace"))
+    return analyze_source(rel, read_source(str(root / rel)))
 
 
 def _changed(root: Path, rel: str, diff_text: str):
@@ -398,12 +402,13 @@ def _keys(records: list) -> dict:
     return key_names(records)
 
 
-def _report(root: Path, cfg, rel: str, breaches: list, ceiling: int, keys: dict) -> int:
+def _report(root: Path, cfg, rel: str, breaches: list, ceiling: int, records: list) -> int:
     """Rung 9. stdout stays empty whatever happens: protocol 1 reserves it for a
     future JSON channel, and Claude Code parses stdout JSON on exit 0."""
     from ..keys import key_of
 
-    marked = _marks_for(root / cfg.ratchet_file, rel)
+    keys = _keys(records)
+    marked = _marks_for(root / cfg.ratchet_file, rel, records)
     unmarked = [rec for rec in breaches if key_of(keys, rec)[1] not in marked]
     if not unmarked:
         return 0
@@ -412,7 +417,7 @@ def _report(root: Path, cfg, rel: str, breaches: list, ceiling: int, keys: dict)
     return 2
 
 
-def _marks_for(marks_path: Path, rel: str) -> set[str]:
+def _marks_for(marks_path: Path, rel: str, records=()) -> set[str]:
     """The ratchet KEY names one file carries marks for, `#N` ordinals included.
 
     Existence, not the numeric high-water rule `verify` applies: crap needs
@@ -420,15 +425,29 @@ def _marks_for(marks_path: Path, rel: str) -> set[str]:
     recorded decision to carry that function as it stands, so without this the
     advisory nags about debt the repo already signed for on every edit.
 
-    Read as lines, not as parsed entries: building 40,303 of them to answer one
-    file's question costs 35 ms, and the answer is a prefix test.
+    Parse only this file's lines and the format comments. Whole-repo entry
+    construction costs 35 ms for 40,303 marks and answers no extra question.
     """
+    from ..repotext import repo_text
+
     if not marks_path.is_file():
         return set()
     prefix = rel + "\t"
-    text = marks_path.read_text(encoding="utf-8", errors="replace")
-    return {line[len(prefix):].rsplit("\t", 1)[0]
-            for line in text.splitlines() if line.startswith(prefix)}
+    text = repo_text(marks_path, marks_path.name)
+    selected = "\n".join(line for line in text.splitlines()
+                           if line.startswith(prefix) or line.startswith("#"))
+    return _known_marks(selected, records)
+
+
+def _known_marks(text: str, records) -> set[str]:
+    """Unproved key identity grants no advisory exemption and writes nothing."""
+    from ..ratchet import checked_key_version, read_ratchet
+
+    try:
+        checked_key_version(text, records)
+    except ValueError:
+        return set()
+    return {entry.long_name for entry in read_ratchet(text)[0]}
 
 
 def _advisory_lines(rel: str, breaches: list, ceiling: int) -> list[str]:

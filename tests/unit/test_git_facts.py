@@ -18,9 +18,6 @@ from crapkit.errors import GitError
 from crapkit.gitio import GitFacts
 from crapkit.lanes import lane_unchanged, write_stamps
 
-SCOPE_PATHS = {"src": ("src",)}
-
-
 @pytest.fixture()
 def counted(monkeypatch) -> dict:
     """Every gitio call GitFacts can make, counted instead of spawned."""
@@ -84,19 +81,59 @@ def _stamped_lane(root: Path, name: str, artifact: str, commit: str) -> Lane:
     return lane
 
 
-def test_two_lanes_sharing_one_context_ask_git_once_each(tmp_path, counted):
-    """The finding: three git commands, once per lane. Two lanes stamped at the
-    same commit now cost one status, one diff and one ancestry check between them."""
+def test_legacy_lane_stamps_do_not_qualify_as_measurement_proof(tmp_path, counted):
     first = _stamped_lane(tmp_path, "unit", "a.json", "beef" * 10)
     second = _stamped_lane(tmp_path, "py", "b.json", "beef" * 10)
-    facts = GitFacts(tmp_path)
+    assert lane_unchanged(tmp_path, first) is False
+    assert lane_unchanged(tmp_path, second) is False
+    assert counted == {"head": 0, "status": 0, "diff": 0, "ancestor": 0}
 
-    assert lane_unchanged(tmp_path, first, SCOPE_PATHS, facts) is True
-    assert lane_unchanged(tmp_path, second, SCOPE_PATHS, facts) is True
 
-    assert counted["status"] == 1
-    assert counted["diff"] == 1
-    assert counted["ancestor"] == 1, "one stamp commit, one answer"
+def test_line_display_shares_git_facts_without_requiring_measurement_reuse(tmp_path, counted):
+    from types import SimpleNamespace
+    from crapkit.uncovered import lane_states
+
+    lanes = [_stamped_lane(tmp_path, name, f"{name}.json", "beef" * 10)
+             for name in ("first", "second")]
+    cfg = SimpleNamespace(lanes=lanes, scope_paths={"src": ("src",)})
+
+    assert lane_states(tmp_path, cfg, GitFacts(tmp_path)) == [("first", ""), ("second", "")]
+    assert counted == {"head": 0, "status": 1, "diff": 1, "ancestor": 1}
+    assert all(not lane_unchanged(tmp_path, lane) for lane in lanes)
+
+
+@pytest.mark.parametrize("reason", ["missing-stamp", "refused-write", "lost-history", "git-error"])
+def test_line_display_withholds_unproved_artifact_locations(tmp_path, counted, monkeypatch, reason):
+    from types import SimpleNamespace
+    from crapkit.uncovered import lane_states
+
+    lane = _stamped_lane(tmp_path, "unit", "a.json", "beef" * 10)
+    if reason == "missing-stamp":
+        (tmp_path / ".crapkit" / "artifacts.json").unlink()
+    elif reason == "refused-write":
+        write_stamps(tmp_path, {lane.artifact: {"commit": "beef" * 10,
+                     "refused_mtime_ns": (tmp_path / lane.artifact).stat().st_mtime_ns}})
+    elif reason == "lost-history":
+        monkeypatch.setattr(gitio, "is_ancestor", lambda *_args: False)
+    else:
+        def unavailable(*_args):
+            raise GitError("git unavailable")
+        monkeypatch.setattr(gitio, "diff_names_since", unavailable)
+    cfg = SimpleNamespace(lanes=[lane], scope_paths={"src": ("src",)})
+
+    assert lane_states(tmp_path, cfg, GitFacts(tmp_path))[0][1]
+
+
+@pytest.mark.parametrize("changed, stale", [("src/a.py", True), ("src/b.py", False)])
+def test_line_display_obeys_an_exact_file_scope(tmp_path, counted, monkeypatch, changed, stale):
+    from types import SimpleNamespace
+    from crapkit.uncovered import lane_states
+
+    lane = _stamped_lane(tmp_path, "unit", "a.json", "beef" * 10)
+    cfg = SimpleNamespace(lanes=[lane], scope_paths={"src": ("src/a.py",)})
+    monkeypatch.setattr(gitio, "status_names", lambda *_args: [changed])
+
+    assert bool(lane_states(tmp_path, cfg, GitFacts(tmp_path))[0][1]) is stale
 
 
 def test_ancestry_is_cached_per_commit_not_globally(tmp_path, counted):
@@ -120,13 +157,6 @@ def test_ancestry_against_a_named_commit_is_a_different_question(tmp_path, count
     facts.is_ancestor("aaa", "fork")
 
     assert counted["ancestor"] == 2
-
-
-def test_a_lane_without_a_context_still_answers_on_its_own(tmp_path, counted):
-    """Direct callers (and the tests above) must not have to build one."""
-    lane = _stamped_lane(tmp_path, "unit", "a.json", "beef" * 10)
-    assert lane_unchanged(tmp_path, lane, SCOPE_PATHS) is True
-    assert counted["status"] == 1
 
 
 def test_four_lanes_asking_at_the_same_instant_still_spawn_git_once(tmp_path, monkeypatch):

@@ -16,7 +16,9 @@ from pathlib import Path
 import pytest
 
 from crapkit import gitio
-from crapkit.cli import build_parser, cmd_hook_precommit, verifying
+from crapkit.cli.parser import build_parser
+from crapkit.cli.verifying import cmd_hook_precommit
+from crapkit.cli import verifying
 from crapkit.errors import GitError
 
 from conftest import run_cli
@@ -61,9 +63,9 @@ def test_the_staged_reads_start_before_the_analysis_import(staged, monkeypatch, 
     order: list[str] = []
     real_reads, real_tools = gitio.staged_reads, verifying._analysis_tools
 
-    def traced_reads(root):
+    def traced_reads(root, base=None):
         order.append("git")
-        return real_reads(root)
+        return real_reads(root, base)
 
     def traced_tools():
         order.append("analysis")
@@ -99,7 +101,16 @@ def test_a_failing_git_read_still_reaches_the_caller_as_a_git_error(tmp_path, ca
         cmd_hook_precommit(hook_args(loose))
 
     assert exc.value.exit_code == 4
-    assert "git diff --cached" in str(exc.value)
+    assert "diff --cached" in str(exc.value)
+    assert f"failed in {loose}" in str(exc.value)
+    assert "gate:" not in capsys.readouterr().out
+
+    res = run_cli(loose, "hook-precommit")
+
+    assert res.returncode == 4, res.stdout + res.stderr
+    assert "diff --cached" in res.stderr
+    assert f"failed in {loose}" in res.stderr
+    assert "gate:" not in res.stdout
 
 
 def test_a_missing_lizard_still_exits_five_with_the_same_sentence(staged):

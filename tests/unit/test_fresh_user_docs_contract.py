@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from crapkit.config import Config, Scope
 from crapkit.cli import queue
 from crapkit.errors import CrapkitError
 from crapkit.invocation import _self
@@ -127,7 +128,7 @@ def _live_item() -> dict:
                     22, 4, 8, 0.5, "measured", 38.5, "decompose", 13)
     # a path the artifacts spoke about, so the payload carries lines and no note
     return queue._next_item_payload(row, admission({}, 5),
-                                    SimpleNamespace(target=6, scope_targets={}),
+                                    Config(target=6),
                                     MissingLines({"calc/grade.py": {9, 11}}, ""),
                                     handle="classify")
 
@@ -263,7 +264,14 @@ def test_the_readme_links_out_by_url_so_pypi_renders_them():
 
     relative = [t for t in targets if not re.match(r"https?://|#|mailto:", t)]
     assert relative == [], f"README links that go nowhere on PyPI: {relative}"
-    assert "https://jeanfrancoisgagne.github.io/crapkit/handbook.html" in targets
+    assert "https://www.jfgagne.com/crapkit/handbook.html" in targets
+
+
+def test_the_docs_landing_page_names_the_host_that_serves_it_as_canonical():
+    """A search engine indexes the canonical URL, and the github.io address only
+    redirects since the site moved."""
+    page = Path("docs/index.html").read_text(encoding="utf-8")
+    assert '<link rel="canonical" href="https://www.jfgagne.com/crapkit/handbook.html">' in page
 
 
 def _packet_keys(monkeypatch) -> set[str]:
@@ -274,12 +282,10 @@ def _packet_keys(monkeypatch) -> set[str]:
 
     row = ScoredRow("core", "core/alpha.py", "alpha( a )", 1, 20, 8, 8, 8, 18, 1, 2,
                     0.5, "untested", 64.0, "decompose", 7)
-    cfg = SimpleNamespace(churn_window_months=12, worklist_floor=1, target=6,
-                          scope_targets={"core": 6},
-                          scopes=(SimpleNamespace(name="core", paths=("core",),
-                                                  languages=("python",)),),
-                          scope_paths={"core": ("core",)}, lanes=(), scoped_tests=(),
-                          diff_uncovered_max=None, ratchet_file="crapkit-ratchet.tsv")
+    cfg = Config(churn_window_months=12, worklist_floor=1, target=6,
+                 scopes=(Scope(name="core", paths=("core",), languages=("python",)),),
+                 lanes=(), scoped_tests=(), diff_uncovered_max=None,
+                 ratchet_file="crapkit-ratchet.tsv")
     for name, answer in (("_load_sources", {"core/alpha.py": "x\n"}), ("load_churn", {}),
                          ("load_uncovered", MissingLines({}, "no lane")),
                          ("head_commit", "abc123def4567"), ("ls_files", []),

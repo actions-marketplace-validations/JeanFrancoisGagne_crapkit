@@ -14,7 +14,7 @@ session works in does not hold those pages.
 
 | Moment | What answers it |
 |---|---|
-| Before opening the file | `crapkit brief PATH NAME --json`, or the MCP `brief` tool where the server is registered |
+| Before opening the file | `crapkit brief PATH NAME --json`, or the MCP `get_function_brief` tool where the server is registered |
 | Which house rules bind here | `notes.repo` and `notes.scope` in the packet |
 | An advisory fired on the edit you just made | Decompose that function now, not at the commit wall. The edit landed and nothing was blocked, but the gate refuses the same function later |
 | An advisory fired after a Bash command, not an edit | The same verdict, read off the working tree. See [After a shell write](#after-a-shell-write) |
@@ -30,8 +30,8 @@ session works in does not hold those pages.
 | Boy-scout scan of the file | `file_functions` and `file_totals` in the packet |
 | A lane command crapkit refuses on Windows | Write the value in double quotes. cmd.exe does not treat `'` as a quote, so a single-quoted value reaches the runner one word per space and the guard reads a positional |
 | `crapkit doctor` WARNs that a lane declares no `results_artifact` | Coverage is measured either way. Two checks go dark for that lane's scopes until it names a junit file: the crashed-worker trust check, and exit 8, the no-new-failures check |
-| `trend` or `report` writing in a checkout you meant to keep read-only | Both fill a per-run rollup in the store, once per run, best effort. It is a cache: no run, baseline, ratchet or mutant moves. `commands.refresh_writes_run` still marks the one command that lands a run |
-| `mutate` left worktrees behind | `crapkit mutate --drop-pool` removes `.crapkit/mutate-pool/`, the worktrees `mutation_workers > 1` keeps between runs. Every run still re-prepares them, `git checkout --force` on HEAD then `git clean -xdff`; what keeping them saves is the build, 30.6 s down to 0.46 s on a 31,459-file repo |
+| `trend` or `report` writing in a checkout you meant to keep read-only | Both fill a per-run rollup cache in the store. `commands.refresh_writes_run` marks a new coverage run; it does not promise that the other packet commands leave the filesystem unchanged |
+| `mutate` left worktrees behind | Every worker uses a kept worktree, including the default of one. `crapkit mutate --drop-pool` reclaims them. See [mutation worktrees](https://github.com/JeanFrancoisGagne/crapkit/blob/main/docs/configuration.md#mutation-worktrees) for preparation, concurrent runs and cleanup |
 
 Field semantics live in [docs: the brief payload](https://github.com/JeanFrancoisGagne/crapkit/blob/main/docs/agent-json.md#brief);
 the five-step loop lives in [AGENTS: the packet](https://github.com/JeanFrancoisGagne/crapkit/blob/main/AGENTS.md#1-the-packet).
@@ -60,7 +60,7 @@ Read `stale` and `uncovered_lines_note` first. `stale: true` means the run preda
 run `commands.refresh` before anything else. `uncovered_lines: null` means no artifact named
 lines for this file, and `flag` says which case you are in:
 
-- `untested`: write the first test at the public seam, then `crapkit coverage`. The lines appear.
+- `untested`: write the first test at the public seam, then `crapkit coverage`. The lines appear. The exception is `remedy: split-lines`: another function shares the source lines, so no test moves the score. Put each definition on its own lines first.
 - `measured`: the artifact no longer matches the tree. Commit or revert the edits, then `crapkit coverage`.
 - `cc-only`: the scope sets `coverage_optional`, so only decompose clears it. Most languages land here, because only Python and JS/TS have coverage parsers.
 - `[]`: the artifact answered and nothing is dark.

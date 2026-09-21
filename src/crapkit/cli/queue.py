@@ -14,12 +14,14 @@ from ..churn_cache import load_churn
 from ..errors import ConfigError, CrapkitError
 from ..gitio import head_commit, ls_files
 from ..invocation import _self
-from ..keys import key_names, key_of, split_ordinal
+from ..keys import claim_key, key_names, key_of, lookup, position, require_unambiguous, split_ordinal
 from ..store import SnapshotStore
 from ..uncovered import load_uncovered
-from ..worklist import admission, build_worklist, sql_floor
-from ._shared import (_latest_scored, _load_repo_config, _load_sources, _open_store,
-                      _positive_top, _print_json, _ratchet_entries)
+from ..worklist import (NO_RATCHET, Marks, RatchetMarks, Worklist, admission, build_worklist,
+                        sql_floor)
+from ._shared import (_command_root, _latest_scored, _load_repo_config, _load_sources,
+                      _open_store, _positive_top, _print_json, _ratchet_entries,
+                      _repo_relative, _scope_names, _stand)
 
 
 def _scored_store(root: Path) -> tuple[SnapshotStore, dict]:
@@ -46,21 +48,22 @@ def _pushdown_floor(cfg) -> int:
 
 def cmd_next_item(args: argparse.Namespace) -> int:
     _positive_top("next-item", args.top)
-    root = Path(args.repo).resolve()
+    root = _command_root(args.repo)
     cfg = _load_repo_config(root)
+    scopes = _scope_names(cfg, args.scope)
     store, latest = _scored_store(root)
-    scopes = args.scope or []
     scored = store.read_scored(latest["id"], min_ccn=_pushdown_floor(cfg), scopes=scopes)
     adm = admission(load_churn(root, cfg.churn_window_months), cfg.worklist_floor)
     ranked, skipped_no_lane = _next_ranked(scored, adm)
     excludes = args.exclude or []
     ranked = [r for r in ranked if not _excluded_item(r, excludes)]
-    ranked, skipped_claimed = _unclaimed(store, ranked)
+    handles = _Handles(store, latest["id"])
+    ranked, skipped_claimed = _unclaimed(store, ranked, handles)
     # one HEAD read for both the staleness verdict and the claims this call takes
     commit = head_commit(root)
-    head = _next_head(latest, skipped_no_lane, skipped_claimed, latest["commit"] != commit)
-    handles = _Handles(store, latest["id"])
-    _maybe_claim(store, commit, args.claim, _claimable(ranked, args.top), handles)
+    ranked, conflicts = _maybe_claim(commit, args.claim, ranked, handles, args.top)
+    head = _next_head(latest, skipped_no_lane, skipped_claimed + conflicts,
+                      latest["commit"] != commit)
     _emit_next(store, head, ranked, args.top, adm, cfg, scored, excludes, scopes,
                load_uncovered(root, cfg), handles)
     return 0
@@ -79,23 +82,46 @@ class _Handles:
         self._store = store
         self._run_id = run_id
         self._by_path: dict[str, dict] = {}
+        self._keys: dict[str, dict] = {}
 
     def of(self, row) -> str:
         if row.path not in self._by_path:
-            self._by_path[row.path] = packet.handles(
-                self._store.read_scored_file(self._run_id, row.path))
-        return self._by_path[row.path][row.start]
+            rows = self._store.read_positions(self._run_id, row.path)
+            self._by_path[row.path] = packet.handles(rows)
+            self._keys[row.path] = key_names(rows)
+        return self._by_path[row.path][lookup(row)]
+
+    def key(self, row) -> tuple[str, str]:
+        self.of(row)
+        return key_of(self._keys[row.path], row)
+
+    def claim(self, row, commit: str) -> int | None:
+        return self._store.record_claim(path=row.path, long_name=row.long_name,
+            commit=commit, handle=self.of(row), key_name=self.key(row)[1],
+            source_run_id=self._run_id)
 
 
-def _unclaimed(store, ranked: list) -> tuple[list, int]:
+def _unclaimed(store, ranked: list, handles) -> tuple[list, int]:
     """The rows no session is holding, and how many an open claim hid.
 
     Filtering happens whether or not this session claims anything: a claim is
     worthless if only the session that took it honours it.
     """
-    held = {(c["path"], c["long_name"]) for c in store.open_claims()}
-    free = [r for r in ranked if (r.path, r.long_name) not in held]
+    held, legacy = {}, set()
+    for claim in store.open_claims():
+        key = claim_key(claim)
+        if key is None:
+            legacy.add((claim["path"], claim["long_name"]))
+        else:
+            held.setdefault((claim["path"], claim["long_name"]), set()).add(key)
+    free = [r for r in ranked if _claim_available(r, held, legacy, handles)]
     return free, len(ranked) - len(free)
+
+
+def _claim_available(row, held: dict, legacy: set, handles) -> bool:
+    pair = row.path, row.long_name
+    precise = held.get(pair)
+    return pair not in legacy and (not precise or handles.key(row) not in precise)
 
 
 def _next_head(latest: dict, skipped_no_lane: int, skipped_claimed: int,
@@ -116,10 +142,11 @@ def _next_head(latest: dict, skipped_no_lane: int, skipped_claimed: int,
 def _claimable(ranked: list, top: int) -> list:
     """What this call is about to hand out. Nothing at all once the queue is
     finished, so an exploratory --claim on it cannot hide tomorrow's top item."""
-    return ranked[:top] if _actionable(ranked) else []
+    return _actionable(ranked)[:top]
 
 
-def _maybe_claim(store, commit: str, take: bool, items: list, handles=None) -> None:
+def _maybe_claim(commit: str, take: bool, items: list, handles,
+                  top: int) -> tuple[list, int]:
     """Record a claim per item this invocation is about to hand out.
 
     HEAD, not the snapshot's commit: the claim describes the tree the session
@@ -129,10 +156,18 @@ def _maybe_claim(store, commit: str, take: bool, items: list, handles=None) -> N
     an anonymous function's long_name names every anonymous function in its file.
     """
     if not take:
-        return
-    for r in items:
-        store.record_claim(path=r.path, long_name=r.long_name, commit=commit,
-                           handle=None if handles is None else handles.of(r))
+        return items, 0
+    candidates = _actionable(items)
+    selected, conflicts = [], 0
+    for row in candidates:
+        if len(selected) == top:
+            break
+        taken = handles.claim(row, commit)
+        if taken is None:
+            conflicts += 1
+        else:
+            selected.append(row)
+    return (selected, conflicts) if candidates else (items, 0)
 
 
 def _actionable(ranked: list) -> list:
@@ -164,11 +199,12 @@ def _emit_next(store, head: dict, ranked, top: int, adm, cfg, scored,
     elif top > 1:
         head.update(empty=False,
                     items=[_next_item_payload(r, adm, cfg, uncovered, _handle(handles, r))
-                           for r in ranked[:top]])
+                           for r in _claimable(ranked, top)])
     else:
+        first = _claimable(ranked, 1)[0]
         head.update(empty=False,
-                    item=_next_item_payload(ranked[0], adm, cfg, uncovered,
-                                            _handle(handles, ranked[0])))
+                    item=_next_item_payload(first, adm, cfg, uncovered,
+                                            _handle(handles, first)))
     _print_json(head)
 
 
@@ -272,7 +308,7 @@ def _uncovered_fields(uncovered, row) -> dict:
 
 def _next_item_payload(top, adm, cfg, uncovered, handle: str | None = None) -> dict:
     c = adm.of(top.path)
-    ceiling = cfg.scope_targets.get(top.scope, cfg.target)
+    ceiling = cfg.ceiling_of(top.scope)
     return {
         "scope": top.scope, "path": top.path, "function": top.long_name,
         # the name form that survives the session's own edit: a start line moves,
@@ -298,7 +334,9 @@ def _claims_summary(claims: list) -> str:
 
 def _print_claims(as_json: bool, claims: list) -> None:
     if as_json:
-        _print_json({"claims": claims, "open": len(claims)})
+        public = [{key: value for key, value in claim.items() if key not in ("key_name", "key_version")}
+                  for claim in claims]
+        _print_json({"claims": public, "open": len(claims)})
         return
     print(f"{len(claims)} open claim(s)")
     for c in claims:
@@ -320,7 +358,14 @@ def _claim_matches(c: dict, name: str) -> bool:
     anonymous function in the file also answers to, so a release by long_name
     would close whichever claim sorts first.
     """
-    return _name_matches(c["long_name"], name) or c.get("handle") == name
+    if c.get("handle") == name:
+        return True
+    wanted, ordinal = split_ordinal(name)
+    if wanted != name and wanted == c["long_name"]:
+        from ..keys import key_name
+
+        return claim_key(c) == (c["path"], key_name(wanted, ordinal))
+    return _name_matches(c["long_name"], name)
 
 
 def _named_claims(claims: list, path: str, name: str) -> list:
@@ -331,10 +376,12 @@ def _named_claims(claims: list, path: str, name: str) -> list:
     return held
 
 
-def _claims_to_release(claims: list, release_all: bool, target: list) -> list:
+def _claims_to_release(claims: list, release_all: bool, target: list,
+                       root: Path = Path("."), cwd: Path | None = None) -> list:
     if release_all:
         return claims
-    return _named_claims(claims, *_release_target(target))
+    path, name = _release_target(target)
+    return _named_claims(claims, _repo_relative(path, root, cwd), name)
 
 
 def _print_released(as_json: bool, closed: int) -> None:
@@ -351,12 +398,13 @@ def cmd_claims(args: argparse.Namespace) -> int:
     verify happens to score that function at its ceiling — which, for the worst
     function in the repo, is the whole job.
     """
-    store = _open_store(Path(args.repo).resolve())
+    root = _command_root(args.repo)
+    store = _open_store(root)
     claims = store.open_claims()
     if args.action != "release":
         _print_claims(args.json, claims)
         return 0
-    to_close = _claims_to_release(claims, args.all, args.target)
+    to_close = _claims_to_release(claims, args.all, args.target, root, _stand(args.repo))
     _print_released(args.json, store.close_claims([c["id"] for c in to_close]))
     return 0
 
@@ -401,17 +449,20 @@ def _no_match_message(path: str, name: str, rows: list, candidates: list) -> str
 
 
 def _row_at_line(path: str, rows: list, name: str):
-    """The row opening on this line, when NAME is a bare start line.
-
-    An `(anonymous)` function has no name to pass back and a file can hold two
-    functions sharing one, so the line a row opens on is the disambiguator that
-    always exists: no two functions in a file start on the same line.
-    """
+    """A numeric selector resolves only when one function opens on that line."""
     if not name.isdigit():
         return None
     at = [r for r in rows if r.start == int(name)]
     if not at:
         raise CrapkitError(_no_line_message(path, name, rows))
+    return _single_line_row(path, name, rows, at)
+
+
+def _single_line_row(path: str, name: str, rows: list, at: list):
+    if len({lookup(row) for row in at}) > 1:
+        handles = packet.handles(rows)
+        choices = ", ".join(sorted({handles[lookup(row)] for row in at}))
+        raise CrapkitError(f"line {name} in {path} is ambiguous; use a handle: {choices}")
     return at[0]
 
 
@@ -433,10 +484,11 @@ def _row_by_handle(path: str, rows: list, name: str):
     ordinal = packet.handle_ordinal(name)
     if ordinal is None:
         return None
-    starts = packet.anonymous_starts(rows)
-    if not 1 <= ordinal <= len(starts):
+    handles = packet.handles(rows)
+    matched = [row for row in rows if handles[lookup(row)] == name]
+    if not matched:
         raise CrapkitError(_no_handle_message(path, name, rows))
-    return next(r for r in rows if r.start == starts[ordinal - 1])
+    return max(matched, key=lambda row: row.crap)
 
 
 def _no_handle_message(path: str, name: str, rows: list) -> str:
@@ -447,6 +499,7 @@ def _no_handle_message(path: str, name: str, rows: list) -> str:
 
 def _pick_function(path: str, rows: list, name: str):
     """The one row `name` names, or an error listing what the file does hold."""
+    require_unambiguous(rows)
     at_line = _row_at_line(path, rows, name)
     if at_line is not None:
         return at_line
@@ -473,8 +526,9 @@ def _one_of(path: str, matched: list, name: str, wanted: str, ordinal: int):
     a bare name does not pick.
     """
     if wanted == name:
-        return max(matched, key=lambda r: (r.crap, -r.start))
-    ordered = sorted(matched, key=lambda r: r.start)
+        return max(matched, key=lambda r: (r.crap, -r.start, -position(r)[1]))
+    spans = {position(r): r for r in sorted(matched, key=lambda r: r.crap)}
+    ordered = [spans[start] for start in sorted(spans)]
     if ordinal > len(ordered):
         raise CrapkitError(_no_twin_message(path, name, wanted, len(ordered)))
     return ordered[ordinal - 1]
@@ -603,7 +657,8 @@ class _BriefLoader:
 
     def mark(self, row) -> float | None:
         return _brief_mark(self._once("marks",
-                                      lambda: _ratchet_entries(self.root, self.cfg)),
+                                      lambda: _ratchet_entries(self.root, self.cfg,
+                                                               self.rows, self.store)),
                            self.key(row))
 
     def mark_age(self, row, mark: float | None) -> int | None:
@@ -621,7 +676,7 @@ class _BriefLoader:
         return mark_events(file_log_patches(self.root, self.cfg.ratchet_file))
 
     def attempts(self, row) -> list:
-        key = (row.path, row.long_name)
+        key = self.key(row)
         if key not in self._attempts:
             self._attempts.update(self.store.attempts_for([key]))
         return self._attempts[key]
@@ -629,7 +684,7 @@ class _BriefLoader:
     def prime_attempts(self, rows: list) -> None:
         """One query for a whole batch's claims, before the packets ask one by one."""
         self._attempts.update(
-            self.store.attempts_for([(r.path, r.long_name) for r in rows]))
+            self.store.attempts_for([self.key(r) for r in rows]))
 
 
 def _brief_versions() -> dict:
@@ -642,7 +697,7 @@ def _brief_versions() -> dict:
 
 
 def _row_ceiling(cfg, row) -> int:
-    return cfg.scope_targets.get(row.scope, cfg.target)
+    return cfg.ceiling_of(row.scope)
 
 
 def _packet_scope(cfg, row) -> str:
@@ -673,10 +728,7 @@ def _packet_gate(loader, row) -> dict:
 
 
 def _packet_commands(cfg, row, scope: str) -> dict:
-    from .verifying import _scoped_command
-
-    template = dict(cfg.scoped_tests).get(scope)
-    scoped = _scoped_command(template, [row.path]) if template else None
+    scoped = bool(dict(cfg.scoped_tests).get(scope))
     return packet.commands(row.path, scoped,
                            f"no [crapkit.scoped_tests] template for scope {scope!r}")
 
@@ -697,7 +749,7 @@ def _packet_context(loader, row, rows: list) -> dict:
         "versions": loader.versions(),
         "commands": _packet_commands(cfg, row, scope),
         "attempts": loader.attempts(row),
-        "regrowth": packet.regrowth(loader.store.function_history(row.path, row.long_name)),
+        "regrowth": packet.regrowth(loader.store.function_history(*loader.key(row))),
         "params": packet.params(row.long_name),
         "notes": packet.notes(cfg, _scope_config(cfg, scope)),
     }
@@ -719,7 +771,7 @@ def _brief_packet(loader, row) -> dict:
     return {
         "run_id": loader.latest["id"], "commit": loader.latest["commit"],
         "path": row.path, "function": row.long_name,
-        "handle": packet.handles(rows)[row.start],
+        "handle": packet.handles(rows)[lookup(row)],
         "scored": dict(row._asdict()),
         "target": ceiling,
         "remedy": row.remedy,
@@ -769,7 +821,7 @@ def _print_brief_context(out: dict) -> None:
     totals = out["file_totals"]
     lane = out["lane"]
     print(f"  file: {totals['functions']} function(s), {totals['over_target']} over "
-          f"target, crap load {totals['crap_load']}")
+          f"ceiling, crap load {totals['crap_load']}")
     print(f"  gate ceiling {out['gate_rule']['ceiling']}  "
           f"lane {lane['name'] if lane else 'none'}  ->  {out['commands']['gate']}")
 
@@ -781,7 +833,7 @@ def _print_brief(as_json: bool, out: dict) -> None:
     s = out["scored"]
     print(f"{out['path']}:{s['start']}  {out['function']}")
     print(f"  ccn {s['ccn']} (cognitive {s['cognitive']})  cov {s['cov']:.0%}  "
-          f"crap {s['crap']:.1f} vs target {out['target']}  -> {s['remedy']}")
+          f"crap {s['crap']:.1f} vs ceiling {out['target']}  -> {s['remedy']}")
     print(f"  mark {_mark_text(out['ratchet_mark'])}  churn {_churn_text(out['churn'])}")
     print(f"  uncovered lines: {_brief_lines_text(out)}")
     _print_brief_neighbours(out)
@@ -826,7 +878,7 @@ def _brief_target(args: argparse.Namespace) -> tuple[str, str]:
 
 def cmd_brief(args: argparse.Namespace) -> int:
     """One call for everything a burn-down session opens a file already knowing."""
-    root = Path(args.repo).resolve()
+    root = _command_root(args.repo)
     cfg = _load_repo_config(root)
     store, latest = _scored_store(root)
     loader = _BriefLoader(root, cfg, store, latest)
@@ -834,6 +886,7 @@ def cmd_brief(args: argparse.Namespace) -> int:
         _print_json(_brief_batch(loader, _resolve_batch(args.batch)))
         return 0
     path, name = _brief_target(args)
+    path = _repo_relative(path, root, _stand(args.repo))  # said from where the user stands
     row = _pick_function(path, loader.scored_file(path), name)
     _print_brief(args.json, _brief_packet(loader, row))
     return 0
@@ -855,11 +908,14 @@ def _stale_warning(stale: bool, as_json: bool, latest: dict) -> None:
 def _entry_json(e) -> dict:
     """One ranked row. `flag` and `remedy` are the run's verdict on it, so a
     caller can tell a wiring gap and a finished row from real work without a
-    second call; both are null on an inventory-only run."""
+    second call; `crap` and `cov` are the numbers behind that verdict. All four
+    are null on an inventory-only run."""
     return {"scope": e.scope, "path": e.path, "function": e.long_name,
             "start": e.start, "end": e.end, "ccn": e.ccn, "ccn_std": e.ccn_std,
             "nloc": e.nloc, "commits": e.commits, "authors": e.authors,
-            "weight": e.weight, "risk": e.risk, "flag": e.flag, "remedy": e.remedy}
+            "weight": e.weight, "risk": e.risk, "flag": e.flag, "remedy": e.remedy,
+            "crap": e.crap, "cov": e.cov, "ratchet_mark": e.ratchet_mark,
+            "occurrence": e.occurrence, "handle": e.handle}
 
 
 def _row_marker(e) -> str:
@@ -887,6 +943,8 @@ def _worklist_payload(wl, latest: dict, cfg, stale: bool, batches: list | None) 
         "run_id": latest["id"], "commit": latest["commit"], "stale": stale,
         "floor": cfg.worklist_floor, "churn_window_months": cfg.churn_window_months,
         "active": [_entry_json(e) for e in wl.active],
+        # what the cap hid: distinct from the over-ceiling total `trend` carries
+        "active_total": wl.active_total,
         "dormant_count": len(wl.dormant),
         "dormant_top": [_entry_json(e) for e in wl.dormant[:10]],
     }
@@ -895,18 +953,38 @@ def _worklist_payload(wl, latest: dict, cfg, stale: bool, batches: list | None) 
     return payload
 
 
+def _crap_text(crap: float | None) -> str:
+    return "      -" if crap is None else f"{crap:>7.1f}"
+
+
+def _cov_text(cov: float | None) -> str:
+    return "   -" if cov is None else f"{cov:>4.0%}"
+
+
+def _row_text(e) -> str:
+    """One printed row: the rank, the two numbers the score is made of, the
+    churn, the place, the name. `ccn_std` and `weight` stay in the JSON."""
+    return (f"  risk {e.risk:>8.1f}  ccn {e.ccn:>3}  crap {_crap_text(e.crap)}  "
+            f"cov {_cov_text(e.cov)}  {e.commits:>3}c/{e.authors}a  {e.path}:{e.start}  "
+            f"{e.long_name}{_row_marker(e)}")
+
+
+def _cap_label(requested: int | None, top: int) -> str:
+    """The knob that set the cap, so a reader knows which one raises it."""
+    return f"--top {top}" if requested is not None else f"worklist_top {top}"
+
+
 def _worklist_print(as_json: bool, wl, latest: dict, cfg, stale: bool,
-                    batches: list | None) -> None:
+                    batches: list | None, cap: str) -> None:
     _stale_warning(stale, as_json, latest)
     if as_json:
         _print_json(_worklist_payload(wl, latest, cfg, stale, batches))
         return
     print(f"worklist @ {latest['commit'][:11]} (run {latest['id']}, floor ccn>={cfg.worklist_floor}, "
-          f"churn {cfg.churn_window_months}mo) — {len(wl.active)} active, {len(wl.dormant)} dormant")
+          f"churn {cfg.churn_window_months}mo) - {len(wl.active)} of {wl.active_total} active "
+          f"({cap}), {len(wl.dormant)} dormant")
     for e in wl.active:
-        print(f"  risk {e.risk:>8.1f}  ccn {e.ccn:>3} ({e.ccn_std:>3} std)  "
-              f"{e.commits:>3}c/{e.authors}a w{e.weight:>7.2f}  {e.path}:{e.start}  "
-              f"{e.long_name}{_row_marker(e)}")
+        print(_row_text(e))
     _print_batches(batches)
 
 
@@ -938,26 +1016,55 @@ def _worklist_run(root: Path, store) -> dict:
 
 
 def cmd_worklist(args: argparse.Namespace) -> int:
-    root = Path(args.repo).resolve()
+    root = _command_root(args.repo)
     cfg = _load_repo_config(root)
+    scopes = _scope_names(cfg, args.scope)
     store = _open_store(root, first_command="coverage")
     latest = _worklist_run(root, store)
-    # the same pushdown next-item uses: no rule can admit anything below it, and
-    # anything above it might be over target, so those rows have to be read
-    scopes = args.scope or []
-    rows = store.read_rows(latest["id"], min_ccn=_pushdown_floor(cfg), scopes=scopes)
-    churn = load_churn(root, cfg.churn_window_months)
-    wl = build_worklist(rows, churn, floor=cfg.worklist_floor,
-                        top=_resolve_top(args.top, cfg),
-                        marks=_worklist_marks(store, cfg, latest["id"], scopes))
+    top = _resolve_top(args.top, cfg)
+    wl = _worklist_for(root, cfg, store, latest, top=top, scopes=scopes)
     batches = _worklist_batches(root, cfg, wl.active, args.batches)
-    _worklist_print(args.json, wl, latest, cfg, latest["commit"] != head_commit(root), batches)
+    _worklist_print(args.json, wl, latest, cfg, latest["commit"] != head_commit(root), batches,
+                    _cap_label(args.top, top))
     return 0
 
 
-def _worklist_marks(store, cfg, run_id: int, scopes: list) -> dict:
-    """The run's verdict per function: what the floor may not hide, and what
-    each ranked row is.
+def _worklist_for(root: Path, cfg, store, latest: dict, *, top: int, scopes: list) -> Worklist:
+    """The ranked queue off one run, shaped once for the command and the report:
+    the rows, the churn window, the run's verdicts and the committed marks."""
+    run_id = latest["id"]
+    # the same pushdown next-item uses: no rule can admit anything below it, and
+    # anything above it might be over target, so those rows have to be read
+    rows = store.read_rows(run_id, min_ccn=_pushdown_floor(cfg), scopes=scopes)
+    wl = build_worklist(rows, load_churn(root, cfg.churn_window_months),
+                        floor=cfg.worklist_floor, top=top,
+                        marks=_worklist_marks(store, cfg, run_id, scopes),
+                        ratchet=_worklist_ratchet(root, cfg, store, run_id))
+    return _worklist_handles(wl, _Handles(store, run_id))
+
+
+def _worklist_handles(wl: Worklist, handles: _Handles) -> Worklist:
+    """Resolve printed entries against their whole file, including hidden rows."""
+    active = [e._replace(handle=handles.of(e)) for e in wl.active]
+    dormant = [e._replace(handle=handles.of(e)) for e in wl.dormant[:10]]
+    return wl._replace(active=active, dormant=dormant + wl.dormant[10:])
+
+
+def _worklist_ratchet(root: Path, cfg, store, run_id: int) -> RatchetMarks:
+    """The committed marks keyed for the run's rows, or nothing when the repo
+    carries no marks file. The first mark under a key wins, as `mark_for`."""
+    entries = _ratchet_entries(root, cfg, lambda: store.read_rows(run_id), store)
+    if not entries:
+        return NO_RATCHET
+    marks: dict = {}
+    for e in entries:
+        marks.setdefault((e.path, e.long_name), e.crap)
+    return RatchetMarks(marks, store.twin_key_names(run_id))
+
+
+def _worklist_marks(store, cfg, run_id: int, scopes: list) -> Marks:
+    """The run's verdict per function and score per row: what the floor may
+    not hide, what each ranked row is, and the number it prints.
 
     Empty on an inventory-only run, which scored no remedy: a run with no
     verdict has no debt to protect from the floor and nothing to say about a

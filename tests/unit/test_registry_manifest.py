@@ -57,3 +57,23 @@ def test_the_description_reads_as_one_plain_sentence():
 
     assert description.strip() == description and len(description) <= 100, "the registry refuses over 100 chars"
     assert re.match(r"^[A-Z]", description) and description.endswith(".")
+
+
+def test_the_description_counts_the_published_tools():
+    from crapkit.mcp_server import TOOLS
+
+    description = _manifest()["description"]
+
+    assert len(TOOLS) == 12
+    assert description.startswith("Twelve tools to inspect CRAP scores"), description
+    assert "check edited functions against their ceiling" in description
+
+
+def test_the_manifest_names_its_repository_so_aggregators_can_link_back():
+    """The registry copies `repository` and `websiteUrl` into every listing that
+    reads it. Without them the 0.4.15 and 0.5.0 entries rendered as 'No repository
+    recorded, License Unknown' on the aggregators that mirror the registry."""
+    manifest = json.loads(Path("server.json").read_text(encoding="utf-8"))
+
+    assert manifest["repository"] == {"url": "https://github.com/JeanFrancoisGagne/crapkit", "source": "github"}
+    assert manifest["websiteUrl"] == "https://www.jfgagne.com/crapkit/"

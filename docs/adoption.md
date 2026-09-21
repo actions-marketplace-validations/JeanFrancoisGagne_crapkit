@@ -1,19 +1,19 @@
 # Adoption
 
-The quickstarts in [README.md](../README.md) carry the mechanics: sniff the repo, check the
-config, score it, seed the ratchet, install the gate. This page carries the decisions they do
-not make for you, in the order you hit them. Read it before you run `crapkit init` in a repo
-you care about.
+Use this page to choose scopes, connect tests and seed existing debt. The
+[Python](../README.md#quickstart-python) and
+[TypeScript](../README.md#quickstart-typescript) quickstarts show the commands in
+order. Existing installations should start with [Upgrading](upgrading.md).
 
 ## Cut fewer, broader scopes first
 
 A scope is a ceiling plus a language set, not a package. One scope per language per
 top-level tree is the right opening move, even in a repo with twenty packages.
 
-Every scope you add owes a lane or a `coverage_optional`, because a lane-less scope is a
-`doctor` FAIL. It also wants a `scoped_tests` template of its own. Ten scopes on day one is
-ten lanes and ten templates before the first score lands, and the usual outcome is a config
-that half exists.
+Every scope needs a lane or `coverage_optional = true`; otherwise `doctor` fails.
+One lane can measure several scopes, so ten scopes do not require ten commands.
+Each measured scope also needs a `scoped_tests` template for the edit loop. Start
+with the scope boundaries your coverage commands and test routing can support.
 
 Splitting later is cheap. Ratchet marks are keyed by path and function name with no scope
 in the key, so re-cutting scopes leaves every recorded mark exactly where it was. Start
@@ -22,10 +22,7 @@ command for part of it.
 
 When you do split, a nested scope wins over the scope that contains it. Declare `src` and
 then `src/web`, and every file under `src/web` belongs to `src/web`: for scoring, for lane
-reuse, for `test-scoped` routing, and for the ceiling `crapkit brief` hands an agent. Since
-0.4.5 that is one rule with one answer. 0.4.4 answered it three ways, so a repo that already
-nests scopes may see files change scope on its next scan, and the per-scope rollups and
-ceilings move with them. A config whose scopes do not nest sees no change.
+reuse, for `test-scoped` routing, and for the ceiling `crapkit brief` hands an agent.
 
 ## Exclude, lane, or coverage_optional
 
@@ -64,9 +61,17 @@ goes to zero for you and the next session sees the rows again.
 ## `scoped_tests` belongs between doctor and coverage
 
 The quickstarts run `crapkit init`, then `crapkit doctor`, then `crapkit coverage`. Fill in
-the `[crapkit.scoped_tests]` table between the last two. `init` already wrote a line per
-scope, live where a detected lane proves the runner and commented everywhere else, so
-uncommenting is usually the whole job.
+the `[crapkit.scoped_tests]` table between the last two. `init` already wrote an entry per
+scope, each under one comment line naming the form it chose: `{files}` where the scope's
+own paths hold a test file, the whole-suite form where they do not (naming the repo's test
+directory unless pytest's `testpaths` already collects it), a workspace's own
+`npm run test -w <dir>`, or the runner's related-tests mode. Live where the repo's own
+files prove the command and commented everywhere else, so uncommenting is usually the
+whole job. `doctor` then repeats `init`'s lane probe: it names the interpreter and the
+pytest and pytest-cov versions each coverage.py lane resolves to, fails a lane whose python
+cannot import pytest-cov, prints a `note` for a lane an environment manager heads (`uv run
+python -m pytest`), which it does not probe, and fails a `{files}` template on a scope
+holding no test file.
 
 Every python line it wrote names one launcher, the lockfile's where the repo has one:
 `uv run python -m pytest ...` on a `uv.lock` repo, in the lane command, in the entries
@@ -81,11 +86,13 @@ exist for any agent that ever works this repo.
 
 ## The two-templated-scopes trap
 
-Uncommenting every template is what springs it. A test file that lives outside every scope's
-`paths` routes to the single scope that declares a template. With two templated scopes there
-is no single owner, and `crapkit test-scoped tests/test_stats.py` exits 3. Naming a source
-file instead routes fine and then hands the runner a source path to collect tests from: no
-tests ran, runner exit 5, crapkit exit 1.
+A `{files}` template on a scope whose tests live outside its `paths` is what springs it.
+`init` no longer writes one there and `doctor` fails one it finds, but a hand-written
+config can still carry it. A test file that lives outside every scope's `paths` routes to
+the single scope that declares a template. With two templated scopes there is no single
+owner, and `crapkit test-scoped tests/test_stats.py` exits 3. Naming a source file instead
+routes fine and then hands the runner a source path to collect tests from: no tests ran,
+runner exit 5, crapkit exit 1.
 
 The way out is the whole-suite form. A template with no `{files}` placeholder runs exactly
 as written, so the scope runs its own suite whichever of its files you name:
@@ -105,10 +112,10 @@ the files you named is what you want.
 
 ## The first verify taints the baseline
 
-`crapkit verify` on a repo that has never passed one runs against a tree carrying all its
-pre-existing debt. It fails, and a failed run then blocks every later baseline: each
-subsequent run prints `run N is not the baseline: verify run M FAILED ...` and measures
-against something older.
+An early `crapkit verify` can fail on pre-existing debt that no ratchet marks cover.
+A failed verify then prevents later coverage runs from silently replacing its
+baseline: subsequent runs print `run N is not the baseline: verify run M FAILED ...`
+and compare against an older trusted run when one exists.
 
 Prevent it by seeding first. `crapkit ratchet seed` records today's over-target functions as
 accepted debt, so the first verify judges your edit rather than the repo's history.
@@ -174,13 +181,10 @@ along with the rest of `.crapkit/`. Warm, `coupling` costs 0.11 s instead of 1.0
 `--min-support` or `--min-confidence` off their defaults bypasses the cache every time, so
 keep the fleet on the defaults unless somebody is investigating.
 
-**`mutate` with `mutation_workers > 1` leaves worktrees on disk.** The workers now keep their
-worktrees under `.crapkit/mutate-pool/w0..wN` and re-prepare them per run, which took a run's
-setup from 30.6 s to 0.46 s. What is left behind is one full checkout of the repo per worker,
-and **the pool is not size-bounded**: budget for it on a big tree, and reclaim it with
-`crapkit mutate --drop-pool`. Single-worker runs mutate the working tree as they always did
-and leave nothing. A second `mutate` in the same repo finds the pool locked and falls back to
-a throwaway base, so it is slower rather than wrong.
+**Every mutation worker uses a kept worktree**, including the default of one.
+Budget one checkout per worker and reclaim the pool with `crapkit mutate --drop-pool`.
+See [mutation worktrees](configuration.md#mutation-worktrees) for preparation,
+concurrent runs and cleanup.
 
 **`trend` and `report` write.** Both fill a per-run rollup table on first read, which is what
 takes `trend` from 4.58 s to 0.04 s. A session holding a checkout it must not write to should
@@ -192,10 +196,10 @@ verdict on HEAD plus the dirty file names was measured for 0.4.5 and rejected: t
 cannot see a second edit to a file that was already dirty, and a gate that misses one edit is
 worse than a slow gate.
 
-Upgrading crapkit mid-campaign costs one commit: 0.4.5 measures at analysis version 8 where
-0.4.4 measured at 7, so every existing mark is refused until somebody runs `crapkit ratchet
-seed` and commits the restamped file. Do it once, on one branch, before the fleet fans out
-([ratchet.md](ratchet.md#upgrading-to-045-analysis-version-8)).
+Upgrade before sessions fan out. Measure once, review any function-identity changes,
+and commit the resulting ratchet changes on the shared starting branch. The
+[upgrade guide](upgrading.md) separates metric restamping from identity mapping;
+a blanket seed cannot establish which callback an old mark belongs to.
 
 ## Put repo traps in `notes`
 
@@ -234,13 +238,24 @@ does not cover that entry: it reads the plugin's own `hooks/hooks.json` and noth
 a protocol bump shows up for the shipped matcher and stays silent for the one you wrote.
 Re-check it by hand after a CLI upgrade.
 
-Every other harness takes one of the two surfaces under it. The table is the whole list; no
-adapter beyond it exists yet.
+Codex users can install the three skills and MCP server through its own plugin manager:
+
+```
+codex plugin marketplace add https://github.com/JeanFrancoisGagne/crapkit.git
+codex plugin add crapkit@crapkit
+```
+
+The advisory hook instructions above configure Claude Code's PostToolUse event.
+After a CLI upgrade, follow
+[plugin and MCP client updates](upgrading.md#plugin-and-mcp-clients): refresh the
+marketplace first, update the installed plugin, then check its version and start a
+fresh client session.
 
 | Harness | What it gets |
 |---|---|
 | Claude Code | the plugin: three skills, the MCP server, the advisory hook |
-| any MCP client (Codex, Cursor, Zed, Continue) | `crapkit mcp` as a stdio server: nine read-only tools, no skills, no hook |
+| Codex | the plugin: three skills and the MCP server |
+| other MCP clients (Cursor, Zed, Continue) | `crapkit mcp` as a stdio server: twelve read-side tools, no skills, no hook; calls can write caches and store metadata |
 | anything else | the pre-commit hook and CI, which are git and shell and need no harness at all |
 
 A runtime with a skills directory but no marketplace can copy `plugin/skills/*` into it and

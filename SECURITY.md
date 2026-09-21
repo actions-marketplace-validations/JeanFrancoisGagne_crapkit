@@ -4,10 +4,12 @@
 
 Fixes land on the latest minor only. There are no maintenance branches.
 
+<!-- generated:version-support -->
 | Version | Supported |
-| ------- | --------- |
-| 0.4.x   | Yes       |
-| < 0.4   | No. Upgrade. |
+| --- | --- |
+| 0.7.x | Yes |
+| < 0.7 | No. Upgrade. |
+<!-- /generated:version-support -->
 
 ## Reporting a vulnerability
 
@@ -27,37 +29,54 @@ next patch release and the advisory credits you unless you would rather it did n
 
 ## What crapkit spawns
 
-Five things start a process, and every one of them runs a command from your
-lane configuration, the one `init` detects and writes and you then edit. The shell
-is the one that will run the command: `cmd.exe` on Windows, `sh` everywhere
-else. When a `timeout_seconds` or a probe deadline expires, crapkit kills the
-whole process tree, not just the shell it started (`taskkill /T` on Windows,
-`killpg` on POSIX), so a suite cannot outlive the run that started it.
+Configured commands run through `cmd.exe` on Windows and `sh` on POSIX,
+with the working directory and environment selected by the operation.
+Crapkit also starts Git and internal process owners; the table below describes
+the commands a project config supplies.
 
 | What | When | What it runs |
 | --- | --- | --- |
-| Lane commands | `crapkit coverage` and `crapkit verify` | each `[[lane]] command`, in the repo root |
-| Scoped tests | `crapkit test-scoped` | the `[crapkit.scoped_tests]` line for that scope |
-| Mutation runs | `crapkit mutate` | `mutation_command`, once per mutant |
-| Runner probes | `crapkit doctor` | `<first word of the lane> --version`, once per distinct word |
-| The pytest-cov probe | `crapkit init` | `<the python that runs pytest> -c "import pytest_cov"` |
+| Lane commands | `crapkit coverage` and `crapkit verify` | each lane's `command`, using its configured `cwd` and `env` |
+| Scoped tests | `crapkit test-scoped` | the scope's test command, in the project root with the caller's environment |
+| Mutation runs | `crapkit mutate` | `mutation_command` for the baseline and each mutant, in an isolated worktree |
+| Runner probes | `crapkit doctor` | version probes for the executables named by lane commands |
+| The pytest-cov probe | `crapkit init` | an import check in the interpreter selected for the pytest lane |
 
-`crapkit override` runs a sixth, `alert_command`, and it is the only one that
-gets data from your source: the override line reaches it on stdin, never
-interpolated into the shell string, because function names are not shell-safe.
+Lane, mutation and probe commands own their descendants through
+Windows Jobs or POSIX process groups. Command completion, timeout, interruption
+and caller death stop the owned processes before releasing their resources.
+Untimed commands have no deadline. On POSIX, commands must keep their inherited
+process group; a daemon that explicitly calls `setsid` leaves this ownership.
+This is process cleanup, not a sandbox for hostile commands.
 
-`mutate` writes mutated source. With one worker, the default, it writes into
-your working tree and puts the original file back when the mutant finishes.
-With `mutation_workers = N` it writes into the pool worktrees below instead. A
-second `mutate` in the same repo finds the pool lock held and falls back to
-throwaway worktrees under the system temp directory.
+Scoped tests have no configured timeout. They own their command descendants
+through the same cleanup used by lanes.
+
+An audited `crapkit verify --override REASON`, or a hook override through
+`CRAPKIT_OVERRIDE_REASON`, runs `alert_command` with the override record on
+stdin. `crapkit digest --alert` runs it with the digest body on stdin when
+the digest has changes to report. Both use a separate shell subprocess in the
+project root without a configured timeout. Source-derived names are never
+interpolated into the command. A nonzero alert exit refuses the operation.
+
+`mutate` writes mutated source in a detached worktree at every worker count,
+including the default of one worker. It copies dirty, untracked and deleted
+inputs into that worktree before applying mutants. A second `mutate` in the
+same repo finds the pool lock held and uses temporary worktrees under
+`.crapkit/mutate-tmp`. Each run holds its lease until owned commands stop.
+The user's working tree stays unchanged.
+
+[Mutation isolation tests](tests/e2e/test_mutate_e2e.py) exercise this behavior
+through the CLI. [Pool tests](tests/unit/test_mutate_pool.py) check preparation
+and restoration.
 
 ## What crapkit writes
 
-Everything crapkit writes for itself lives under `.crapkit/` in the repo it
-scores, which is why `init` adds that directory to `.gitignore`. The exceptions
-are what you are meant to read and commit: `crapkit.toml`, the ratchet TSV, and
-the `.gitignore` line itself.
+Managed run state lives under `.crapkit/` in the project being scored;
+`init` adds that directory to `.gitignore`. The config, ratchet TSV and
+`.gitignore` are intended to be reviewed and committed. Commands that export a
+baseline or report write to the output path you supply, and lane commands can
+write to their own configured destinations.
 
 | Under `.crapkit/` | What it is |
 | --- | --- |
@@ -67,12 +86,13 @@ the `.gitignore` line itself.
 | `coupling-cache-v1.json` | ranked coupling pairs at the default thresholds, keyed on HEAD, the churn window, the UTC date, the path format and a digest of the tracked set |
 | `mutate-pool/` | one git worktree per mutation worker, each a full checkout of HEAD |
 
-The pool is the part worth knowing about. Those worktrees are kept between runs
-on purpose, because building them again costs 30 s on a large repo where
-re-preparing them costs half a second. Nothing bounds their size: N workers cost
-N checkouts of your repo, in your repo. `crapkit mutate --drop-pool` removes
-them and their git registrations.
+Mutation worktrees remain between runs so later runs can reuse their checkouts.
+Their disk cost grows with the worker count and repository size. Run
+`crapkit mutate --drop-pool` to remove the pool and its Git registrations;
+an active pool refuses removal. Input links and reparse points are refused
+before a worker can write through them to another tree.
 
-Nothing under `.crapkit/` is signed or checked for tampering. It is cache and
-history, not a trust boundary. Anyone who can write there can write a scored
-run, and they could already run the lane commands.
+The local store and caches are not authenticated. Parsing, provenance and
+content checks catch stale or malformed data; they do not establish a security
+boundary against someone who can write to the project. That person can also
+change the commands the project runs.

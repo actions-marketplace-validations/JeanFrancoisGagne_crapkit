@@ -36,6 +36,44 @@ def test_string_literals_are_never_mutated():
     assert file_mutants(src, changed_lines={2}, language="python") == []
 
 
+@pytest.mark.parametrize('source', [
+    'def f():\n    isTrue = 1\n    return isTrue\n',
+    'def f():\n    return 1  # True == False\n',
+    'def f():\n    """\n    True == False\n    """\n    return 1\n',
+    'def f():\n    return "escaped \\" True == False"\n',
+])
+def test_python_identifiers_comments_and_multiline_strings_are_not_mutants(source):
+    assert file_mutants(source, None, 'python') == []
+
+
+@pytest.mark.parametrize('language,source,expected', [
+    ('typescript', 'function f() { return `true ${true}`; }',
+     'function f() { return `true ${false}`; }'),
+    ('rust', 'fn f() -> bool { let s = r#"true == false"#; /* true */ true }',
+     'fn f() -> bool { let s = r#"true == false"#; /* true */ false }'),
+    ('go', 'func f() bool { s := `true == false`; return true }',
+     'func f() bool { s := `true == false`; return false }'),
+    ('cpp', 'bool f() { auto s = R"(true == false)"; return true; }',
+     'bool f() { auto s = R"(true == false)"; return false; }'),
+    ('vue', '<template><div>true</div></template><script>const x = true;</script>',
+     '<template><div>true</div></template><script>const x = false;</script>'),
+    ('tsx', 'function F() { return <div>{true}</div>; }',
+     'function F() { return <div>{false}</div>; }'),
+    ('javascript', 'function f() { const s = /true/; return true; }',
+     'function f() { const s = /true/; return false; }'),
+    ('java', 'boolean f() { String s = "true"; return true; }',
+     'boolean f() { String s = "true"; return false; }'),
+    ('swift', 'func f() -> Bool { let s = "true"; return true }',
+     'func f() -> Bool { let s = "true"; return false }'),
+    ('zig', 'fn f() bool { const s = "true"; return true; }',
+     'fn f() bool { const s = "true"; return false; }'),
+    ('objectivec', 'bool f() { NSString *s = @"true"; return true; }',
+     'bool f() { NSString *s = @"true"; return false; }'),
+])
+def test_language_readers_keep_strings_markup_and_comments_out_of_mutants(language, source, expected):
+    assert [m.mutated for m in file_mutants(source, None, language)] == [expected]
+
+
 def test_typescript_strict_equality_flips():
     src = "export function eq(a: number, b: number) {\n  return a === b && a > 0;\n}\n"
     mutants = file_mutants(src, changed_lines={2}, language="typescript")
@@ -114,3 +152,30 @@ def test_apply_mutant_replaces_exactly_one_line():
     assert out.splitlines()[2] == first.mutated
     assert out.splitlines()[3] == "        return 10"
     assert len(out.splitlines()) == len(PY.splitlines())
+
+
+# --- the corpus cut: which of the diff's files may grow mutants at all -----------
+
+CORPUS_TOML = (
+    '[crapkit]\ntarget = 6\n\n'
+    '[[scope]]\nname = "src"\npaths = ["src"]\nlanguages = ["python"]\n\n'
+    '[exclude]\nglobs = ["src/gen/**"]\nmax_file_bytes = 100\n'
+)
+
+
+def test_the_corpus_cut_is_the_one_scoring_uses():
+    """Scopes, excludes, the test-file cut and the byte ceiling, all through
+    `universe.assign_files`, so mutate cannot drift from what `coverage` scores."""
+    from crapkit.config import load_config_text
+    from crapkit.mutate import partition_by_corpus
+
+    targets = {"src/a.py": None, "src/tests/test_a.py": {3}, "src/gen/client.py": None,
+               "src/b.rb": None, "tests/test_b.py": None, "src/big.py": {1}}
+    sizes = {"src/big.py": 101}
+
+    kept, outside = partition_by_corpus(targets, load_config_text(CORPUS_TOML),
+                                        size_of=lambda p: sizes.get(p, 1))
+
+    assert kept == {"src/a.py": None}
+    assert outside == ["src/b.rb", "src/big.py", "src/gen/client.py",
+                       "src/tests/test_a.py", "tests/test_b.py"]

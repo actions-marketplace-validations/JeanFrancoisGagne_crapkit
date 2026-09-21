@@ -1,58 +1,43 @@
-"""Where mutants actually run. One worker (the default) mutates the live
-working tree, exactly as this command always has. `mutation_workers = N` gives
-each worker its own detached git worktree instead, because a mutant is a write
-to a source file: two of them in one tree would read each other's edits.
+"""Run every mutant in a private detached worktree, at any worker count.
 
-Two things the parallel path owes the serial one. Results merge by the mutant's
-position in the list, never by who finished first, so the same tree reports the
-same JSON at any worker count. And the worktree is a checkout of HEAD while
-`mutate` is diff-scoped against the working tree, so the targeted files are
-copied in as they are on disk — uncommitted lines are the ones being mutated.
+Capture changed and untracked inputs once, including tests, configuration and
+deletions, then apply that snapshot to every worker's checkout of HEAD. Results
+merge in mutant order. Neither the runner nor a mutant writes to the source tree.
 
 The command runs with cwd set to the worktree. A consumer whose test command
 resolves the code under test from somewhere else (an editable install pointing
 at the main checkout, a global site-packages copy) would measure unmutated
 code and score every mutant a survivor: keep the command cwd-relative.
 
-Those worktrees are KEPT, at `<root>/.crapkit/mutate-pool/w0..wN`. Building four
-of them costs 30.6 s on a 31,459-file repo and re-preparing the kept four costs
-0.46 s (best of 5, interleaved), and `mutate` is diff-scoped, so that build was
-most of a run's wall clock. Re-preparing is `git checkout --force <sha>` naming
-the main repo's HEAD, then `git clean -xdff`: the last run's mutant goes back,
-the last suite's artifacts go away, and a commit made since lands. What is left
-on disk is four checkouts, which `crapkit mutate --drop-pool` removes.
+Keep worktrees at `<root>/.crapkit/mutate-pool/w0..wN` for reuse. Resetting them
+to HEAD and cleaning them removes the preceding run's changes. Ignored local
+dependencies are not copied; the configured command supplies its own setup.
 
-The pool is one directory shared by every run in the repo, where mkdtemp gave
-each run its own, so entry takes an exclusive lock on `.crapkit/mutate-pool/`.
-A second `mutate` in the same repo finds it held and falls back to the old
-throwaway base: slower, never the first run's tree with a second run's mutant.
+An OS lock at `.crapkit/mutate-pool.lock` protects reuse and removal. A second
+run uses temporary worktrees while the pool is occupied. Cleanup refuses an
+occupied pool, and removing the pool never removes the lock file's identity.
 """
 from __future__ import annotations
 
 import os
+import json
+import re
 import shutil
-import tempfile
+import stat
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+from typing import Literal
+from uuid import uuid4
 
 from .config import shell_words
 from .errors import GitError, ToolError
-from .gitio import head_commit, worktree_add, worktree_remove, worktree_reset
+from .gitio import head_commit, status_names, worktree_add, worktree_remove, worktree_reset, worktree_root
 from .mutate import apply_mutant
-from .procs import run_bounded
-
-try:  # the lock, through whichever of the two the platform has
-    import fcntl
-except ImportError:  # pragma: no cover - Windows
-    fcntl = None
-try:
-    import msvcrt
-except ImportError:  # pragma: no cover - POSIX
-    msvcrt = None
-
+from .procs import own_processes, run_bounded
 
 def _suite_env() -> dict:
     """Python validates .pyc files by source SIZE and whole-second mtime, so a
@@ -60,7 +45,7 @@ def _suite_env() -> dict:
     return {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
 
-def require_live_suite(tree: Path, cfg) -> None:
+def require_live_suite(tree: Path, cfg, *, owner=None) -> None:
     """Refuse to score anything until the command has passed once with nothing
     mutated.
 
@@ -74,7 +59,7 @@ def require_live_suite(tree: Path, cfg) -> None:
     mutation score, so it is said instead of one.
     """
     code = run_bounded(cfg.mutation_command, cfg.mutation_timeout_seconds,
-                       cwd=tree, env=_suite_env())
+                       cwd=tree, env=_suite_env(), owner=owner)
     if code == 0:
         return
     raise ToolError(f"mutation_command {_runner_word(cfg.mutation_command)!r} "
@@ -93,9 +78,9 @@ def _baseline_verdict(code: int | None) -> str:
     return "timed out" if code is None else f"exits {code}"
 
 
-def run_one(tree: Path, cfg, mutant) -> bool:
+def run_one(tree: Path, cfg, mutant, *, owner=None) -> bool:
     """True = killed. The original file ALWAYS comes back, whatever happens."""
-    p = tree / mutant.path
+    p = _private_file(tree, mutant.path)
     original = p.read_bytes()
     # Python validates .pyc files by source SIZE + mtime in WHOLE SECONDS: two
     # same-size mutants applied within one second would reuse the first one's
@@ -112,9 +97,9 @@ def run_one(tree: Path, cfg, mutant) -> bool:
         # one of them per mutant, all at once on the single-worker path.
         # None is the deadline: a mutant that loops forever is dead.
         return run_bounded(cfg.mutation_command, cfg.mutation_timeout_seconds,
-                           cwd=tree, env=env) != 0
+                           cwd=tree, env=env, owner=owner) != 0
     finally:
-        p.write_bytes(original)
+        _private_file(tree, mutant.path).write_bytes(original)
 
 
 def _shards(indexed: list, workers: int) -> list[list]:
@@ -128,32 +113,91 @@ def _merge(done: list) -> list[bool]:
     return [killed for _, killed in sorted(done)]
 
 
-def _run_shard(tree: Path, cfg, shard: list, report) -> list:
+def _run_shard(tree: Path, cfg, shard: list, report, owner, cancelled) -> list:
     out = []
     for index, mutant in shard:
-        killed = run_one(tree, cfg, mutant)
+        if cancelled.is_set():
+            break
+        killed = run_one(tree, cfg, mutant, owner=owner)
         report(index, mutant, killed)
         out.append((index, killed))
     return out
 
 
-def _seed(root: Path, tree: Path, rel_paths: list) -> None:
-    """The worktree checked out HEAD; the mutants were grown from the working
-    tree. Copy the targeted files over so both agree on what line 40 is."""
-    for rel in rel_paths:
-        dst = tree / rel
+def _input_snapshot(root: Path, targets: list, state: Path) -> tuple[str, dict]:
+    """Freeze every working-tree change once, including tests and deletions."""
+    head = head_commit(root)
+    paths = sorted(set(status_names(root)) | set(targets))
+    files = {rel: _snapshot_file(_unlinked_path(root, rel)) for rel in paths
+             if not Path(rel).is_relative_to(state)}
+    if head_commit(root) != head:
+        raise ToolError("HEAD changed while preparing mutation inputs; rerun mutate")
+    return head, files
+
+
+def _snapshot_file(path: Path) -> tuple[bytes, int] | None:
+    if not path.exists():
+        return None
+    return path.read_bytes(), path.stat().st_mode
+
+
+def _refuse_link(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    reparse = getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    if stat.S_ISLNK(info.st_mode) or reparse:
+        raise ToolError(f"mutation path {path} is a link; use private regular files")
+
+
+def _unlinked_path(root: Path, relative) -> Path:
+    """Check each component without following symlinks or Windows reparse points."""
+    root = Path(os.path.abspath(root))
+    path = Path(os.path.abspath(root / relative))
+    if not path.is_relative_to(root):
+        raise ToolError(f"mutation path {path} escapes its workspace {root}")
+    current = root
+    _refuse_link(current)
+    for part in path.relative_to(root).parts:
+        current /= part
+        _refuse_link(current)
+    return path
+
+
+def _private_file(root: Path, relative) -> Path:
+    path = _unlinked_path(root, relative)
+    if path.exists() and path.stat().st_nlink > 1:
+        raise ToolError(f"mutation path {path} has multiple links; use private regular files")
+    return path
+
+
+def _seed(tree: Path, files: dict) -> None:
+    """Apply the same captured bytes and deletions to every private worker."""
+    destinations = {rel: _private_file(tree, rel) for rel in files}
+    for rel, saved in files.items():
+        dst = destinations[rel]
+        if saved is None:
+            dst.unlink(missing_ok=True)
+            continue
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(root / rel, dst)
+        dst.write_bytes(saved[0])
+        dst.chmod(saved[1])
 
 
-def _on_every_tree(action, root: Path, trees: list) -> None:
+def _on_every_tree(action, root: Path, trees: list, *, owner) -> list:
     """`action(root, tree)` on one thread per tree, and WAIT FOR THEM ALL, even
     once one has raised. Leaving a checkout in flight is what turns a failed add
     into a leaked worktree: the cleanup walks the list, finds nothing at that
     path yet, and the abandoned thread creates it a moment later."""
+    action = partial(action, owner=owner)
     with ThreadPoolExecutor(max_workers=len(trees)) as pool:
-        for done in [pool.submit(action, root, tree) for tree in trees]:
-            done.result()
+        try:
+            futures = [pool.submit(action, root, tree) for tree in trees]
+            return [done.result() for done in futures]
+        except BaseException as error:
+            _cancel_owner(owner, error)
+            raise
 
 
 def pool_dir(root: Path) -> Path:
@@ -172,14 +216,41 @@ def _worktrees(root: Path, count: int):
     a peer run holds it. Either way the caller gets `count` trees and hands
     them back at the end of the block.
     """
-    with _pool_lock(root) as held:
-        keeper = _pooled(root, count) if held else _throwaway(root, count)
-        with keeper as trees:
-            yield trees
+    with _owned_worktrees(root, count) as (trees, owner):
+        yield trees
 
 
 @contextmanager
-def _pooled(root: Path, count: int):
+def _owned_worktrees(root: Path, count: int):
+    recover_temporary(root)
+    lock = _unlinked_path(root, pool_dir(root).parent / "mutate-pool.lock")
+    prepared, owner = False, None
+    try:
+        with own_processes([lock], optional=True, label="mutation worktree pool") as owner:
+            if owner.held:
+                trees = _pooled(root, count, owner=owner)
+                prepared = True
+                yield trees, owner
+                return
+    except BaseException as error:
+        if owner is not None and owner.held and not prepared:
+            _clean_failed_pool(root, count, lock, error)
+        raise
+    with _throwaway(root, count) as owned:
+        yield owned
+
+
+def _clean_failed_pool(root: Path, count: int, lock: Path, error: BaseException) -> None:
+    try:
+        with own_processes([lock], optional=True, label="mutation worktree pool cleanup") as owner:
+            if owner.held:
+                base = pool_dir(root)
+                _drop(root, base, [base / f'w{i}' for i in range(count)], owner=owner)
+    except BaseException as cleanup:
+        raise error from cleanup
+
+
+def _pooled(root: Path, count: int, *, owner):
     """The kept set, re-prepared on the way in and LEFT ON DISK on the way out.
 
     A build that fails takes the whole pool with it, because half a pool reused
@@ -188,144 +259,213 @@ def _pooled(root: Path, count: int):
     """
     base = pool_dir(root)
     trees = [base / f"w{i}" for i in range(count)]
-    try:
-        _stock(root, base, trees, head_commit(root))
-    except BaseException:
-        _drop(root, base, trees)
-        raise
-    yield trees
+    for tree in trees:
+        _unlinked_path(root, tree)
+    _trim_pool(root, base, trees, owner=owner)
+    _stock(root, base, trees, head_commit(root), owner=owner)
+    return trees
 
 
-def _stock(root: Path, base: Path, trees: list, head: str) -> None:
+def _trim_pool(root: Path, base: Path, trees: list, *, owner) -> None:
+    surplus = [path for path in base.glob("w*")
+               if re.fullmatch(r"w(?:0|[1-9][0-9]*)", path.name) and path not in trees]
+    _drop(root, base, surplus, owner=owner)
+    if any(path.exists() for path in surplus):
+        raise ToolError("could not remove surplus mutation workers")
+
+
+def _stock(root: Path, base: Path, trees: list, head: str, *, owner) -> None:
     """Every tree at `head` with nothing of the last run in it, however it got
     there: re-prepared when the pool is there to re-prepare, built when it is
     not."""
-    if all(tree.is_dir() for tree in trees) and _reprepared(root, trees, head):
+    if all(tree.is_dir() for tree in trees) and _reprepared(root, trees, head, owner=owner):
         return
-    _drop(root, base, trees)
-    _on_every_tree(worktree_add, root, trees)
+    _drop(root, base, trees, owner=owner)
+    _on_every_tree(worktree_add, root, trees, owner=owner)
 
 
-def _reprepared(root: Path, trees: list, head: str) -> bool:
+def _reprepared(root: Path, trees: list, head: str, *, owner) -> bool:
     """False, not a raise, when git refuses one of them. A directory git no
     longer knows as a worktree — a killed run, a hand-deleted admin entry, a
     copied folder — is a pool to rebuild, not a `mutate` to fail."""
+    return all(_on_every_tree(partial(_reset_to, head), root, trees, owner=owner))
+
+
+def _reset_to(head: str, root: Path, tree: Path, *, owner) -> bool:
+    """`_on_every_tree` hands its action (root, tree); the commit rides in
+    front. The main repo's sha, never the literal HEAD, which inside a linked
+    worktree means the commit that worktree was built at."""
     try:
-        _on_every_tree(partial(_reset_to, head), root, trees)
+        worktree_reset(tree, head, owner=owner)
     except GitError:
         return False
     return True
 
 
-def _reset_to(head: str, root: Path, tree: Path) -> None:
-    """`_on_every_tree` hands its action (root, tree); the commit rides in
-    front. The main repo's sha, never the literal HEAD, which inside a linked
-    worktree means the commit that worktree was built at."""
-    worktree_reset(tree, head)
-
-
-def _drop(root: Path, base: Path, trees: list) -> None:
+def _drop(root: Path, base: Path, trees: list, *, owner) -> None:
     """Through `worktree remove`, never an rmtree alone: an abandoned checkout
-    leaves an entry in `git worktree list` that outlives the directory. The base
-    stays, because the lock this process is holding is a file inside it."""
+    leaves an entry in `git worktree list` that outlives the directory."""
+    for tree in trees:
+        _unlinked_path(base, tree)
     if trees:
-        _on_every_tree(worktree_remove, root, trees)
+        _on_every_tree(worktree_remove, root, trees, owner=owner)
 
 
 def drop_pool(root: Path) -> list:
     """Every kept checkout removed, and the base with it. Returns what was
     there, for the command that prints it."""
-    base = pool_dir(root)
-    trees = sorted(p for p in base.glob("w*") if p.is_dir())
-    _drop(root, base, trees)
-    shutil.rmtree(base, ignore_errors=True)
-    return trees
+    base = _unlinked_path(root, pool_dir(root))
+    if not base.exists():
+        return []
+    lock = _unlinked_path(root, base.parent / 'mutate-pool.lock')
+    with own_processes([lock], optional=True, label='mutation worktree pool cleanup') as owner:
+        if not owner.held:
+            raise ToolError("mutation worktree pool is in use; retry --drop-pool after the run finishes")
+        trees = sorted(p for p in base.glob("w*") if p.is_dir())
+        _drop(root, base, trees, owner=owner)
+        shutil.rmtree(base, ignore_errors=True)
+        return trees
 
 
 @contextmanager
 def _throwaway(root: Path, count: int):
-    """What every run did before the pool, and what the second concurrent run
-    in one repo still does: a private base, gone on the way out — after a clean
-    run, after an exception, and after an add that failed halfway through.
+    """A concurrent run holds its own stable lease through command cleanup.
 
-    The adds run together, and so do the removes. Each one is a full checkout
-    that spends its time waiting on the disk rather than on a core, so four of
-    them serialized cost 54.5 s on a 31,620-file repo against 25.1 s overlapped.
+    The receipt precedes tree creation, so recovery can remove partial builds
+    after caller death. Older system-temp directories have no such proof.
     """
-    base = Path(tempfile.mkdtemp(prefix="crapkit-mutate-"))
+    base = _unlinked_path(root, root / '.crapkit/mutate-tmp' / uuid4().hex)
+    lease = _temporary_lease(root, base)
     trees = [base / f"w{i}" for i in range(count)]
     try:
-        _on_every_tree(worktree_add, root, trees)
-        yield trees
+        with own_processes([lease], label="temporary mutation worktrees") as owner:
+            base.mkdir(parents=True)
+            try:
+                _write_temporary_receipt(root, base, count)
+                _on_every_tree(worktree_add, root, trees, owner=owner)
+                yield trees, owner
+            finally:
+                if not owner.cancelled:
+                    _teardown(root, base, trees, owner=owner)
     finally:
-        _teardown(root, base, trees)
+        if base.exists():
+            _recover_temporary(root, base, False)
 
 
-def _teardown(root: Path, base: Path, trees: list) -> None:
-    _on_every_tree(worktree_remove, root, trees)
-    shutil.rmtree(base, ignore_errors=True)
+def _teardown(root: Path, base: Path, trees: list, *, owner) -> None:
+    _drop(root, base, trees, owner=owner)
+    shutil.rmtree(base)
 
 
-@contextmanager
-def _pool_lock(root: Path):
-    """Exclusive, and an answer rather than a wait: False means a peer run owns
-    the pool and this one takes the throwaway path.
+@dataclass(frozen=True)
+class TemporaryRecovery:
+    path: Path
+    status: Literal['recovered', 'planned', 'active', 'unproven', 'failed']
+    reason: str = ''
 
-    The OS holds it, so it dies with the process. A lock file created and
-    deleted by hand would survive a killed run and lock every later run out of
-    the pool for good — a 35 s regression per run that nothing reports.
+
+def _temporary_lease(root: Path, base: Path) -> Path:
+    return _private_file(root, root / '.crapkit/mutate-leases' / (base.name + '.lock'))
+
+
+def _write_temporary_receipt(root: Path, base: Path, count: int) -> None:
+    receipt = {'version': 1, 'root': str(root.resolve()), 'run': base.name, 'workers': count}
+    temporary = base / 'owner.tmp'
+    temporary.write_text(json.dumps(receipt), encoding='utf-8')
+    temporary.replace(base / 'owner.json')
+
+
+def _temporary_trees(root: Path, base: Path) -> list[Path]:
+    _unlinked_path(root, base)
+    receipt = json.loads(_private_file(base, 'owner.json').read_text(encoding='utf-8'))
+    expected = {'version': 1, 'root': str(root.resolve()), 'run': base.name,
+                'workers': receipt['workers']}
+    if not _receipt_matches(receipt, expected) or not re.fullmatch(r'[0-9a-f]{32}', base.name):
+        raise ValueError('temporary mutation receipt does not match this directory')
+    count = receipt['workers']
+    if type(count) is not int or not 1 <= count <= 100:
+        raise ValueError('temporary mutation receipt has an invalid worker count')
+    return [_unlinked_path(base, f'w{i}') for i in range(count)]
+
+
+def _receipt_matches(receipt: dict, expected: dict) -> bool:
+    return type(receipt.get('version')) is int and receipt == expected
+
+
+def _recover_temporary(root: Path, base: Path, dry_run: bool) -> TemporaryRecovery:
+    try:
+        _temporary_trees(root, base)
+        lease = _temporary_lease(root, base)
+        if not lease.is_file():
+            raise ValueError('temporary mutation lease is missing')
+    except (OSError, ValueError, KeyError, TypeError, ToolError) as error:
+        return TemporaryRecovery(base, 'unproven', str(error))
+    return _recover_leased(root, base, lease, dry_run)
+
+
+def _recover_leased(root: Path, base: Path, lease: Path, dry_run: bool) -> TemporaryRecovery:
+    try:
+        with own_processes([lease], optional=True, label='temporary mutation recovery') as owner:
+            if not owner.held:
+                return TemporaryRecovery(base, 'active', 'temporary mutation worktrees are in use')
+            trees = _temporary_trees(root, base)
+            if dry_run:
+                return TemporaryRecovery(base, 'planned')
+            _teardown(root, base, trees, owner=owner)
+    except (OSError, ValueError, KeyError, TypeError, ToolError) as error:
+        return TemporaryRecovery(base, 'failed', str(error))
+    return TemporaryRecovery(base, 'recovered')
+
+
+def recover_temporary(root: Path, *, dry_run: bool = False) -> list[TemporaryRecovery]:
+    """Remove proved idle temporary runs; keep live or unproven paths untouched.
+
+    Stable lease files stay outside removed directories. Recovery never scans
+    old system-temp worktrees or removes a live concurrent run.
     """
-    base = pool_dir(root)
-    base.mkdir(parents=True, exist_ok=True)
-    handle = os.open(base / ".lock", os.O_CREAT | os.O_RDWR)
-    held = _take_lock(handle)
-    try:
-        yield held
-    finally:
-        _drop_lock(handle, held)
-        os.close(handle)
+    base = _unlinked_path(root, root / '.crapkit/mutate-tmp')
+    if not base.exists():
+        return []
+    return [_recover_temporary(root, path, dry_run) for path in sorted(base.iterdir())]
 
 
-def _take_lock(handle: int) -> bool:
-    """True = this process owns the pool now."""
-    try:
-        if msvcrt is not None:
-            msvcrt.locking(handle, msvcrt.LK_NBLCK, 1)
-        else:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        return False
-    return True
-
-
-def _drop_lock(handle: int, held: bool) -> None:
-    if not held:
-        return
-    if msvcrt is not None:
-        os.lseek(handle, 0, os.SEEK_SET)
-        msvcrt.locking(handle, msvcrt.LK_UNLCK, 1)
-    else:
-        fcntl.flock(handle, fcntl.LOCK_UN)
-
-
-def _fan_out(cfg, trees: list, shards: list, report) -> list:
+def _fan_out(cfg, trees: list, shards: list, report, owner) -> list:
+    cancelled = threading.Event()
     with ThreadPoolExecutor(max_workers=len(trees)) as pool:
-        futures = [pool.submit(_run_shard, tree, cfg, shard, report)
-                   for tree, shard in zip(trees, shards)]
-        return [pair for f in futures for pair in f.result()]
+        try:
+            futures = [pool.submit(_run_shard, tree, cfg, shard, report, owner, cancelled)
+                       for tree, shard in zip(trees, shards)]
+            return [pair for f in futures for pair in f.result()]
+        except BaseException as error:
+            cancelled.set()
+            _cancel_owner(owner, error)
+            raise
+
+
+def _cancel_owner(owner, error: BaseException) -> None:
+    try:
+        owner.cancel()
+    except BaseException as cleanup:
+        raise error from cleanup
 
 
 def _run_parallel(root: Path, cfg, mutants: list, workers: int, report) -> list[bool]:
     shards = _shards(list(enumerate(mutants)), workers)
-    targets = sorted({m.path for m in mutants})
-    with _worktrees(root, workers) as trees:
+    checkout = worktree_root(root)
+    prefix = root.resolve().relative_to(checkout)
+    targets = sorted({(prefix / m.path).as_posix() for m in mutants})
+    head, files = _input_snapshot(checkout, targets, prefix / ".crapkit")
+    with _owned_worktrees(root, workers) as (trees, owner):
+        if head_commit(root) != head:
+            raise ToolError("HEAD changed while preparing mutation workers; rerun mutate")
         for tree in trees:
-            _seed(root, tree, targets)
+            _seed(tree, files)
         # In the worker's own checkout, which is where the mutants will run: a
         # baseline taken at the root would clear a command the worktree cannot
         # start.
-        require_live_suite(trees[0], cfg)
-        done = _fan_out(cfg, trees, shards, report)
+        execution_roots = [tree / prefix for tree in trees]
+        require_live_suite(execution_roots[0], cfg, owner=owner)
+        done = _fan_out(cfg, execution_roots, shards, report, owner)
     return _merge(done)
 
 
@@ -342,10 +482,7 @@ def run_mutants(root: Path, cfg, mutants: list, report) -> list[bool]:
     if not mutants:
         return []
     workers = min(cfg.mutation_workers, len(mutants))
-    if workers > 1:
-        return _run_parallel(root, cfg, mutants, workers, report)
-    require_live_suite(root, cfg)
-    return _merge(_run_shard(root, cfg, list(enumerate(mutants)), report))
+    return _run_parallel(root, cfg, mutants, workers, report)
 
 
 def reporter(total: int, stream):

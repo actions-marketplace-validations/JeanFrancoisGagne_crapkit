@@ -271,17 +271,19 @@ def _documented_pester_globs() -> tuple[str, ...]:
     """
     import tomllib
 
-    text = (Path(crapkit.__file__).resolve().parents[2]
+    text = (Path(__file__).resolve().parents[2]
             / "docs" / "configuration.md").read_text(encoding="utf-8")
     block = next(b for b in text.split("```toml")[1:] if ".Tests.ps1" in b)
     return tuple(tomllib.loads(block.split("```")[0])["exclude"]["globs"])
 
 
 def test_the_documented_pester_glob_reaches_a_root_level_test_file():
-    """`**/*.Tests.ps1` alone needs a directory in front of the file name, so a
-    repo-root `Deploy.Tests.ps1` stayed in the corpus and came back from doctor
-    as a tracked file no scope claims — pointing at the page that gave the glob.
-    PowerShell repos keep scripts at the root more than most."""
+    """A leading `**/` matches zero or more directories, so the page's one glob
+    reaches a repo-root `Deploy.Tests.ps1` and `scripts/Deploy.Tests.ps1` alike.
+    Under fnmatch alone it needed a directory in front of the file name, and a
+    root-level test file came back from doctor as a tracked file no scope
+    claims. PowerShell repos keep scripts at the root more than most, so this
+    pins that the page gives the one-glob form."""
     from crapkit.universe import exclude_matcher, excluded
 
     match = exclude_matcher(_documented_pester_globs())

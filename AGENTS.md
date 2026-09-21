@@ -12,8 +12,10 @@ Two audiences, two sections. Read the one that matches the repo you are in:
   itself.
 
 Every command below runs as `crapkit <sub>` (console script) or
-`python -m crapkit <sub>`. Every subcommand takes `--repo PATH`, default `.`, except
-`claude-hook`, which reads its root from the hook payload on stdin.
+`python -m crapkit <sub>`. Every subcommand takes `--repo PATH`; without it the root is the
+nearest `crapkit.toml` at or above the working directory
+(docs/adr/0002-configuration-is-found-upward-nearest-wins.md), except `claude-hook`, which
+reads its root from the hook payload on stdin.
 
 ---
 
@@ -35,11 +37,13 @@ gets dropped. They are spelled as the console script (`crapkit rescore PATH --ga
 which is the spelling that resolves from an activated venv on Windows: bare `python`
 there can reach the WindowsApps stub or the base interpreter the venv wraps.
 
-`commands.refresh` is the fourth string and the only one that writes: it is a `coverage`
-run, reusing the artifacts of every lane whose scope files have not moved. That is what
+`commands.refresh` is the fourth string: it creates a `coverage` run.
+Automatic reuse requires the same clean HEAD and unchanged configuration,
+environment and coverage/JUnit bytes; every other lane reruns. That is what
 `stale: true` asks for. Nothing else clears it, because nothing else lands a run on the
-current commit. `commands.refresh_writes_run: true` marks it, so a session with a
-read-only checkout can tell the one command it must not run from the three it may.
+current commit. `commands.refresh_writes_run: true` marks that ledger write.
+The other commands can still write caches or test artifacts; the field does not
+promise filesystem read-only execution.
 
 `PATH` and `FUNCTION` come from `crapkit next-item --claim`, or from one entry of a
 `crapkit brief --batch N --json` an orchestrator already ran.
@@ -64,7 +68,7 @@ do next.
 |---|---|
 | `source` | the function's own text, `start` to `end`. Edit from this, not from a fresh read |
 | `handle` | the name to pass back to `brief`, `explain` and `claims release`. It survives your own edit; `start` does not |
-| `remedy` | `decompose`, `add-tests` or `ok`, at the top level: the same verdict `next-item` prints |
+| `remedy` | `decompose`, `split-lines`, `add-tests` or `ok`, at the top level: the same verdict `next-item` prints |
 | `est_splits`, `est_uncovered_paths` | the same two budget numbers `next-item` prints, out of the same code |
 | `params` | its parameter names in order, so a new test can call it without opening the file |
 | `notes` | the repo's and the scope's house rules, carried in from crapkit.toml |
@@ -138,6 +142,10 @@ what you are editing, `gate_rule.ceiling` is the number to land under.
   a new helper does not collide with a name that is there.
 - `remedy: add-tests`: write the failing test first, at the public seam, then cover the
   lines `uncovered_lines` names. `params` gives the call signature.
+- `remedy: split-lines`: another function shares this one's source lines, so coverage
+  cannot tell them apart and the score stays at uncovered whatever you test. Put each
+  definition on its own lines, then `crapkit coverage`. The next run says whether tests
+  are still owed.
 - New file: `rescore --gate` gates it in full (every function, with an `untracked`
   warning on stderr) because git diff cannot scope it. `git add` it so later runs judge
   only your edits; the pre-commit hook only ever sees staged content.
@@ -172,27 +180,30 @@ passes here and still fails verify on CRAP.
 
 ## 4. Run the owning scope's tests
 
-    python -m pytest "calc/grade.py" -q -p no:cacheprovider   # commands.scoped_tests, verbatim
+    crapkit test-scoped calc/grade.py   # commands.scoped_tests, verbatim
 
-`commands.scoped_tests` is not a `crapkit test-scoped` call. It is the owning scope's own
-`[crapkit.scoped_tests]` template with `{files}` already replaced by this packet's file,
-double-quoted, so what you run is the runner the scope declared. Without a packet in hand,
-`crapkit test-scoped calc/grade.py` fills the same template from the same config, and the
-exit codes below are its.
+`commands.scoped_tests` calls `crapkit test-scoped` with the packet's literal file.
+That command selects the owning scope's `[crapkit.scoped_tests]` template and runs
+it from the project root with the inherited environment. Packet commands quote
+special filenames for the host shell; run the string verbatim. The exit codes
+below apply to both packet commands and direct `test-scoped` calls.
 
 `commands.scoped_tests` is `null` when this scope declares no template, and then there
 is no step 4 to run: go to step 5. `crapkit doctor` warns about every scope a lane
 measures with no template behind it, which is the gap to close.
 
 This needs one template per scope in crapkit.toml. `crapkit init` writes the block at the
-end of the file, one line per scope it found: live for a scope whose runner a detected
-lane already proves, commented for the rest, so uncommenting is usually the whole job.
+end of the file, one entry per scope it found under a comment line naming the form it
+chose (`{files}` only where the scope's own paths hold a test file, the whole-suite form
+otherwise): live for a scope whose runner a detected lane already proves, commented for
+the rest, so uncommenting is usually the whole job.
 Every python line it writes names one launcher, the commented lane template included, so
 on a repo whose lockfile pins uv what you uncomment reads `uv run python -m pytest ...`
 and binds to the environment the repo pins:
 
     [crapkit.scoped_tests]
-    calc = "python -m pytest {files} -q -p no:cacheprovider"
+    # calc: no test file under calc/, so the whole suite runs, from tests/
+    calc = "python -m pytest tests -q -p no:cacheprovider"
 
 - Key is the `name` of a `[[scope]]`. Value is a shell command.
 - crapkit routes each file you name to the scope whose `paths` entry matches deepest,
@@ -259,7 +270,7 @@ lane subset, or a lane that failed).
 The lines verify prints, one per finding kind, collected here from separate runs:
 
     verify OK @ f6e9bde18a7 vs baseline f6e9bde18a7 (1 changed files)
-    crapkit: lane 'py' FAILED: lane 'py' produced no artifact at .crapkit/cov/py.json (command exit 4); full log: /repo/.crapkit/lane-py.log; last output: ...
+    crapkit: lane 'py' FAILED: lane 'py' produced no artifact at .crapkit/cov/py.json (command exit 4); lane log: /repo/.crapkit/lane-py.log; last output: ...
     verify FAILED @ 3a45b8a9b6c vs baseline 03d9cac1397 (1 changed files)
       GATE  crap     42.0  ccn   6 cov 0%  calc/report.py:22  bucket( counts , low , high , invert , label )  -> add-tests  [dirty]
       RATCHET  calc/report.py  spread( counts , low , high , invert , label , pad ): 8.0 -> 72.0
@@ -338,14 +349,15 @@ Coverage is measured either way. What the lane cannot do without a results file 
 the two checks that read one, so exit 8 can never fire for its scopes and nothing else
 would have said so. `crapkit init` writes both on the lanes it detects.
 
-When the lane did start and failed anyway, the refusal names `full log: <path>` and quotes
+When the lane did start and failed anyway, the refusal names `lane log: <path>` and quotes
 the end of that log, with the reason hoisted in front when the end does not carry one.
 Those hoisted lines come from the last attempt only. A lane with `retries` set appends
 every attempt to the same `.crapkit/lane-<name>.log`, and the final one starts after the
 last whole `--- attempt N ---` line, so the reason a superseded attempt died for is never
 stood in front of the attempt that actually failed. The message names no attempt number.
-Open the log the path names and read down from its last banner; a log with no banner is
-one attempt.
+Open the log the path names and read down from its last retained banner. Logs rotate
+at `log_max_bytes`, retaining the current file and one `.1` backup; an earlier
+banner may have rotated out. Set the limit to `0` when complete output is required.
 
 ## When crapkit's root sits below the git top
 
@@ -382,13 +394,13 @@ Where a packet's `PATH` and `FUNCTION` come from when no orchestrator handed you
 `next-item` always prints one JSON object on stdout and has no `--json` flag. One real
 payload, one line, sorted keys:
 
-    {"commit": "f6e9bde18a7b4a4d4a0610c16b0526bd9aefc6c6", "empty": false, "item": {"authors": 1, "ccn": 11, "ccn_std": 11, "cognitive": 15, "commits": 6, "cov": 0.0, "crap": 132.0, "end": 84, "est_splits": 2, "est_uncovered_paths": 11, "flag": "measured", "function": "curve( scores , mode , floor , ceiling , skip_none )", "handle": "curve", "nesting": 6, "nloc": 17, "path": "calc/grade.py", "remedy": "decompose", "scope": "calc", "start": 67, "target": 6, "uncovered_lines": [69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]}, "run_id": 5, "schema": 1, "skipped_no_lane": 0, "stale": false}
+    {"commit": "f6e9bde18a7b4a4d4a0610c16b0526bd9aefc6c6", "empty": false, "item": {"authors": 1, "ccn": 11, "ccn_std": 11, "cognitive": 15, "commits": 6, "cov": 0.0, "crap": 132.0, "end": 84, "est_splits": 2, "est_uncovered_paths": 11, "flag": "measured", "function": "curve( scores , mode , floor , ceiling , skip_none )", "handle": "curve", "nesting": 3, "nloc": 17, "path": "calc/grade.py", "remedy": "decompose", "scope": "calc", "start": 67, "target": 6, "uncovered_lines": [69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]}, "run_id": 5, "schema": 1, "skipped_no_lane": 0, "stale": false}
 
 Act on these fields:
 
 | Field | Use it for |
 |---|---|
-| `remedy` | `decompose` splits the function, `add-tests` covers it, `ok` needs nothing |
+| `remedy` | `decompose` splits the function, `split-lines` moves it off a line it shares, `add-tests` covers it, `ok` needs nothing |
 | `est_splits` | pieces a decomposition needs: `0` when `ccn <= target`, else `ceil(ccn / target)` |
 | `est_uncovered_paths` | decision paths no test walks: `round((1 - cov) * ccn)` |
 | `uncovered_lines` | the exact line numbers to cover |
@@ -445,7 +457,7 @@ ranking and never about which snapshot each is describing. `ratchet seed` and `p
 their run by the same rule `verify` uses, so neither signs marks off a run verify refused.
 They print which run they took and which they passed over:
 
-    crapkit-ratchet.tsv: added 1, tightened 0 — 1 mark(s) vs run 3 (86fb0cc6bce), skipped failed verify run 4
+    crapkit-ratchet.tsv: added 1, tightened 0 - 1 mark(s) vs run 3 (86fb0cc6bce), skipped failed verify run 4
 
 The `worklist_floor` is not part of the judgement: a function under the floor whose CRAP
 is over its ceiling is queued like any other, so an empty queue is never the floor hiding
@@ -458,7 +470,7 @@ emptied the queue rather than the work being finished:
 
 | Key | What it counts | Your move |
 |---|---|---|
-| `below_floor` | ccn under `worklist_floor` (default 5) | nothing: a row over target is queued whatever its ccn, so every row counted here is at or under its ceiling |
+| `below_floor` | ccn under `worklist_floor` (default 5) | nothing: a row over ceiling is queued whatever its ccn, so every row counted here is at or under its ceiling |
 | `no_lane` | scored rows no lane covers | wiring gap: `crapkit doctor` names the scope, then declare a `[[lane]]` for it |
 | `no_lane_over_target` | of those, the ones over their ceiling | the same wiring gap, now blocking the stop condition: declare the lane, or set `coverage_optional` if the scope is meant to go unmeasured |
 | `no_churn_in_window` | file has no commits inside `churn_window_months` | nothing, cold code; `crapkit worklist` lists it as dormant when you want to look |
@@ -542,33 +554,49 @@ Stdio JSON-RPC, newline-delimited, no SDK dependency. Client config:
       }
     }
 
-`--repo` sets the default root; every tool also takes an optional `repo` argument that
-overrides it per call. `initialize` reports protocol `2024-11-05` and server name
-`crapkit`.
+`--repo` names an exact root, as on every subcommand; without it the server walks up from
+where it started, and a tool's optional `repo` argument overrides the root per call and is
+walked the same way (ADR 0002). `initialize` negotiates the protocol revision (a client's
+`2025-06-18`, `2025-03-26` or `2024-11-05` is echoed back; anything else is answered with
+`2025-06-18`) and reports server name `crapkit`.
 
-Nine tools:
+Twelve tools, every one the CLI command's `--json` form:
 
 | Tool | Arguments | Returns |
 |---|---|---|
-| `worklist` | `top` | JSON |
-| `brief` | `path`, `name` | JSON |
-| `runs` | none | JSON |
-| `coupling` | `min_support`, `min_confidence` | JSON |
-| `duplication` | `similarity` | JSON |
-| `ratchet_report` | none | JSON |
-| `explain` | `path`, `name` | plain text |
-| `doctor` | none | plain text |
-| `next_item` | `top` (int), `exclude` (array of strings: one fragment per element, each becoming its own `--exclude`) | JSON text |
+| `list_worklist` | `top` (int), `scope` (array of strings: one declared scope name per element, each becoming its own `--scope`) | JSON |
+| `get_next_item` | `top` (int), `exclude` (array of strings: one fragment per element, each becoming its own `--exclude`), `scope` (array of strings, as on `list_worklist`) | JSON text |
+| `get_function_brief` | `path`, `name` | JSON |
+| `get_function_history` | `path`, `name`, `history` (bool: adds `commits`), `tests` (bool: adds `tests`) | JSON |
+| `list_runs` | none | JSON |
+| `get_trend` | none | JSON (`trend --json`: per-run totals) |
+| `check_config` | none | JSON (the `doctor --json` report) |
+| `list_coupled_files` | `min_support`, `min_confidence` | JSON |
+| `list_duplicate_functions` | `similarity` | JSON |
+| `get_ratchet_report` | none | JSON |
+| `list_claims` | none | JSON (`claims list --json`) |
+| `check_gate` | `path` | JSON: `rescore PATH --gate --json`, whose `gate` block says whether the edited file clears the commit gate; `ok` false on a breach (exit 6), answered as a result, not a tool error |
 
-The server is read-only. Every tool shells to a read command, so nothing it exposes
-writes a run, a baseline, a ratchet or a mutant. `coverage`, `verify`, `ratchet`,
-`mutate` and `claims` stay in the CLI.
+Arguments are checked against the served schema before the CLI spawns. `tools/list`
+carries `required` from each tool's positionals, and a missing positional, an undeclared
+key or a wrong type answers a tool result with `isError` true, in the tool's words
+(`brief needs name (see inputSchema.required)`), not a `-32602` protocol error; ADR 0001
+under `docs/adr/` says why. `ping` answers `{}`. An exception escaping the server answers
+`-32603` and the loop continues. `structuredContent` rides beside the text whenever the
+CLI exited 0; a `doctor` that finds a FAIL exits 1 and answers its JSON text with
+`isError: true` and no `structuredContent`. `gate` is the one tool whose non-zero exit is
+an answer: exit 6 (a breach) comes back with `isError: false`, `structuredContent` and
+`gate.ok` false; exits 3, 4 and 5 stay tool errors, as does 1 (no scored run yet).
 
-`brief`, `worklist` and `coupling` do fill the ranked-pairs cache under `.crapkit/` on a
-cold run, and the store fills a per-run rollup the first time `trend` or `report` asks.
-Those are caches: deleting one costs a walk, never a verdict. A session that must write
-nothing at all still has `commands.refresh_writes_run` to tell the one command that
-lands a run from the ones that do not.
+The tools inspect scores and source without running test suites or editing source files.
+Calls can write caches, initialize or migrate the snapshot store, and fill rollups.
+`get_next_item` takes no claim; `check_gate` runs `rescore` and records no verification run.
+`list_claims` lists existing claims. Claim acquisition and release stay in the CLI,
+along with coverage runs, verification, ratchet changes and mutations.
+
+`brief`, `worklist` and `coupling` fill the ranked-pairs cache under `.crapkit/` on a cold
+run. The store fills missing per-run rollups when `trend` or `report` asks for them.
+`commands.refresh_writes_run` distinguishes a new coverage run from these cache writes.
 
 ---
 
@@ -600,16 +628,20 @@ rejected in review.
 
 ## Tests
 
-    python -m pytest                      # both suites
-    python -m pytest tests/unit           # 2,688 tests, about a minute (16 s at -n 8)
-    python -m pytest tests/e2e -n 8       # 626 tests, about 1m30
+<!-- generated:test-schedule -->
+```sh
+python tools/testing/run.py
+python -m pytest tests/unit -p no:randomly -n 4 --dist worksteal
+python -m pytest tests/e2e -n 8 -p no:randomly --dist worksteal
+```
+<!-- /generated:test-schedule -->
 
 `[tool.pytest.ini_options]` in pyproject.toml sets `testpaths = ["tests"]` and
-`addopts = "-q --tb=short -p no:cacheprovider"`. Nothing else: no xdist and no
-randomization, so the `-n 8` above is yours to pass and no `-n 0` is needed to isolate a
-failure. Pass it: the e2e suite runs about 1m30 at `-n 8` against about 8 minutes
-serially, the pair CI, the PR template and pyproject.toml quote. If you have
-pytest-randomly installed globally, add `-p no:randomly` to pin the order.
+`addopts = "-q --tb=short -p no:cacheprovider"`. The shared runner owns the
+four-worker unit and eight-worker CLI schedule used by development, CI and self-verification.
+Use `--unit-workers 1` on the shared runner to reproduce a unit failure serially.
+Use `--coverage` to combine both suites' branch coverage, test contexts and JUnit
+results. Either suite failing makes the runner fail.
 
 `tests/unit` covers pure seams, and that now includes `cli/verifying.py` and
 `cli/scoring.py`, driven in process rather than through a subprocess. `tests/e2e` drives
@@ -625,13 +657,20 @@ injects its own git identity, so no global git config is required.
 `src/crapkit/` is the pure core: analysis, scoring, the store, git, the ratchet, the
 report renderers. One module per concern, and none of them knows about argparse.
 
-Four of them answer a question the whole tree asks, so nothing reimplements the answer:
+Shared rules belong to these modules:
 
 | Module | What it answers |
 |---|---|
 | `universe.py` | which scope owns a path. `owning_scope` is the only predicate, and the deepest declared `paths` entry wins |
 | `config.py` | what words a lane command holds. `shell_words` and `shell_segments` read it the way the shell that runs it reads it |
-| `procs.py` | how a spawn with a deadline dies. `run_bounded` kills the whole process tree and reaps it |
+| `config_contract.py` | which configuration shapes, keys and enum values are valid. Runtime admission, doctor and the generated editor schema share this vocabulary |
+| `procs.py` | who owns command descendants. `run_owned` and `run_bounded` stop descendants before returning or releasing leases |
+| `resources.py` | how cold analysis pools share a nonblocking worker budget; cached and small calls skip pool coordination |
+| `logs.py` | how active command output drains into bounded rotating logs without hiding progress |
+| `retention.py` | which completed test runs are eligible for cleanup under their own leases |
+| `lanes.py` | which measurement outputs a command owns. `measurement_owner` holds resolved artifacts, logs and stamps through execution and parsing, with a helper process retaining locks until surviving commands stop |
+| `ratchetfile.py` | which ratchet bytes a command admitted. Every writer publishes from that captured input under a short lock and refuses an intervening edit |
+| `gitpaths.py` | how Git path records become repository paths, preserving whitespace and Unicode separators |
 | `coupling_cache.py` | which files keep landing in the same commits. `coupling`, `brief` and `worklist --batches` all read this one door, and it caches the ranked pairs in `.crapkit/coupling-cache-v1.json` beside the churn caches |
 
 `store.py` gained a `run_rollup` table: one row per run per scope, filled the first time
@@ -639,11 +678,14 @@ something asks and pruned with its run. `trend` and `report` read it instead of
 rescanning every scored row of every run, which makes both of them writers. The fill is
 best effort, because two crapkit processes on one store can collide on it: losing the
 cache is a cost, losing the command is a bug.
+`history_totals` reads metadata and totals from one snapshot, then fills missing
+rollups after that read ends. Override audits and pruning take the same write
+transaction rule so retention cannot delete a run receiving an audit.
 
-`src/crapkit/cli/` is the command layer, split into ten family modules. `cli/__init__.py`
-holds no logic. It carries `_OWNER`, a name-to-module map, and a `__getattr__` that loads
-one family the first time a name is read. Eight eager imports used to load every family on
-every invocation, which put the cost of every subcommand on `crapkit --version`.
+`src/crapkit/cli/` is the command layer. `cli/__init__.py`
+exports only `main` and loads the parser when called. The parser names each handler's
+family and imports that family only when dispatching its command. Import helpers from
+their owning modules; there is no second export registry to maintain.
 
 | Family | Subcommands |
 |---|---|
@@ -655,15 +697,16 @@ every invocation, which put the cost of every subcommand on `crapkit --version`.
 | `ratchet_cmds.py` | `ratchet` |
 | `analyses.py` | `duplication`, `coupling`, `mutate`, `mcp` |
 | `admin.py` | `init`, `doctor`, `watch` |
+| `maintenance.py` | `clean` |
 | `claude_hook.py` | `claude-hook` |
 | `_shared.py` | helpers more than one family reads |
 
 `claude_hook.py` carries two rules the other families do not, and both are load-bearing.
 Its module scope imports stdlib only, because every edit on the machine pays for it. And
-it never opens the snapshot store: `SnapshotStore.__init__` runs migrations, so a per-edit
-hook would rewrite the schema of whatever store it touched.
+it never opens the snapshot store. Opening an older store can still migrate it, and
+a per-edit hook has no reason to read or change snapshot state.
 
-Four reader modules sit beside the core, all registered in `analyze.py`'s
+Five reader modules sit beside the core, all registered in `analyze.py`'s
 `deferred_pygments()` block:
 
 | Module | What it does |
@@ -672,14 +715,15 @@ Four reader modules sit beside the core, all registered in `analyze.py`'s
 | `lizardrust.py` | counts Rust `match` arms, which lizard does not (lizard #494) |
 | `lizardshell.py` | a shell reader, because lizard ships none and answers `.sh` with `CLikeReader` instead of an error |
 | `lizardpowershell.py` | a PowerShell reader, same reason, plus a cp1252 decode fallback |
+| `lizardtypescript.py` | separates JavaScript and TypeScript expression arrows at commas and preserves their source spans; refuses unresolved TypeScript angle syntax |
 
 Registration belongs at that module scope and nowhere else. A `ProcessPoolExecutor` child
 imports `analyze.py`, so a reader registered anywhere later leaves spawned workers
 measuring with the readers lizard shipped and reporting plausible wrong numbers.
 
-One module is neither: `discover.py` has no importer and has not had one since it was
-added. It is either wired into the packet or removed in a later release. Do not build on
-it before that lands.
+Unused `discover.py` was removed. Live configuration discovery remains in `rootfind.py`.
+Reference implementations for analyzer and coverage comparisons live in test support,
+not in the installed package.
 
 ## Standing rules
 
@@ -688,9 +732,8 @@ else, usually later, usually as a plausible wrong number.
 
 - **Every function you add or edit sits at ccn 6 or below.** The pre-commit gate refuses
   the rest; the section below says what a refusal means.
-- **A name added to a family module gets its `_OWNER` entry in the same commit.** A name
-  with no entry is not re-exported, and the suite reaches dozens of these helpers by name
-  through `crapkit.cli`.
+- **Register a new command once, in the parser.** Import helpers directly from their
+  owning family module. Keep `crapkit.cli.main` as the public process entry point.
 - **Change what a metric measures and bump `ANALYSIS_VERSION` in `analyze.py`.** The
   ratchet stamps every marks file with the version that produced it, and `verify` refuses
   to weigh fresh scores against marks another version signed. 0.4.5 bumped it to 8,
@@ -701,11 +744,11 @@ else, usually later, usually as a plausible wrong number.
   reads `-k "not slow"` as three positionals. The full-suite guard, `doctor` and the
   pytest-cov probe all go through those two, and they read the command the way the shell
   that will run it reads it: sh on POSIX, cmd.exe on Windows.
-- **Any spawn with a timeout goes through `procs.run_bounded`.** `shell=True` makes the
-  shell the child and the real program a grandchild, so `subprocess.run`'s own timeout
-  kills the shell and leaves the suite running with nothing waiting on it. `mutate` left
-  one orphan suite per killed mutant that way. `run_bounded` starts the shell in its own
-  process group and kills the group, `taskkill /T` on Windows and `killpg` on POSIX.
+- **Own commands that can time out or be cancelled through `procs.run_owned`.**
+  `run_bounded` is the shell-command adapter. Windows Jobs and POSIX process groups
+  cover descendants; guardians retain protected leases until cleanup finishes.
+  Keep artifact and checkout leases around the owned command so a cancelled suite
+  cannot keep writing after another caller acquires its resources.
 - **Ask `universe.owning_scope` which scope owns a path.** Ownership was decided three
   ways once, and `brief` handed out a function's lane and test command from one scope and
   its ceiling from another.
