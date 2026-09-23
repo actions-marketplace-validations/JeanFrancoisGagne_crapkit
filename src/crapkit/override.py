@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .errors import ConfigError, ToolError
 from .keys import stated_key
-from .ratchet import RatchetEntry, dump_ratchet
+from .ratchet import RatchetEntry
 from .ratchetfile import RatchetFile
 from .store import SnapshotStore
 from .verify import GateViolation
@@ -32,9 +32,19 @@ def record_override(
     key_version: int | None = None,
     identity_rows=None,
     ratchet_input: RatchetFile | None = None,
+    metric: str,
 ) -> None:
+    """`metric` is the metric that scored the violations, and every caller
+    names it. A measured grant (verify's, which may raise a mark) is refused
+    by marks another metric recorded, the refusal verify itself gives, and by
+    an empty metric. The hook's grant (`raise_marks=False`) synthesizes its
+    numbers from ccn alone and compares no mark, so it keeps the recorded
+    stamps: a stale file stays stale and verify keeps refusing it. `metric`
+    then stamps only a file the grant creates."""
     saved = ratchet_input or RatchetFile.read(root / ratchet_file)
-    _validate_override_keys(saved, violations, identity_rows, key_version)
+    text = _checked_grant_text(saved, violations, raise_marks=raise_marks, keys=key_version,
+                               metric=metric)
+    _validate_override_keys(text, identity_rows, key_version)
     _require_auditable_override(reason, alert_command)
     _alert_or_refuse(alert_command, root, violations, reason)
 
@@ -43,30 +53,43 @@ def record_override(
     # the two leaves an audit trail with no grant, never a grant with no trail.
     store.write_overrides(run_id, [(*stated_key(v), v.crap, reason) for v in violations])
 
-    _grant_ratchet_debt(saved, violations, raise_marks=raise_marks,
-                        key_version=key_version)
+    saved.publish(text)  # the functional exemption: the debt enters the ratchet, diff-visible
 
 
-def _validate_override_keys(saved: RatchetFile, violations, rows, key_version: int | None) -> None:
+def _validate_override_keys(text: str, rows, key_version: int | None) -> None:
     """Reject a mixed-format grant before its alert or either durable record."""
-    _check_saved_reader(saved)
-    prior = saved.entries
     if rows is None or key_version != 0:
         return
     from .ratchet import checked_key_version
 
-    proposed = prior + [RatchetEntry(*stated_key(v), v.crap) for v in violations]
     try:
-        checked_key_version(dump_ratchet(proposed), rows)
+        checked_key_version(text, rows)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
 
 
-def _check_saved_reader(saved: RatchetFile) -> None:
+def _checked_grant_text(saved: RatchetFile, violations: list[GateViolation], *,
+                        raise_marks: bool, keys: int | None, metric: str) -> str:
+    """The marks file after the grant, refused before any side effect when a
+    reader cannot prove its keys.
+
+    Both texts are checked. The saved marks can already lack proof. The grant
+    text can lack it too: a kept analysis 9 stamp gives the `(anonymous)` key
+    the grant adds no proof, and every later reader, seed included, refused the
+    file it wrote.
+    """
+    _check_reader(saved.text or "")
+    granted = _granted_marks(saved.entries, violations, raise_marks=raise_marks)
+    text = _grant_text(saved, granted, raise_marks=raise_marks, keys=keys, metric=metric)
+    _check_reader(text)
+    return text
+
+
+def _check_reader(text: str) -> None:
     from .ratchet import check_reader_keys
 
     try:
-        check_reader_keys(saved.text or "")
+        check_reader_keys(text)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
 
@@ -96,24 +119,27 @@ def _alert_or_refuse(alert_command: str, root: Path, violations: list[GateViolat
             f"{(proc.stderr or proc.stdout).strip()[-300:]} — no alert, no override")
 
 
-def _grant_ratchet_debt(saved: RatchetFile, violations: list[GateViolation], *,
-                        raise_marks: bool, key_version: int | None = None) -> None:
-    """The functional exemption: the debt enters the committed ratchet, diff-visible."""
-    by_key = {(e.path, e.long_name): e for e in saved.entries}
+def _granted_marks(prior: list[RatchetEntry], violations: list[GateViolation], *,
+                   raise_marks: bool) -> list[RatchetEntry]:
+    """The marks after the grant: each violation's debt entered or kept."""
+    by_key = {(e.path, e.long_name): e for e in prior}
     for v in violations:
         key = stated_key(v)
         mark = _override_mark(by_key.get(key), v.crap, raise_marks=raise_marks)
         by_key[key] = RatchetEntry(key[0], key[1], round(mark, 4))
-    text = dump_ratchet(list(by_key.values()), key_version=_grant_key_version(saved, key_version))
-    saved.publish(text)
+    return list(by_key.values())
 
 
-def _grant_key_version(saved: RatchetFile, checked: int | None) -> int:
-    from .ratchet import read_key_version
+def _grant_text(saved: RatchetFile, granted: list[RatchetEntry], *, raise_marks: bool,
+                keys: int | None, metric: str) -> str:
+    """The marks file after the grant, stamped by the rule its numbers fall under.
 
-    if checked is not None:
-        return checked
-    return read_key_version(saved.text or "")
+    Every grant that may raise a mark goes through `measured`, which refuses
+    an empty metric rather than keeping whatever stamp was there.
+    """
+    if raise_marks:
+        return saved.measured(granted, metric, keys=keys)
+    return saved.kept(granted, keys=keys, new_file_metric=metric)
 
 
 def _override_mark(prior: RatchetEntry | None, crap: float, *, raise_marks: bool) -> float:

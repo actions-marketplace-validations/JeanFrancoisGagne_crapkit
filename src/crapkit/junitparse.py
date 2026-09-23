@@ -84,7 +84,9 @@ def _refuse_unfinished(root: ET.Element) -> None:
     a quarter of the scope scores cov 0. Reported on a 15,300-test lane where
     one dead worker left 4,626 tests unexecuted (#21).
     """
-    notes = _crash_notes(root) + _session_notes(root) + _collection_notes(root)
+    # A runner that refused this report records these words in an error of its
+    # own, so the same crash can appear twice; the reader names it once.
+    notes = list(dict.fromkeys(_crash_notes(root) + _session_notes(root) + _collection_notes(root)))
     if notes:
         raise ToolError("junit reports a run that did not finish, so its coverage measures "
                         f"a partial suite: {'; '.join(notes)}")
@@ -134,19 +136,59 @@ def passed_test_ids(xml_text: str) -> set[str]:
 
 
 def _refuse_partial(root: ET.Element) -> None:
-    """Count each subtree once, including aggregate testsuites declarations."""
+    """Count each subtree once, including aggregate testsuites declarations.
+
+    A suite declares its testcases, or, from pytest before 9.1, its records,
+    which differ only where a test errored in teardown.
+
+    Accepting either total leaves one gap. A report holding teardown errors is
+    admitted when it is short by exactly its record-minus-testcase difference,
+    because pytest before 9.1 wrote that same XML for a complete run.
+    """
+    cases = _subtree_counts(root, dict.fromkeys(root.iter("testcase"), 1))
+    teardown = _has_teardown_error(root.iter("error"))
+    records = _subtree_counts(root, _declared_records(root)) if teardown else cases
+    for element in [*root.iter("testsuites"), *root.iter("testsuite")]:
+        _admit_declared_count(element.get("tests"), {cases[element], records[element]})
+
+
+def _subtree_counts(root: ET.Element, weights: dict) -> dict:
     counts = {}
     for element in reversed(list(root.iter())):
-        count = int(element.tag == "testcase") + sum(counts[child] for child in element)
-        counts[element] = count
-        if element.tag in ("testsuite", "testsuites"):
-            _admit_declared_count(element.get("tests"), count)
+        counts[element] = weights.get(element, 0) + sum(counts[child] for child in element)
+    return counts
 
 
-def _admit_declared_count(declared: str | None, count: int) -> None:
+# pytest before 9.1 declared records, not testcases. A teardown error is one more
+# record: it sits beside the test's own result in one testcase, or, after a call
+# failure, opens a second testcase with the same id that pytest subtracted again.
+_TEARDOWN = "failed on teardown with "
+
+
+def _declared_records(root: ET.Element) -> dict:
+    """What each testcase adds to a pre-9.1 pytest's declared `tests` count."""
+    records, failed = {}, set()
+    for case in root.iter("testcase"):
+        records[case] = _records(case, failed)
+        if case.find("failure") is not None:
+            failed.add(_case_id(case))
+    return records
+
+
+def _records(case: ET.Element, failed: set[str]) -> int:
+    if not _has_teardown_error(case.findall("error")):
+        return 1
+    return 0 if _case_id(case) in failed else 2
+
+
+def _has_teardown_error(errors) -> bool:
+    return any((error.get("message") or "").startswith(_TEARDOWN) for error in errors)
+
+
+def _admit_declared_count(declared: str | None, counts: set[int]) -> None:
     if declared is None:
         return
-    if not declared.isascii() or not declared.isdigit() or int(declared) != count:
+    if not declared.isascii() or not declared.isdigit() or int(declared) not in counts:
         raise ToolError("junit test count does not match its cases; the report is incomplete")
 
 

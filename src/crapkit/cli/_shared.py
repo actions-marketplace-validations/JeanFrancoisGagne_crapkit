@@ -275,17 +275,61 @@ def _open_store(root: Path, first_command: str = "coverage") -> SnapshotStore:
     return SnapshotStore(db_path)
 
 
-def _identity_history(root: Path, store=None) -> set:
+def _proved_paths(root: Path, proof, marks) -> set:
+    """The files whose history the legacy mark proof must cover.
+
+    A mark is compared with a row of its own file, so the rows' files come
+    first: check_gate and the commit gate prove the few files they read, and
+    worklist, brief and verify every file their run holds. Two readers compare
+    a mark with a row the proof does not hold. `ratchet prune` moves a mark off
+    a file git renamed, which the working tree no longer has, onto a proved
+    file. And with no rows at all the reader matches marks against another
+    run: explain on a file the newest run dropped. So a marked file the tree
+    lost is proved, and an empty proof proves every marked file. The helper
+    cannot tell that explain from `rescore --gate` on a file with no functions,
+    which compares no mark, so that gate pays the whole proof too, as it did
+    before the proof was narrowed to the rows' files.
+    """
+    paths = {row.path for row in proof}
+    marked = {entry.path for entry in marks}
+    return (paths | _lost_files(root, marked - paths)) if paths else marked
+
+
+def _lost_files(root: Path, paths: set) -> set:
+    """The paths the working tree no longer holds.
+
+    One listing per folder, not one stat per file: a large consumer repo marks
+    9,105 files, 0.18 to 0.31 s to stat one by one and 0.03 s to list. A name
+    the listing lacks reads as lost, so a case or Unicode mismatch can only
+    prove a file the proof did not need.
+    """
+    folders: dict[str, set[str]] = {}
+    for path in paths:
+        folder, _, name = path.rpartition("/")
+        folders.setdefault(folder, set()).add(name)
+    return {posixpath.join(folder, name) for folder, names in folders.items()
+            for name in names - _listing(root / folder)}
+
+
+def _listing(folder: Path) -> set[str]:
+    try:
+        return set(os.listdir(folder))
+    except OSError:  # the folder went with the file
+        return set()
+
+
+def _identity_history(root: Path, store, paths: set) -> set:
+    """Collision groups any stored run held in `paths`."""
     if store is not None:
-        return store.historical_collision_groups()
-    path = root / ".crapkit" / "crap.sqlite"
-    if not path.is_file():
+        return store.historical_collision_groups(paths)
+    db = root / ".crapkit" / "crap.sqlite"
+    if not db.is_file():
         return set()
     from contextlib import closing
 
-    opened = SnapshotStore(path)
+    opened = SnapshotStore(db)
     with closing(opened._conn):
-        return opened.historical_collision_groups()
+        return opened.historical_collision_groups(paths)
 
 
 def _check_ratchet_identity(text: str, root: Path, name: str, rows, store=None) -> int:
@@ -296,10 +340,12 @@ def _check_ratchet_identity(text: str, root: Path, name: str, rows, store=None) 
         check_reader_keys(text)
         if read_key_version(text) == KEY_VERSION:
             return KEY_VERSION
-        if not read_ratchet(text)[0]:
+        marks = read_ratchet(text)[0]
+        if not marks:
             return KEY_VERSION
         proof = rows() if callable(rows) else rows
-        return checked_key_version(text, proof, historical=_identity_history(root, store))
+        paths = _proved_paths(root, proof, marks)
+        return checked_key_version(text, proof, historical=_identity_history(root, store, paths))
     except ValueError as exc:
         raise ConfigError(f"{name}: {exc}") from exc
 

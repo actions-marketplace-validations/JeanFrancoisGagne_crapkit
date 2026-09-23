@@ -60,6 +60,9 @@ class Lane(NamedTuple):
     retries: int = 0
     retest_command: str = ""  # {tests} template for the flake retry before exit 8
     log_max_bytes: int = 16777216  # inherited global bound, not a per-lane TOML key
+    # Root-relative paths the command reads. Declared, they let --reuse-unchanged
+    # reuse the lane while none of them changed; () keeps the whole-tree rule.
+    inputs: tuple[str, ...] = ()
 
 
 # pytest options that read the NEXT token as their value. `-n 8` is eight
@@ -600,8 +603,6 @@ class Config(NamedTuple):
     analysis_workers: int = 0  # requested lizard workers; 0 = automatic sizing
     analysis_worker_budget: int = 0  # shared pool slot ceiling; 0 = available CPUs
     log_max_bytes: int = 16777216  # each active/backup lane log; 0 = unlimited
-    test_retention_days: int = 7  # finished default test evidence; 0 = no age pruning
-    test_retention_count: int = 10  # finished default test evidence; 0 = no count pruning
     # Operational traps the repo learned the hard way. They lived as TOML
     # comments, which the parser drops, so no payload could ever quote them.
     notes: tuple[str, ...] = ()
@@ -725,7 +726,41 @@ def _parse_lane(row: dict, scope_names: set, root: str | os.PathLike | None = No
                 timeout_seconds=row.get("timeout_seconds", 0),
                 no_progress_seconds=row.get("no_progress_seconds", 0),
                 retries=row.get("retries", 0),
-                retest_command=row.get("retest_command", ""))
+                retest_command=row.get("retest_command", ""),
+                inputs=_lane_inputs(row))
+
+
+_DRIVE_PATH = re.compile(r"[A-Za-z]:")
+
+
+def _outside_root(entry: str) -> bool:
+    """An input git would read outside the root, or could not read at all.
+
+    Inputs become pathspecs read from the root with diff.relative on, and that
+    diff never reports a change above the root: a `../shared` input would be
+    trusted forever."""
+    path = entry.replace("\\", "/")
+    return not path or path.startswith("/") or bool(_DRIVE_PATH.match(path)) or ".." in path.split("/")
+
+
+def _lane_inputs(row: dict) -> tuple[str, ...]:
+    return tuple(_lane_input(row.get("name"), entry) for entry in row.get("inputs", ()))
+
+
+def _lane_input(name, entry: str) -> str:
+    r"""One input spelled the way `git ls-files` spells a root-relative path.
+
+    git reads inputs with --literal-pathspecs, so `src/*.ts` would match no
+    file at all and the lane would be reused forever while its sources change.
+    `src\app.ts` matched on Windows git and named a file holding a backslash on
+    Linux; the scope-path spelling rule settles that before git sees it."""
+    if _outside_root(entry):
+        raise ConfigError(f"lane {name!r}: inputs entry {entry!r} is not a path "
+                          "inside the root; list paths relative to crapkit.toml, without '..'")
+    if "*" in entry or "?" in entry:
+        raise ConfigError(f"lane {name!r}: inputs entry {entry!r} is a glob; inputs are literal "
+                          "paths from the root, so list the directory or file itself")
+    return _unrooted(entry) or "."
 
 
 def _reject_shared_artifacts(lanes: list, root=None) -> None:
@@ -780,8 +815,6 @@ def _build_config(raw: dict, root: str | os.PathLike | None = None) -> Config:
         analysis_workers=main.get("analysis_workers", 0),
         analysis_worker_budget=main.get("analysis_worker_budget", 0),
         log_max_bytes=main.get("log_max_bytes", 16777216),
-        test_retention_days=main.get("test_retention_days", 7),
-        test_retention_count=main.get("test_retention_count", 10),
         notes=tuple(main.get("notes", ())),
         scope_notes=scope_notes,
     )

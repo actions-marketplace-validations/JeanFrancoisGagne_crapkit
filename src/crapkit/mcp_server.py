@@ -117,10 +117,11 @@ _WORKLIST_ITEM = {'type': 'object',
                          'description': 'measured, untested, no-lane or cc-only; null on an '
                                         'inventory-only run',
                          'enum': ('measured', 'untested', 'no-lane', 'cc-only', None)},
-                'remedy': {'type': 'string',
+                'remedy': {'type': ('string', 'null'),
                            'description': 'decompose, split-lines, add-tests or ok; every row '
-                                          'but ok reaches get_next_item when a lane measures it',
-                           'enum': _REMEDIES},
+                                          'but ok reaches get_next_item when a lane measures it; '
+                                          'null on an inventory-only run',
+                           'enum': (*_REMEDIES, None)},
                 'crap': {'type': ('number', 'null'),
                          'description': 'the score from the ranked run; null on an inventory-only '
                                         'run'},
@@ -1035,8 +1036,8 @@ TOOLS: tuple[dict, ...] = (
                     "serial_fallback": {"type": "boolean", "description": "busy slots allow serial work without waiting"},
                     "coordination": {"type": "string", "description": "worker slot ownership scope"},
                     "log_max_bytes": {"type": "integer", "description": "byte limit per current and backup lane log; zero is unlimited"},
-                    "test_retention_days": {"type": "integer", "description": "default test evidence age limit; zero disables it"},
-                    "test_retention_count": {"type": "integer", "description": "default test evidence count limit; zero disables it"}}},
+                    "test_retention_days": {"type": "integer", "description": "deprecated, always 0: crapkit applies no test evidence retention"},
+                    "test_retention_count": {"type": "integer", "description": "deprecated, always 0: crapkit applies no test evidence retention"}}},
             "store": {
                 "type": "object",
                 "description": "the run store",
@@ -1273,24 +1274,27 @@ TOOLS: tuple[dict, ...] = (
     },
     {
         "name": "check_gate",
-        "title": "Commit gate verdict for an edited file",
+        "title": "rescore --gate verdict for an edited file",
         "argv": ("rescore", "--gate"),
         "json_flag": True,
         "positional": ("path",),
         "flags": {},
         "verdict_exits": (6,),
-        "description": ("Checks whether an edited file clears the hook's commit gate: fresh ccn per "
-        "changed function against its scope's ceiling less pardoned ratchet debt. "
-        "Call it after an edit once get_function_brief states the rule. CLI verify "
-        "gives the repo-wide verdict. It runs no tests, and a breach reads gate.ok "
-        "false, not an error. path is repo-relative or absolute inside repo, outside "
-        "or missing is a config error. A tracked file is judged on its diff from "
-        "HEAD, an untracked one in full, an unchanged or unscoped one judges 0. repo "
-        "may be any directory under the checkout."),
+        "description": ("Checks an edited file by rescore --gate's rule: each changed function's "
+        "ccn against its scope's ceiling, pardoned only while its crap is at or under its "
+        "ratchet mark. The hook's commit gate pardons any marked function, so this is "
+        "stricter and a breach predicts a verify refusal. Call it after an edit once "
+        "get_function_brief states the rule. It runs no tests, and a breach reads gate.ok "
+        "false, not an error. Marks are read only on a breach, so a clean gate skips a "
+        "broken marks file. A tracked file is judged on its diff from HEAD, an untracked "
+        "one in full."),
         "properties": {
             "path": {
                 "type": "string",
-                "description": "repo-relative source file to judge as edited"}},
+                "description": ("repo-relative, or absolute inside repo, source file to judge "
+                "as edited. Outside the repo or missing answers a config error, and an "
+                "unchanged or unscoped file judges 0. repo may be any directory under the "
+                "checkout, and path stays relative to the root it walks up to.")}},
         "output": {
             "schema": {
                 "type": "integer",
@@ -1367,8 +1371,8 @@ TOOLS: tuple[dict, ...] = (
                         "description": "the failing functions; empty when ok",
                         "items": {
                             "type": "object",
-                            "description": ("one judged function over its ceiling that no ratchet "
-                            "mark covers"),
+                            "description": ("one judged function over its ceiling, unmarked or "
+                            "with its crap past its ratchet mark"),
                             "properties": {
                                 "path": {
                                     "type": "string",
@@ -1654,7 +1658,7 @@ _INSTRUCTIONS = (
     "coverage); an unmeasured repo answers with a one-line pointer instead of data. Start "
     "with get_next_item for one function to fix, list_worklist for the whole ranking, "
     "get_function_brief for everything about one function, and check_gate after an edit to "
-    "learn whether the file clears the commit gate.")
+    "learn whether the file clears rescore --gate, which is stricter than the commit hook.")
 
 
 def _negotiated(params: dict) -> str:

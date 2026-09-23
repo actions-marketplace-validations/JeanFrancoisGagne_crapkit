@@ -255,34 +255,58 @@ Three cases:
 
 ```
 $ crapkit verify
-crapkit: ratchet marks were recorded under [crapkit-analysis=7 lizard=1.24.0] but this run measures [crapkit-analysis=8 lizard=1.24.0] — CRAP scores are not comparable across metric versions; re-baseline with `crapkit ratchet seed`
+crapkit: ratchet marks were recorded under [crapkit-analysis=7 lizard=1.24.0] but this run measures [crapkit-analysis=8 lizard=1.24.0] — CRAP scores are not comparable across metric versions; run `crapkit coverage`, then re-baseline with `crapkit ratchet seed`
 EXIT=3
 ```
 
 ```
 $ crapkit verify
-warning: crapkit-ratchet.tsv carries no metric stamp (written before stamping) — re-baseline with `crapkit ratchet seed` to stamp it
+warning: crapkit-ratchet.tsv carries no metric stamp (written before stamping) — run `crapkit coverage`, then re-baseline with `crapkit ratchet seed` to stamp it
 verify OK @ 525a3276065 vs baseline 525a3276065 (1 changed files)
 EXIT=0
 ```
 
-After their identity checks pass, `ratchet seed` and `prune` rewrite the stamp to the
-running metric. An upgrade that changes which functions a reader finds needs a reviewed
-mapping first; fresh coverage alone cannot supply it. See
-[same-line function identity](#same-line-function-identity). An explicit move preserves
-both stamps. The merge driver writes the stamps both sides already shared, so two legacy
-sides stay legacy.
+Every write to the marks file sets the stamp by where its numbers came from:
 
-Upgrading lizard changes the stamp, so the next comparison refuses existing marks.
-Reseeding can update compatible marks; changed function membership needs the identity
-review below first.
+| Write | Metric stamp it leaves |
+|---|---|
+| `ratchet seed` | The metric the run it read was measured under. The only write that replaces a recorded metric stamp. |
+| `ratchet prune`, `ratchet move`, the merge driver | The recorded stamp. None of them adds a number. A marks file prune creates holds no mark and takes the running metric. |
+| `verify`'s tighten, `verify --override` | The running metric. Marks another metric recorded are refused before the lanes run; a file written before stamping gains its stamp. |
+| The pre-commit hook's override | The recorded stamp. A marks file it creates takes the running metric. |
+
+Seed and prune run their identity checks first. An upgrade that changes which functions a
+reader finds needs a reviewed mapping first; fresh coverage alone cannot supply it. See
+[same-line function identity](#same-line-function-identity). The merge driver writes the
+stamps both sides already shared, so two legacy sides stay legacy.
+
+Upgrading lizard or the analysis version changes the running metric, so the next comparison
+refuses existing marks. Run `crapkit coverage` first, then `ratchet seed`: a seed from a run
+the older version measured signs the older metric, and verify keeps refusing. The seed line
+says so, and prune's line names the run's metric the same way:
+
+```
+$ crapkit ratchet seed
+crapkit-ratchet.tsv: added 0, tightened 0 - 2 mark(s) vs run 9 (4a06338604a); run 9 was measured under [crapkit-analysis=9 lizard=1.24.0], not this crapkit's [crapkit-analysis=10 lizard=1.24.0], so verify refuses these marks until a fresh `crapkit coverage` and another seed
+```
+
+A run stored before crapkit recorded its metric vouches for none, and seed refuses it:
+
+```
+$ crapkit ratchet seed
+crapkit: ratchet seed: run 3 recorded no metric (analysis version and lizard), so the marks it measured cannot be stamped; run `crapkit coverage` and seed again
+EXIT=3
+```
+
+Reseeding from a fresh run can update compatible marks; changed function membership needs
+the identity review below first.
 
 ### Upgrading to 0.4.5: analysis version 8
 
-This historical transition changed analysis version 7 to 8. The transcript above
-belongs to that upgrade; the current reader uses version 10. Follow
+This historical transition changed analysis version 7 to 8. The verify refusal quoted
+above belongs to that upgrade; the current reader uses version 10. Follow
 [Upgrading](upgrading.md) for current saved-state checks. In the older transition,
-reseeding updated the stamp as follows:
+reseeding from a fresh coverage run updated the stamp as follows:
 
 ```
 $ crapkit ratchet seed
@@ -296,8 +320,8 @@ What version 8 changed is one rule: shell cognitive complexity now nests, becaus
 `done` and `esac` close a level. A 4-deep `if` in a `.sh` file reads 10, the way it does in
 every other language crapkit scans, instead of 4. So **cognitive numbers move in shell
 files and nowhere else, and ccn does not move at all.** CRAP is built from ccn and coverage,
-so the marks themselves land where they landed before; the re-seed is the stamp catching up,
-not a repricing of the debt.
+so the marks themselves land where they landed before; the re-seed from a run measured under
+version 8 is the stamp catching up, not a repricing of the debt.
 
 A repo with no shell in it still has to re-seed. The stamp records the rules the numbers
 were measured under, not which of them a given file exercised.
@@ -376,6 +400,12 @@ EXIT=3
 
 `move` needs no run and no store; it reads the file and rewrites it.
 
+Both paths are read like every other path argument, so the marks land under the key a
+scored row carries. `./calc/grading.py` and, on Windows, `calc\grading.py` name
+`calc/grading.py`. Typed from a directory below the root, a path is read from there: in
+`calc/`, `crapkit ratchet move grade.py grading.py` is the first example above. Under
+`--repo` the paths stay root-relative. The line names the paths as the marks file spells them.
+
 ---
 
 ## The git merge driver
@@ -436,7 +466,7 @@ conflict for you to resolve after re-seeding one side:
 
 ```
 $ git merge legacy
-crapkit: ratchet merge refused: ours is [crapkit-analysis=8 lizard=1.24.0] and theirs is [unstamped] — marks from different metric versions cannot merge; re-baseline one side with `crapkit ratchet seed`
+crapkit: ratchet merge refused: ours is [crapkit-analysis=8 lizard=1.24.0] and theirs is [unstamped] — marks from different metric versions cannot merge; run `crapkit coverage`, then re-baseline one side with `crapkit ratchet seed`
 Auto-merging crapkit-ratchet.tsv
 CONFLICT (content): Merge conflict in crapkit-ratchet.tsv
 Automatic merge failed; fix conflicts and then commit the result.
@@ -688,6 +718,20 @@ The hook path never raises an existing mark. It has no coverage data, so it synt
 worst-case score, and letting that overwrite a real measurement would blind the ratchet to a
 later coverage collapse. A prior tighter mark stays, and the next `verify` still demands
 repayment.
+
+The hook path leaves the metric stamp alone too. Its score comes from ccn alone and it compares
+no mark, so a marks file stamped under an older metric keeps that stamp, and the next `verify`
+still refuses it until a fresh `crapkit coverage` and `crapkit ratchet seed` re-baseline the
+marks. A marks file the grant creates takes the stamp of the crapkit that ran it. A
+`verify --override` grant is measured, so marks another metric recorded refuse it the way they
+refuse `verify` itself.
+
+The kept stamp also decides whether the hook can grant an anonymous JavaScript or TypeScript
+callback. Under a stamp older than analysis version 10, the `(anonymous)` mark the grant adds
+has no reader proof, and every later reader would refuse the file (see
+[same-line function identity](#same-line-function-identity)). So the hook refuses that grant
+and writes no alert line, no store row and no mark. The grant is refused until
+`crapkit coverage` and `crapkit ratchet seed` restamp the file.
 
 An empty reason is refused. Runs an override names are pinned in the store: `runs prune`
 never deletes them.

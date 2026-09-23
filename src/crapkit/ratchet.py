@@ -19,6 +19,7 @@ import math
 from typing import NamedTuple
 
 from .invocation import _self
+from .keys import split_ordinal
 from .score import ScoredRow
 from .records import decode_record, encode_record, record_lines
 
@@ -41,9 +42,15 @@ class TightenRefusal(NamedTuple):
     fresh: float
 
 
-def stamp_text(analysis_version: int, lizard_version: str) -> str:
+def stamp_text(analysis_version: int | str, lizard_version: str) -> str:
     """The metric identity a set of marks was measured under, as one line."""
     return f"crapkit-analysis={analysis_version} lizard={lizard_version}"
+
+
+def run_stamp(tool_versions: dict) -> str:
+    """The metric a stored run was measured under; "" for a run that recorded none."""
+    analysis, lizard = tool_versions.get("analysis_version"), tool_versions.get("lizard")
+    return stamp_text(analysis, lizard) if analysis and lizard else ""
 
 
 def metric_version() -> str:
@@ -83,8 +90,6 @@ def _key_stamps(text: str) -> list[str]:
 
 
 def _marked_group(entry: RatchetEntry, groups: set) -> tuple[str, str]:
-    from .keys import split_ordinal
-
     exact = (entry.path, entry.long_name)
     return exact if exact in groups else (entry.path, split_ordinal(entry.long_name)[0])
 
@@ -121,14 +126,18 @@ def check_key_groups(text: str, present: set, collisions: set) -> int:
     version = read_key_version(text)
     if version == KEY_VERSION:
         return version
-    groups = {_marked_group(entry, present | collisions) for entry in read_ratchet(text)[0]}
-    unresolved = groups & collisions
+    known = present | collisions  # once: a union per mark copied `present` 40k times
+    groups = {_marked_group(entry, known) for entry in read_ratchet(text)[0]}
+    _refuse_ambiguous(groups & collisions)
+    return KEY_VERSION if groups <= present else 0
+
+
+def _refuse_ambiguous(unresolved: set) -> None:
     if unresolved:
         names = "; ".join(f"{path}: {name}" for path, name in sorted(unresolved))
         raise ValueError(f"legacy ratchet key identity is ambiguous for {names}; "
                          "preserve these marks and reconcile their function mapping "
                          "as described in docs/ratchet.md#same-line-function-identity")
-    return KEY_VERSION if groups <= present else 0
 
 
 def checked_key_version(text: str, rows, *, historical: set = frozenset()) -> int:
@@ -147,7 +156,17 @@ def stamp_conflict(recorded: str, current: str) -> str | None:
         return None
     return (f"ratchet marks were recorded under [{recorded}] but this run measures "
             f"[{current}] — CRAP scores are not comparable across metric versions; "
-            f"re-baseline with `{_self()} ratchet seed`")
+            f"{coverage_then_seed()}")
+
+
+def coverage_then_seed(rebaseline: str = "re-baseline") -> str:
+    """The remedy every stamp refusal prints: a fresh run, then the seed.
+
+    Seed stamps the metric of the run it reads. Right after an upgrade the
+    newest run is the older crapkit's, so seed alone kept the old stamp and
+    verify refused again.
+    """
+    return f"run `{_self()} coverage`, then {rebaseline} with `{_self()} ratchet seed`"
 
 
 def _comment(line: str) -> bool:
@@ -226,12 +245,11 @@ def mark_for(entries: list[RatchetEntry], path: str, long_name: str) -> float | 
     return None
 
 
-def dump_ratchet(entries: list[RatchetEntry], *, stamp: str | None = None,
-                 key_version: int = 0) -> str:
-    """`stamp` None takes the running metric; a version string is written verbatim
-    and "" writes none, which is how the merge driver keeps two legacy sides legacy."""
-    version = metric_version() if stamp is None else stamp
-    lines = [f"# {version}"] if version else []
+def dump_ratchet(entries: list[RatchetEntry], *, stamp: str, key_version: int = 0) -> str:
+    """`stamp` is written verbatim, and "" writes none. No default: a writer that
+    stamped by omission relabeled marks another metric recorded, so the choice
+    belongs to `ratchetfile.RatchetFile`'s stamp rules."""
+    lines = [f"# {stamp}"] if stamp else []
     if key_version:
         lines.append(f"{_KEY_STAMP}{key_version}")
     lines.append(_HEADER)

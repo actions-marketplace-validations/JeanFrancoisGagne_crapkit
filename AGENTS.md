@@ -50,7 +50,9 @@ promise filesystem read-only execution.
 
 Read commands need a run in the store and exit 1 with the command that makes one when
 there is none (`next-item` and `brief` say `no scored run in <root> — run \`crapkit
-coverage\` first`; `worklist` says `no snapshot`). Run what the message names, then retry.
+coverage\` first`; `worklist` says `no run with rows`, and every one of them says
+`no snapshot` when `.crapkit/crap.sqlite` does not exist). Run what the message names,
+then retry.
 
 ## 1. The packet
 
@@ -70,14 +72,14 @@ do next.
 | `handle` | the name to pass back to `brief`, `explain` and `claims release`. It survives your own edit; `start` does not |
 | `remedy` | `decompose`, `split-lines`, `add-tests` or `ok`, at the top level: the same verdict `next-item` prints |
 | `est_splits`, `est_uncovered_paths` | the same two budget numbers `next-item` prints, out of the same code |
-| `params` | its parameter names in order, so a new test can call it without opening the file |
+| `params` | its parameters in order, each `{name, type}`, so a new test can call it without opening the file |
 | `notes` | the repo's and the scope's house rules, carried in from crapkit.toml |
-| `gate_rule` | `ceiling` is the number step 3 judges ccn against, `binds` names which limit fires first |
+| `gate_rule` | `ceiling` is the number step 3 judges ccn against; `binds` is the gate's scope rule as one fixed sentence: print it, do not branch on it |
 | `commands` | the literal strings for steps 3, 4 and 5, plus `refresh` and `refresh_writes_run` |
 | `stale` | `true` means the run predates HEAD: run `commands.refresh` before trusting `cov` |
 | `file_functions`, `file_totals` | the siblings an extracted helper lands beside, and the file's rollup |
 | `regrowth` | `regrown: true` says an earlier decomposition of this function did not hold |
-| `attempts` | sessions that already claimed it. Above 0, read `regrowth.history` before repeating their split |
+| `attempts` | every claim already taken on it, oldest first. Not empty: read `regrowth.history` before repeating their split |
 | `coupling` | files that keep landing in the same commits: edit them in this session or not at all. `is_test: true` marks the ones outside the scored corpus |
 | `duplication_twins` | near-duplicates. `contained: true` means one already fits inside the other, so one can call the other |
 | `uncovered_lines` | the exact lines to cover, same null-vs-`[]` contract as next-item |
@@ -131,7 +133,9 @@ exits 1:
 
 `{"schema": 1, "run_id": ..., "commit": ..., "stale": ..., "packets": [...]}`: the top N
 of the queue as N packets, `crap` descending, built from one read of the store, the
-churn log and the ratchet file. Hand one packet to one session.
+churn log and the ratchet file. Hand one packet to one session. A function another
+session holds under `next-item --claim` is skipped, as `next-item` skips it, and the
+envelope then carries `skipped_claimed`, the count of rows a claim hid.
 
 ## 2. Do the work
 
@@ -581,14 +585,15 @@ Twelve tools, every one the CLI command's `--json` form:
 
 Arguments are checked against the served schema before the CLI spawns. `tools/list`
 carries `required` from each tool's positionals, and a missing positional, an undeclared
-key or a wrong type answers a tool result with `isError` true, in the tool's words
-(`brief needs name (see inputSchema.required)`), not a `-32602` protocol error; ADR 0001
-under `docs/adr/` says why. `ping` answers `{}`. An exception escaping the server answers
-`-32603` and the loop continues. `structuredContent` rides beside the text whenever the
-CLI exited 0; a `doctor` that finds a FAIL exits 1 and answers its JSON text with
-`isError: true` and no `structuredContent`. `gate` is the one tool whose non-zero exit is
-an answer: exit 6 (a breach) comes back with `isError: false`, `structuredContent` and
-`gate.ok` false; exits 3, 4 and 5 stay tool errors, as does 1 (no scored run yet).
+key or a wrong type answers a tool result with `isError` true, naming the MCP tool rather
+than the CLI command behind it (`get_function_brief needs name (see inputSchema.required)`),
+not a `-32602` protocol error; ADR 0001 under `docs/adr/` says why. `ping` answers `{}`.
+An exception escaping the server answers `-32603` and the loop continues.
+`structuredContent` rides beside the text whenever the CLI exited 0; a `doctor` that finds
+a FAIL exits 1 and answers its JSON text with `isError: true` and no `structuredContent`.
+`check_gate` is the one tool whose non-zero exit is an answer: exit 6 (a breach) comes
+back with `isError: false`, `structuredContent` and `gate.ok` false; exits 3, 4 and 5 stay
+tool errors, as does 1 (no scored run yet).
 
 The tools inspect scores and source without running test suites or editing source files.
 Calls can write caches, initialize or migrate the snapshot store, and fill rollups.

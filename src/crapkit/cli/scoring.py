@@ -566,12 +566,57 @@ def _emit_coverage_findings(root: Path, args, scored, cfg) -> None:
                    over_target_results(scored, cfg.scope_targets, cfg.target))
 
 
+# The named source past which loading the shared cache costs less than lizard.
+# On a large consumer repo lizard reads 0.3 to 2.1 ms a KB in process (median
+# 1.1 on its 15 largest files, 1.4 on 15 median-sized ones), and loading the
+# 21.8 MB cache takes 0.36 to 0.41 s on a quiet machine: 256 KB is about that
+# load at the 1.4 ms rate. End to end there, three unchanged files of 194 KB
+# ran 0.55 s faster outright than through the cache, while outright cost the
+# fifteen largest (1.1 MB) 0.65 s and the eight largest (640 KB) 0.14 s.
+_RESCORE_OUTRIGHT_BYTES = 256 * 1024
+
+
+def _outright_sized(root: Path, flat: list) -> bool:
+    """Few enough files for the hook's rule, and few enough bytes that lizard on
+    them costs less than loading the cache would."""
+    from ..hook import commit_sized
+
+    return commit_sized(flat) and sum(map(_file_sizer(root), flat)) < _RESCORE_OUTRIGHT_BYTES
+
+
 def _rescored_records(root: Path, cache_path: Path, flat: list,
                       workers: int | None = None, worker_budget: int = 0) -> dict:
+    """Fresh records for `flat`.
+
+    A few small files are analyzed outright and the shared cache is neither read
+    nor written: loading a 21.8 MB cache costs 0.41 s and rewriting it after an
+    edit 0.17 s more, against 3 to 7 ms of lizard for a median-sized file and
+    24 to 123 ms for one of 58 to 89 KB. Past the hook's file threshold or
+    _RESCORE_OUTRIGHT_BYTES the cache is the cheaper read. The next inventory
+    analyzes those few files once.
+    """
+    if _outright_sized(root, flat):
+        return _records_in_process(root, flat)
+    return _cached_records(root, cache_path, flat, workers, worker_budget)
+
+
+def _records_in_process(root: Path, flat: list) -> dict:
+    """Records for `flat` from the per-file analysis the cache path runs on a
+    miss, in this process and with no cache: the same read, hash check, decode
+    and reader chain, and the notes that path prints for a miss. Every file
+    here is one, so a file with twin names prints its note on every run."""
+    from ..analyze import analyze_jobs, content_hash
+
+    jobs = [(str(root / rel), rel) for rel in flat]
+    return analyze_jobs(jobs, workers=1, hashes={rel: content_hash(root / rel) for rel in flat})
+
+
+def _cached_records(root: Path, cache_path: Path, flat: list,
+                    workers: int | None, worker_budget: int) -> dict:
     """Fresh records for `flat`, folded INTO the shared cache rather than over it.
 
-    A rescore knows about a handful of files; writing its entry map straight out
-    would throw away every other file's analysis and leave the next full run cold.
+    Writing the rescore's own entry map straight out would throw away every
+    other file's analysis and leave the next full run cold.
     """
     _, analyze_files, load_cache, save_cache = _analysis_tools()
     prior = load_cache(cache_path)
@@ -595,18 +640,18 @@ def _refuse_missing(root: Path, rel_paths: list) -> None:
 
 def _rescore_analyze(root: Path, cfg, files, cwd: Path | None = None) -> tuple[list, list, dict]:
     """Fresh complexity for the named files, said from `cwd` where the user
-    stands; the shared cache is merged, never truncated."""
+    stands. A commit's worth of files leaves the shared cache alone; more are
+    merged into it, never truncated."""
     from ..hook import file_ceilings
 
     rel_paths = sorted({_repo_relative(p, root, cwd) for p in files})
     _refuse_missing(root, rel_paths)
     files_by_scope = assign_files(rel_paths, cfg, size_of=_file_sizer(root))
-    flat = sorted(set().union(*files_by_scope.values())) if files_by_scope else []
+    flat = _tracked_files(files_by_scope)
     records_by_path = _rescored_records(root, root / ".crapkit" / "cache.json", flat,
                                         _analysis_workers(cfg), cfg.analysis_worker_budget)
-    by_scope = {scope: [r for f in scope_files for r in records_by_path[f]]
-                for scope, scope_files in files_by_scope.items()}
-    return build_inventory_rows(by_scope), flat, file_ceilings(cfg, files_by_scope, flat)
+    rows = build_inventory_rows(_records_by_scope(files_by_scope, records_by_path))
+    return rows, flat, file_ceilings(cfg, files_by_scope, flat)
 
 
 def _baseline_rows(store: SnapshotStore, run_id: int, flat: list) -> list:
@@ -738,13 +783,27 @@ class _GateVerdict(NamedTuple):
         return not self.breaches
 
 
+def _unpardoned_breaches(root: Path, cfg, overlay, touched: list) -> list:
+    """The touched breaches no ratchet mark pardons, reading the marks only
+    when there is a breach to pardon.
+
+    hook-precommit follows the same rule. On a large consumer repo the read
+    cost a clean gate several seconds, most of it proving legacy ratchet keys
+    against every stored run. The trade: a clean gate no longer reports a marks
+    file it cannot parse, and the next gate that breaches still does.
+    """
+    if not touched:
+        return []
+    return _unmarked_breaches(touched, _ratchet_entries(root, cfg, overlay) or [])
+
+
 def _gate_verdict(root: Path, cfg, overlay, ceilings: dict[str, int]) -> _GateVerdict:
     from ..keys import key_names
 
     untracked = _untracked_of(root, overlay)
     candidates = _gate_candidates(root, overlay) + [r for r in overlay if r.path in untracked]
     touched = _ceiling_breaches(candidates, ceilings, key_names(overlay))
-    breaches = _unmarked_breaches(touched, _ratchet_entries(root, cfg, overlay) or [])
+    breaches = _unpardoned_breaches(root, cfg, overlay, touched)
     return _GateVerdict(len(candidates), ceilings, breaches, sorted(untracked))
 
 

@@ -143,8 +143,9 @@ ok   lizard 1.24.0
 doctor: 1 problem(s)
 ```
 
-The probe is memoized on the word, so a repo declaring 14 lanes over 2 runners starts two
-processes, not fourteen.
+The probe runs from the lane's `cwd` with its `env` merged in, the way the lane itself
+starts, and is memoized on the word and that directory and environment, so a repo declaring
+14 lanes over 2 runners from one directory starts two processes, not fourteen.
 
 ---
 
@@ -276,6 +277,7 @@ $ ls .crapkit .crapkit/cov
 artifacts.json
 cache.json
 churn-cache-v2.json
+churn-commits-v1.json
 churn-log-v2.json
 churn-log-v2.z
 coupling-cache-v1.json
@@ -298,7 +300,8 @@ py.json
 | `cache.json` | Analysis records per file, so an unchanged file is not re-analyzed. | The file's content hash, under a fingerprint of the lizard pin and the analysis version. |
 | `stat-stamps.json` | What the last run saw for each file (mtime, size, hash), so unchanged files are not re-hashed. | |
 | `churn-cache-v2.json` | Per-file churn for the window: commits, authors, weight. | HEAD sha, window months, today's UTC date, path format. |
-| `churn-log-v2.z` | The window's `git log --name-only` output, deflated, with its key in `churn-log-v2.json` beside it. | Same four fields. |
+| `churn-commits-v1.json` | The window's commits: each one's author, author date and commit date, and each path's commits. Read only when the churn map misses; a HEAD that grew from it walks only the new commits. Not kept in a shallow clone. | HEAD sha, window months, path format and the --since cutoff its commits were cut at, plus the body's size and CRC. |
+| `churn-log-v2.z` | The window's `git log --name-only` output, deflated, with its key in `churn-log-v2.json` beside it. | Same four fields. The key also records the --since cutoff the log was cut at; a refresh below it walks the window again. |
 | `coupling-cache-v1.json` | Ranked co-change pairs at the default thresholds, ordered and uncut. | The churn map's key plus a digest of the tracked set. |
 | `mutate-pool/` | Kept worktrees for every mutation worker, including one. See [mutation worktrees](configuration.md#mutation-worktrees). | |
 | `mutate-tmp/` | Recognized concurrent mutation runs, removed after completion or recovered under an exclusive lease. | |
@@ -516,10 +519,11 @@ A lane that reaches `crapkit coverage` with the plugin still missing gets the sa
 the refusal: the package has to land in the environment the SUITE runs in, not in the shell's
 active venv. Before 0.4.12 it read `pip install pytest-cov` and named no environment at all,
 so a reader whose lane ran its own venv installed the package where it changed nothing. The
-refusal binds the install to an interpreter under the same condition the probe uses — the
-lane starts with the word that runs pytest, and that word is a python — so
-`python -m pytest --cov` earns `python -m pip install pytest-cov` while `uv run pytest --cov`
-and `coverage run -m pytest --cov=pylib` name the environment and stop there. Neither `uv`
+refusal binds the install to an interpreter under the same condition the probe uses: the
+step that runs pytest starts with a python. So `python -m pytest --cov` and
+`cd web && python -m pytest --cov` earn `python -m pip install pytest-cov`, while
+`uv run pytest --cov` and `coverage run -m pytest --cov=pylib` name the environment and stop
+there. Neither `uv`
 nor `coverage` has a `-m pip install`, and a reader who runs one gets a second, unrelated
 failure.
 
@@ -962,12 +966,16 @@ which is what [refuses that file on reuse](#the-artifact-a-failed-attempt-left-b
 | Flag | Behavior |
 |---|---|
 | `--reuse-artifacts` | Skip every lane command, parse whatever is on disk, except the artifact a lane's last attempt failed to write: that one is refused (exit 5) until something rewrites it. Warns per lane when files under that lane's scopes changed since the stamp. |
-| `--reuse-unchanged` | Reuse a lane only at the same clean HEAD, with unchanged lane settings, `crapkit.toml` bytes, inherited environment and coverage/JUnit bytes. Otherwise run it again. A failed attempt that wrote no artifact always reruns. |
+| `--reuse-unchanged` | Reuse a lane only when its stamp proves nothing it reads changed; otherwise run it again. A lane without `inputs` needs the same clean HEAD, unchanged lane settings, `crapkit.toml` bytes, inherited environment and coverage/JUnit bytes. A lane with `inputs` needs its artifact's commit still behind HEAD, no change under those paths, its own lane table and `env` unchanged, and the same coverage/JUnit bytes. A failed attempt that wrote no artifact always reruns. |
 
-Automatic reuse covers the whole tracked tree, including tests and shared helpers.
-Any tracked or untracked change, or a new commit, reruns the lane. Measurements
-made from a dirty tree and older stamps without this proof cannot be reused
-automatically. Environment values are hashed together; stamps do not store them.
+Without `inputs`, automatic reuse covers the whole tracked tree, including tests and
+shared helpers: any tracked or untracked change, or a new commit, reruns the lane.
+With [`inputs`](configuration.md#lane) it covers exactly those paths, literal paths
+from the root with no globs, so a docs commit or an untracked draft elsewhere reruns
+nothing, and a file the command reads that the list leaves out is never checked.
+Measurements made while their proof did not hold (a dirty tree, or dirty inputs)
+and older stamps without this proof cannot be reused automatically. Environment
+values are hashed together; stamps do not store them.
 
 Ignored inputs other than `crapkit.toml`, files outside the repository, installed
 dependencies and services are outside that proof. Run fresh coverage when those

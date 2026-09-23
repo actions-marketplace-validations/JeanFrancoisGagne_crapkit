@@ -78,6 +78,14 @@ def _materialized(tmp: Path, blobs: dict[str, bytes]) -> list[tuple[str, str]]:
     return jobs
 
 
+def commit_sized(paths) -> bool:
+    """A commit's worth of files: few enough to analyze in this process, with no
+    pool and no cache, because lizard on each costs less than either would.
+    `rescore` asks the same question of the files it names, and adds a byte
+    budget of its own for large files."""
+    return len(paths) < _HOOK_POOL_THRESHOLD
+
+
 def staged_records(blobs: dict[str, bytes], *, worker_budget: int = 0) -> dict[str, list]:
     """Records for the staged blobs, pooled once a commit touches enough files.
 
@@ -86,7 +94,7 @@ def staged_records(blobs: dict[str, bytes], *, worker_budget: int = 0) -> dict[s
     read them back costs a write and a read per file. The pooled arm still
     materializes, because a worker process reads its own files.
     """
-    if len(blobs) < _HOOK_POOL_THRESHOLD:
+    if commit_sized(blobs):
         return {rel: analyze_source(rel, decode_source(blob))
                 for rel, blob in sorted(blobs.items())}
     with tempfile.TemporaryDirectory() as tmp:

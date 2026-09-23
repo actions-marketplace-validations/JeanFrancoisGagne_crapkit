@@ -20,6 +20,7 @@ from conftest import cli_runner
 CRAPKIT = Path(".crapkit")
 LOG_Z = CRAPKIT / "churn-log-v2.z"
 LOG_KEY = CRAPKIT / "churn-log-v2.json"
+WINDOW_CUTOFF = ("--since", "--max-age")
 COUPLING_CACHE = CRAPKIT / "coupling-cache-v1.json"
 
 APP_PY = """def plain(x):
@@ -116,7 +117,9 @@ def _subcommand(argv: list[str]) -> str:
 
 
 def window_walks(walks: list[list[str]]) -> list[list[str]]:
-    return [argv for argv in walks if any(a.startswith("--since") for a in argv)]
+    """Walks cut at the window cutoff: --max-age when crapkit read the cutoff
+    first, --since when git named none."""
+    return [argv for argv in walks if any(a.startswith(WINDOW_CUTOFF) for a in argv)]
 
 
 def range_walks(walks: list[list[str]]) -> list[list[str]]:
@@ -165,17 +168,22 @@ def test_brief_really_reports_coupling(coupled_repo):
 
 
 def test_the_cached_log_is_the_log_git_streams(coupled_repo):
-    """The contract under every byte-identity claim: same lines as the git door
-    this one caches, cold and warm alike."""
-    from crapkit.churn_log import log_lines
-    from crapkit.gitio import churn_log_lines
+    """The contract under every byte-identity claim: the lines git prints for
+    the window in the stored format, cold and warm alike."""
+    from crapkit.churn_log import LOG_FORMAT, log_lines
 
-    from_git = [line.rstrip("\n") for line in churn_log_lines(coupled_repo, 12)]
+    raw = subprocess.run(["git", "-c", "diff.relative=true", "-c", "core.quotePath=false",
+                          "log", "--relative", "--since=12 months ago", LOG_FORMAT,
+                          "--name-only"], cwd=coupled_repo, capture_output=True, check=True,
+                         text=True, encoding="utf-8").stdout
+    from_git = raw.split("\n")[:-1]
     cold = [line.rstrip("\n") for line in log_lines(coupled_repo, 12)]
     warm = [line.rstrip("\n") for line in log_lines(coupled_repo, 12)]
 
     assert cold == from_git
     assert warm == from_git
+    assert all(line.count("\x02") == 2 for line in cold if line.startswith("\x01")), \
+        "every header keeps its author date and commit date"
 
 
 def test_batches_answer_from_the_log_without_walking_history(coupled_repo, tmp_path):

@@ -36,6 +36,25 @@ def _scored_store(root: Path) -> tuple[SnapshotStore, dict]:
     return store, latest
 
 
+def _judged_today(rows: list, cfg, rows_of) -> list:
+    """The rows with the remedy today's ceiling gives each one.
+
+    `target` and the budget come from the crapkit.toml on disk, so the remedy
+    printed beside them has to as well, or an uncommitted ceiling edit prints
+    `ok` next to `est_splits: 2` and the queue never offers the function.
+    `rows_of(path)` is a file's rows, read only when a shared span is in doubt.
+    """
+    ceilings = {scope: cfg.ceiling_of(scope) for scope in {r.scope for r in rows}}
+    return [packet.rejudged(r, ceilings[r.scope], rows_of) for r in rows]
+
+
+def _file_reader(store, run_id: int):
+    """One scored-file read per path, kept, for the rows that need neighbours."""
+    from functools import lru_cache
+
+    return lru_cache(maxsize=None)(lambda path: store.read_scored_file(run_id, path))
+
+
 def _pushdown_floor(cfg) -> int:
     """The lowest ccn next-item's SQL read may skip.
 
@@ -52,7 +71,9 @@ def cmd_next_item(args: argparse.Namespace) -> int:
     cfg = _load_repo_config(root)
     scopes = _scope_names(cfg, args.scope)
     store, latest = _scored_store(root)
-    scored = store.read_scored(latest["id"], min_ccn=_pushdown_floor(cfg), scopes=scopes)
+    scored = _judged_today(store.read_scored(latest["id"], min_ccn=_pushdown_floor(cfg),
+                                             scopes=scopes),
+                           cfg, _file_reader(store, latest["id"]))
     adm = admission(load_churn(root, cfg.churn_window_months), cfg.worklist_floor)
     ranked, skipped_no_lane = _next_ranked(scored, adm)
     excludes = args.exclude or []
@@ -65,7 +86,7 @@ def cmd_next_item(args: argparse.Namespace) -> int:
     head = _next_head(latest, skipped_no_lane, skipped_claimed + conflicts,
                       latest["commit"] != commit)
     _emit_next(store, head, ranked, args.top, adm, cfg, scored, excludes, scopes,
-               load_uncovered(root, cfg), handles)
+               lambda: load_uncovered(root, cfg), handles)
     return 0
 
 
@@ -191,19 +212,23 @@ def _next_reasons(store, run_id: int, ranked: list, scored, adm, cfg,
 
 
 def _emit_next(store, head: dict, ranked, top: int, adm, cfg, scored,
-               excludes: list, scopes: list, uncovered, handles=None) -> None:
+               excludes: list, scopes: list, load_lines, handles=None) -> None:
+    """`load_lines` reads the lane artifacts' dark lines, and only an item
+    prints them: an empty queue never parses an artifact or asks git whether a
+    lane's sources moved, which was nearly all of an empty call's time."""
     if not _actionable(ranked):
         head.update(empty=True,
                     reasons=_next_reasons(store, head["run_id"], ranked, scored, adm, cfg,
                                           excludes, scopes))
     elif top > 1:
+        uncovered = load_lines()
         head.update(empty=False,
                     items=[_next_item_payload(r, adm, cfg, uncovered, _handle(handles, r))
                            for r in _claimable(ranked, top)])
     else:
         first = _claimable(ranked, 1)[0]
         head.update(empty=False,
-                    item=_next_item_payload(first, adm, cfg, uncovered,
+                    item=_next_item_payload(first, adm, cfg, load_lines(),
                                             _handle(handles, first)))
     _print_json(head)
 
@@ -578,8 +603,10 @@ class _BriefLoader:
         return self._once("versions", _brief_versions)
 
     def scored_file(self, path: str) -> list:
+        """One file's rows, each judged against today's ceiling for its scope."""
         if path not in self._scored_files:
-            self._scored_files[path] = self.store.read_scored_file(self.latest["id"], path)
+            stored = self.store.read_scored_file(self.latest["id"], path)
+            self._scored_files[path] = _judged_today(stored, self.cfg, lambda _path: stored)
         return self._scored_files[path]
 
     def key(self, row) -> tuple[str, str]:
@@ -722,11 +749,6 @@ def _brief_packet(loader, row) -> dict:
     }
 
 
-def _brief_payload(root: Path, cfg, store: SnapshotStore, latest: dict, row) -> dict:
-    """One packet for a caller holding a repo and a row rather than a loader."""
-    return _brief_packet(_BriefLoader(root, cfg, store, latest), row)
-
-
 def _mark_text(mark: float | None) -> str:
     return "none" if mark is None else f"{mark:.4f}"
 
@@ -783,12 +805,19 @@ def _resolve_batch(requested: int) -> int:
     return requested
 
 
-def _batch_rows(loader, count: int) -> list:
-    """The top N actionable queue items, admitted exactly as next-item admits them."""
-    scored = loader.store.read_scored(loader.latest["id"],
-                                      min_ccn=_pushdown_floor(loader.cfg))
+def _batch_rows(loader, count: int) -> tuple[list, int]:
+    """The top N actionable queue items, admitted exactly as next-item admits
+    them, and how many rows an open claim hid.
+
+    The claim filter is next-item's own: a function one session holds under
+    `next-item --claim` is not handed to another session inside a packet.
+    """
+    run_id = loader.latest["id"]
+    scored = _judged_today(loader.store.read_scored(run_id, min_ccn=_pushdown_floor(loader.cfg)),
+                           loader.cfg, loader.scored_file)
     ranked, _ = _next_ranked(scored, admission(loader.churn(), loader.cfg.worklist_floor))
-    return _actionable(ranked)[:count]
+    ranked, skipped_claimed = _unclaimed(loader.store, ranked, _Handles(loader.store, run_id))
+    return _actionable(ranked)[:count], skipped_claimed
 
 
 def _brief_batch(loader, count: int) -> dict:
@@ -797,12 +826,18 @@ def _brief_batch(loader, count: int) -> dict:
     A session that briefs its whole batch one command at a time pays for the
     store, the config, the churn window, the git log and every file text once
     per function. Here they are read once and every packet is cut from them.
+
+    `skipped_claimed` appears only when a claim hid something, as on next-item,
+    so a store nobody claims in emits the payload it always did.
     """
-    rows = _batch_rows(loader, count)
+    rows, skipped_claimed = _batch_rows(loader, count)
     loader.prime_attempts(rows)
-    return {"run_id": loader.latest["id"], "commit": loader.latest["commit"],
-            "stale": loader.stale(),
-            "packets": [_brief_packet(loader, row) for row in rows]}
+    out = {"run_id": loader.latest["id"], "commit": loader.latest["commit"],
+           "stale": loader.stale(),
+           "packets": [_brief_packet(loader, row) for row in rows]}
+    if skipped_claimed:
+        out["skipped_claimed"] = skipped_claimed
+    return out
 
 
 def _brief_target(args: argparse.Namespace) -> tuple[str, str]:
@@ -938,6 +973,10 @@ def _worklist_run(root: Path, store) -> dict:
     The fallback is the newest run with rows, for a repo that has only run
     `inventory`: next-item refuses that repo and a complexity-only ranking is
     still worth printing.
+
+    The store is open by now, so the refusal names the run that is missing
+    rather than the store: a store holding only hook runs used to read as
+    `no snapshot` with `.crapkit/crap.sqlite` on disk.
     """
     from ..store import default_baseline, rowful_runs
 
@@ -947,7 +986,7 @@ def _worklist_run(root: Path, store) -> dict:
     runs = rowful_runs(store)
     if runs:
         return runs[-1]
-    raise CrapkitError(f"no snapshot in {root} — run `{_self()} coverage` first "
+    raise CrapkitError(f"no run with rows in {root} — run `{_self()} coverage` first "
                        f"(or `{_self()} inventory` for complexity-only ranking, "
                        "with no coverage, flags or remedies)")
 

@@ -12,13 +12,19 @@ the copy worth having. The whole compressed file is read before the first line
 goes out (its CRC is the only way to know a log is not half-written); the 23 MB
 of text it holds never is.
 
-Two things are stored that the served lines do not carry. The commit date (%ct)
-rides along on every header line, so an aged-out commit can be expired without
-asking git; and the key records the HEAD the log was built from, so a HEAD that
-grew from it costs `git log cached..HEAD` instead of the window — 0.77 s instead
-of 6.9 s at a day-old HEAD, for the same 628k lines. Commit date is not author
-date: `--since` filters on the committer's clock while the recency weight uses
-the author's, and a rebased commit has two different ones.
+Two things are stored beyond the author and author date a churn header needs.
+The commit date (%ct) rides along on every header line, so an aged-out commit
+can be expired without asking git, and the lines are served that way: coupling
+only asks which lines open a commit and the churn parser reads either header
+shape, so no reader pays a pass to strip it. And the key records the HEAD the
+log was built from, so a HEAD that grew from it costs `git log cached..HEAD`
+instead of the window — 0.77 s instead of 6.9 s at a day-old HEAD, for the
+same 628k lines. Commit date is not author date: `--since` filters on the
+committer's clock while the recency weight uses the author's, and a rebased
+commit has two different ones. The key also records the cutoff the log was cut
+at, because that cutoff can move back: git's month arithmetic puts 6 months
+before Aug 31 on Mar 3 and before Sep 1 on Mar 1, and a log cut at the later
+cutoff cannot be re-dated to the earlier one.
 
 A cache is disposable. An unreadable, torn or unkeyable log reads as cold, never
 as a crash, and a HEAD the cached log is not an ancestor of (a rewind, a rebase,
@@ -29,12 +35,14 @@ from __future__ import annotations
 import codecs
 import json
 import zlib
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from datetime import datetime, timezone
+from functools import lru_cache
 from itertools import chain
+from operator import methodcaller
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import BinaryIO
+from typing import BinaryIO, NamedTuple
 
 from .errors import GitError
 from .gitio import _git_lines, head_commit, is_ancestor
@@ -49,6 +57,11 @@ LOG_NAME = "churn-log-v2.z"
 LEGACY_NAME = "churn-log.z"
 LOG_FORMAT = "--format=%x01%an%x02%at%x02%ct"
 CHUNK = 1 << 20
+# Characters of log text per compress call and file write. One call and one
+# write per line cost 0.36-0.57 s over a 635k-line log; a megabyte at a time,
+# 0.17-0.22 s, for the same deflated text.
+TEE_BATCH = 1 << 20
+_TRIM = methodcaller("rstrip", "\n")
 # The key's format marker: these logs hold root-relative paths (--relative),
 # the only kind that joins against ls-files rows when the root sits below the
 # repo top. A key without it names a top-relative log, and that one is cold —
@@ -56,12 +69,78 @@ CHUNK = 1 << 20
 RELATIVE_PATHS = "root-relative"
 
 
-def log_lines(root: Path, months: int) -> Iterator[str]:
-    """The churn window's log, streamed, in the format every consumer parses.
+class Window(NamedTuple):
+    """The window's log and the --since cutoff it was cut at. The cutoff is None
+    when git would not name one, or when a laid-down log recorded none."""
+    lines: Iterator[str]
+    cutoff: int | None
 
-    Same lines as `gitio.churn_log_lines`, off disk whenever the key still holds.
-    """
-    return (_shipped(line) for line in _stored_lines(root, months))
+
+def log_lines(root: Path, months: int) -> Iterator[str]:
+    """The churn window's log at HEAD, streamed as it is stored: each header is
+    %an, %at and %ct. The lines `git log` prints under LOG_FORMAT, off disk
+    whenever the key still holds."""
+    return _stored_window(root, months, None).lines
+
+
+def stored_window(root: Path, months: int, head: str | None) -> Window:
+    """The same log as of `head`, with the cutoff it was cut at: a caller that
+    keys what it builds on a HEAD it read passes that HEAD, so a commit landing
+    meanwhile stays out of both. None reads HEAD."""
+    return _stored_window(root, months, head)
+
+
+def walked_window(root: Path, months: int, head: str | None) -> Window:
+    """The window as of `head`, straight from git in the stored shape, laying
+    nothing down: for a reader that needs commit dates where no log is on disk
+    yet. None walks whatever HEAD is when git starts."""
+    cutoff = window_cutoff(root, months, head)
+    return Window(_window_log(root, months, head, cutoff), cutoff)
+
+
+# The per-process answers below are shared by the two copies a HEAD move
+# brings forward: the commit table on a map miss, then the laid-down log when a
+# coupling reader follows (brief, worklist --batches). Both ask the same three
+# questions about the same two commits, and asking git twice doubled the spawns.
+
+def commits_since(root: Path, base: str, head: str) -> Iterator[str]:
+    """What `head` added on top of `base`, in the stored shape; nothing when
+    they match. Walked once per pair in a process: two commits name one range."""
+    if base == head:
+        return iter(())
+    return iter(_range_lines(root, base, head))
+
+
+def grew_from(root: Path, base: str, head: str) -> bool:
+    """Whether `head` is `base` or descends from it. Asked of git once per pair
+    in a process: whether one commit descends from another never changes."""
+    return base == head or _ancestry(root, base, head)
+
+
+def window_cutoff(root: Path, months: int, head: str | None) -> int | None:
+    """git's --since cutoff for the window, the commit date a commit must reach
+    to stay in it; None when git will not name one.
+
+    Read once per HEAD and UTC day in a process, so a carry and the refresh
+    after it cut at the same cutoff. The cutoff moves with the clock, so a
+    long-running process reads it again at the next HEAD or the next day, the
+    two things every copy here is keyed on."""
+    return _cutoff_at(root, months, head, _utc_date())
+
+
+@lru_cache(maxsize=16)
+def _cutoff_at(root: Path, months: int, head: str | None, date: str) -> int | None:
+    return _window_cutoff(root, months)
+
+
+@lru_cache(maxsize=16)
+def _ancestry(root: Path, base: str, head: str) -> bool:
+    return is_ancestor(root, base, head)
+
+
+@lru_cache(maxsize=4)
+def _range_lines(root: Path, base: str, head: str) -> tuple[str, ...]:
+    return tuple(_range_log(root, base, head))
 
 
 def has_cache(root: Path) -> bool:
@@ -110,30 +189,24 @@ def _drop(path: Path) -> None:
         return
 
 
-def _stored_lines(root: Path, months: int) -> Iterator[str]:
-    """The same log with its commit dates still attached — the on-disk form."""
+def _stored_window(root: Path, months: int, head: str | None) -> Window:
+    """The laid-down log when its key answers; else the log carried forward or
+    walked, and laid down as it streams past. Its stamp records the cutoff the
+    lines were cut at, which a later refresh must not go below."""
     sweep_legacy(root)
     path = root / ".crapkit" / LOG_NAME
-    key = _cache_key(root, months)
-    served = _cached(path, key)
+    key = _cache_key(root, months, head)
+    stored = _read_key(path)
+    served = _served(path, stored, key)
     if served is not None:
         return served
-    return _tee(_source(root, months, path, key), path, key)
-
-
-def _source(root: Path, months: int, path: Path, key: dict | None) -> Iterator[str]:
-    refreshed = _refreshed(root, months, path, key)
-    if refreshed is not None:
-        return refreshed
-    return _window_log(root, months)
-
-
-def _shipped(line: str) -> str:
-    """An enriched header down to the shipped `%an\\x02%at`; path lines pass through."""
-    if not line.startswith("\x01"):
-        return line
-    head, sep, _ = line.rstrip("\n").rpartition("\x02")
-    return head + "\n" if sep else line
+    if key is None:
+        return walked_window(root, months, None)  # nothing to key a copy on
+    cutoff = window_cutoff(root, months, key["head"])
+    source = _refreshed(root, path, stored, key, cutoff)
+    if source is None:
+        source = _window_log(root, months, key["head"], cutoff)
+    return Window(_tee(source, path, {**key, "cutoff": cutoff}), cutoff)
 
 
 def _commit_time(line: str) -> int:
@@ -146,12 +219,14 @@ def _utc_date() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def _cache_key(root: Path, months: int) -> dict | None:
-    """None when HEAD is unreadable — then there is nothing safe to key on."""
-    try:
-        head = head_commit(root)
-    except GitError:
-        return None
+def _cache_key(root: Path, months: int, head: str | None = None) -> dict | None:
+    """Keyed on `head` when the caller read one, else on HEAD now. None when
+    HEAD is unreadable — then there is nothing safe to key on."""
+    if head is None:
+        try:
+            head = head_commit(root)
+        except GitError:
+            return None
     return {"head": head, "months": months, "date": _utc_date(),
             "paths": RELATIVE_PATHS}
 
@@ -172,12 +247,22 @@ def _key_fields(doc: dict) -> dict:
     return {field: doc.get(field) for field in ("head", "months", "date", "paths")}
 
 
-def _cached(path: Path, key: dict | None) -> Iterator[str] | None:
+def _answers(stored: dict | None, key: dict | None) -> bool:
+    return key is not None and stored is not None and _key_fields(stored) == key
+
+
+def _served(path: Path, stored: dict | None, key: dict | None) -> Window | None:
     """The stored log when it answers exactly this key, else None."""
-    stored = _read_key(path)
-    if key is None or stored is None or _key_fields(stored) != key:
+    if not _answers(stored, key):
         return None
-    return _read_log(path, stored)
+    lines = _read_log(path, stored)
+    return None if lines is None else Window(lines, _stored_cutoff(stored))
+
+
+def _stored_cutoff(stored: dict) -> int | None:
+    """The cutoff a laid-down log was cut at; None for a log that recorded none."""
+    cutoff = stored.get("cutoff")
+    return cutoff if isinstance(cutoff, int) else None
 
 
 def _read_log(path: Path, stored: dict) -> Iterator[str] | None:
@@ -210,39 +295,43 @@ def _inflate(blob: bytes) -> Iterator[str]:
         yield tail
 
 
-def _refreshed(root: Path, months: int, path: Path, key: dict | None) -> Iterator[str] | None:
-    """The cached log carried forward to this HEAD, or None when only a walk will do."""
-    stored = _read_key(path)
-    if key is None or not _refreshable(root, stored, key):
+def _refreshed(root: Path, path: Path, stored: dict | None, key: dict,
+               cutoff: int | None) -> Iterator[str] | None:
+    """The cached log carried forward to this HEAD and cutoff, or None when only
+    a walk will do."""
+    if not _refreshable(root, stored, key, cutoff):
         return None
     cached = _read_log(path, stored)
-    cutoff = _window_cutoff(root, months)
-    if cached is None or cutoff is None:
+    if cached is None:
         return None
-    return _within(chain(_fresh_commits(root, stored["head"], key["head"]), cached), cutoff)
+    return _within(chain(commits_since(root, stored["head"], key["head"]), cached), cutoff)
 
 
-def _refreshable(root: Path, stored: dict | None, key: dict) -> bool:
+def _refreshable(root: Path, stored: dict | None, key: dict, cutoff: int | None) -> bool:
     """True only for a cached log this HEAD grew from: same window, same path
-    format, and behind us."""
-    if stored is None or stored.get("months") != key["months"]:
+    format, cut at a cutoff no later than this one, and behind us."""
+    if stored is None or not _same_window(stored, key) or not _cutoff_holds(stored, cutoff):
         return False
-    if stored.get("paths") != key["paths"]:
-        return False  # a top-relative log: prepending would stack fresh commits on wrong paths
-    if stored.get("head") == key["head"]:
-        return True
-    return is_ancestor(root, str(stored.get("head")), key["head"])
+    return grew_from(root, str(stored.get("head")), key["head"])
 
 
-def _fresh_commits(root: Path, base: str, head: str) -> Iterator[str]:
-    """Nothing to walk when the log already ends at this HEAD — a re-dating is free."""
-    if base == head:
-        return iter(())
-    return _range_log(root, base, head)
+def _same_window(stored: dict, key: dict) -> bool:
+    """Same months, and root-relative paths: prepending to a top-relative log
+    would stack fresh commits on wrong paths."""
+    return stored.get("months") == key["months"] and stored.get("paths") == key["paths"]
+
+
+def _cutoff_holds(stored: dict, cutoff: int | None) -> bool:
+    """Whether the log holds every commit this cutoff keeps: it was cut at a
+    cutoff no later. git's month arithmetic moves the cutoff back at a month
+    end (6 months before Aug 31 is Mar 3, before Sep 1 is Mar 1), and a log cut
+    at the later cutoff lacks the commits in between; only a walk has them."""
+    laid = _stored_cutoff(stored)
+    return cutoff is not None and laid is not None and laid <= cutoff
 
 
 def _within(lines: Iterator[str], cutoff: int) -> Iterator[str]:
-    """Commit blocks below the window floor, dropped whole with their paths."""
+    """Commit blocks below the window cutoff, dropped whole with their paths."""
     keep = False
     for line in lines:
         if line.startswith("\x01"):
@@ -251,36 +340,51 @@ def _within(lines: Iterator[str], cutoff: int) -> Iterator[str]:
             yield line
 
 
-def _tee(source: Iterator[str], path: Path, key: dict | None) -> Iterator[str]:
+def _tee(source: Iterator[str], path: Path, stamp: dict) -> Iterator[str]:
     """Stream the log out and lay the compressed copy down as the lines go past.
 
     Written under an operation's own .part and renamed at the end, so a reader that
     stops early, a crash, or a second crapkit running beside this one never
     leaves a truncated log looking valid.
     """
-    part = _open_part(path, key)
+    part = _open_part(path)
     if part is None:
         yield from source
         return
     comp = zlib.compressobj(1)
     try:
-        for line in source:
-            # normalized: the seam promises lines, not their endings, and a
-            # stub that strips them would be written back as one long line.
-            part.write(comp.compress(line.rstrip("\n").encode("utf-8") + b"\n"))
-            yield line
+        for batch in _batches(source, TEE_BATCH):
+            part.write(comp.compress(_encoded(batch)))
+            yield from batch
         part.write(comp.flush())
     except BaseException:
         _discard(part)
         raise
-    _keep(part, path, key)
+    _keep(part, path, stamp)
 
 
-def _open_part(path: Path, key: dict | None) -> BinaryIO | None:
-    """None when there is nothing to key on or nowhere to write: a read-only
-    .crapkit costs the speedup, never the command."""
-    if key is None:
-        return None
+def _batches(lines: Iterable[str], size: int) -> Iterator[list[str]]:
+    """Runs of lines holding at least `size` characters; the last run holds the rest."""
+    batch, held = [], 0
+    for line in lines:
+        batch.append(line)
+        held += len(line)
+        if held >= size:
+            yield batch
+            batch, held = [], 0
+    if batch:
+        yield batch
+
+
+def _encoded(batch: list[str]) -> bytes:
+    """Normalized: the seam promises lines, not their endings, and a stub that
+    strips them would be written back as one long line."""
+    return ("\n".join(map(_TRIM, batch)) + "\n").encode("utf-8")
+
+
+def _open_part(path: Path) -> BinaryIO | None:
+    """None when there is nowhere to write: a read-only .crapkit costs the
+    speedup, never the command."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         return NamedTemporaryFile(dir=path.parent, prefix=path.stem + ".",
@@ -298,26 +402,40 @@ def _discard(part: BinaryIO) -> None:
     _drop(Path(part.name))
 
 
-def _keep(part: BinaryIO, path: Path, key: dict | None) -> None:
+def _keep(part: BinaryIO, path: Path, stamp: dict) -> None:
     """Checksum our own bytes before publication. A competing rename can leave
     a mismatched pair, which reads as cold, but cannot attach our key to its log."""
     scratch = Path(part.name)
     try:
         part.close()
         blob = scratch.read_bytes()
-        stamp = {**key, "size": len(blob), "crc": zlib.crc32(blob)}
+        record = {**stamp, "size": len(blob), "crc": zlib.crc32(blob)}
         scratch.replace(path)
-        _key_path(path).write_text(json.dumps(stamp, sort_keys=True), encoding="utf-8")
+        _key_path(path).write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
     except OSError:
         _drop(scratch)
 
 
-def _window_log(root: Path, months: int) -> Iterator[str]:
-    """The whole window, from git. The expensive one. --relative for the same
-    reason gitio.churn_log_lines carries it: consumers join these paths against
-    root-relative rows, and a root below the repo top matched nothing without it."""
-    return _git_lines(root, "log", "--relative", f"--since={months} months ago",
-                      LOG_FORMAT, "--name-only")
+def _window_log(root: Path, months: int, head: str | None, cutoff: int | None) -> Iterator[str]:
+    """The whole window, from git. The expensive one: on a big repo 21 MB of
+    text, so it is streamed and never held whole. --relative, because every
+    consumer joins these paths against root-relative ls-files rows: log
+    --name-only answers relative to the repo top, so a root one directory down
+    (a monorepo member, a project nested in a worktree) read every scored file
+    as zero-churn. At the top the flag changes nothing.
+
+    Walked from `head`, the commit the caller keys its copy on, and not from
+    whatever HEAD is by the time git starts: a commit landing in between would
+    sit in a copy keyed on its parent, and the next range walk would add it
+    again. Only a caller with no HEAD to key on walks HEAD itself.
+
+    Cut at `cutoff`, the one the caller records, rather than at a second
+    reading of "N months ago": the clock moves between the two, and at a month
+    end it moves the cutoff back. Only when git named no cutoff does the walk
+    read the clock itself."""
+    since = f"--since={months} months ago" if cutoff is None else f"--max-age={cutoff}"
+    return _git_lines(root, "log", "--relative", since, LOG_FORMAT, "--name-only",
+                      *([head] if head else []))
 
 
 def _range_log(root: Path, base: str, head: str) -> Iterator[str]:
