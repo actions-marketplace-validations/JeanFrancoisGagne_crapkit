@@ -35,13 +35,20 @@ def _no_trusted_run() -> str:
             "(failed verifies and hook runs never serve as baselines)")
 
 
-def _no_full_run(pick) -> str:
+def _no_full_run(pick, runs: list[dict]) -> str:
     """Why there is nothing to seed or prune against: no trusted run at all, or
-    a failure standing in front of every one there is."""
-    if pick.blocker is None:
+    a failure standing in front of every one there is, or of the next one.
+
+    A store whose only run is a failed verify gets the second line, not "run
+    coverage first": the coverage run would stand behind that failure and earn
+    the second line anyway."""
+    from ..store import outstanding_failure
+
+    blocker = pick.blocker or outstanding_failure(runs)
+    if blocker is None:
         return _no_trusted_run()
-    return (f"no run to work from: verify run {pick.blocker['id']} FAILED with "
-            f"{pick.blocker['findings']} finding(s), nothing older is left to work from, "
+    return (f"no run to work from: verify run {blocker['id']} FAILED with "
+            f"{blocker['findings']} finding(s), nothing older is left to work from, "
             f"and a fresh `{_self()} coverage` would only be refused the same way — "
             "fix the findings and let a verify pass")
 
@@ -101,7 +108,7 @@ def _usable_pick(runs: list[dict]):
 
     pick = pick_baseline(runs)
     if pick.run is None:
-        raise CrapkitError(_no_full_run(pick))
+        raise CrapkitError(_no_full_run(pick, runs))
     return pick
 
 
@@ -347,12 +354,15 @@ def _ratchet_from_run(root: Path, cfg, action: str, requested: int | None) -> in
     fresh = store.read_scored(latest["id"])
     require_unambiguous(fresh, run_id=latest["id"], advice=_identity_advice(work, action))
     saved = RatchetFile.read(root / cfg.ratchet_file)
-    key_version = _check_ratchet_identity(saved.text or "", root, cfg.ratchet_file, fresh, store)
+    marks = saved.entries
+    key_version = _check_ratchet_identity(saved.text or "", root, cfg.ratchet_file, fresh, store,
+                                          entries=marks, moves_marks=True)
     if action == "seed":
-        entries, note = _seeded(saved.entries, fresh, cfg)
+        entries, note = _seeded(marks, fresh, cfg)
+        _refuse_unkeyable_twins(cfg.ratchet_file, work, marks, entries, fresh, key_version)
         text = saved.reseeded(entries, _seed_metric(latest), keys=key_version)
     else:
-        entries, note = _pruned(root, store, saved.entries, fresh)
+        entries, note = _pruned(root, store, marks, fresh)
         text = saved.kept(entries, keys=key_version, new_file_metric=metric_version())
     _publish_checked(saved, text, entries, fresh, latest["tool_versions"].get("analysis_version"))
     metric_note = _metric_note(work, action, created=saved.text is None)
@@ -402,6 +412,43 @@ def _seeded(prior: list, fresh: list, cfg) -> tuple[list, str]:
     entries, added, tightened = seed_ratchet(prior, fresh, target=cfg.target,
                                              scope_targets=cfg.scope_targets)
     return entries, f"added {added}, tightened {tightened}"
+
+
+def _refuse_unkeyable_twins(name: str, work: _WorkRun, prior: list, entries: list, fresh: list,
+                            key_version: int) -> None:
+    """Refuse a seed that would add same-line twin marks to start-only keys.
+
+    A file with no key stamp keeps the start-only format while any mark names a
+    function the run lacks, and that format cannot say which of two functions on
+    one line a mark belongs to. The publish check refused the file seed rendered
+    and told the reader to reconcile the twin marks seed itself was adding: on a
+    large consumer repo 170 groups, none of them in the file. Prune drops the
+    unseen marks, and the next seed writes the positioned keys.
+    """
+    from ..ratchet import KEY_VERSION, marked_collisions
+
+    twins = set() if key_version == KEY_VERSION else marked_collisions(entries, fresh)
+    if twins:
+        raise ConfigError(_prune_first(name, work, prior, fresh, twins))
+
+
+def _prune_first(name: str, work: _WorkRun, prior: list, fresh: list, twins: set) -> str:
+    from ..ratchet import unseen_marks
+
+    run_id = work.run["id"]
+    unseen = [(entry.path, entry.long_name) for entry in unseen_marks(prior, fresh)]
+    flag = f" --baseline {run_id}" if work.named else ""
+    return (f"{name}: {len(unseen)} mark(s) name functions run {run_id} does not hold, "
+            f"first {_first_key(unseen)}, so the file keeps the start-only key format, which "
+            f"cannot key the same-line twins in {len(twins)} group(s) this seed would mark, "
+            f"first {_first_key(twins)}; run `{_self()} ratchet prune{flag}` first, then seed "
+            "again: prune drops those marks and seed then writes the positioned keys")
+
+
+def _first_key(keys) -> str:
+    """The first of `keys` in marks-file order, as `path: name`."""
+    path, key_name = min(keys)
+    return f"{path}: {key_name}"
 
 
 def _seed_metric(run: dict) -> str:
@@ -466,11 +513,12 @@ def _measured_here(run: dict | None) -> dict | None:
 
 
 def _publish_checked(saved, text: str, entries: list, fresh: list, analysis_version) -> None:
+    """Refuse to write `text`, which holds `entries`, when its marks cannot be keyed."""
     from ..ratchet import check_reader_version, checked_key_version
 
     try:
         check_reader_version(entries, analysis_version)
-        checked_key_version(text, fresh)
+        checked_key_version(text, fresh, entries=entries)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
     saved.publish(text)

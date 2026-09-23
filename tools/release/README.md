@@ -18,6 +18,7 @@ python tools/release/release.py run stage2a VERSION
 python tools/release/release.py run verify VERSION
 python tools/release/release.py run stage2b VERSION
 python tools/release/release.py run registry VERSION
+python tools/release/release.py run glama VERSION
 python tools/release/release.py verify VERSION
 ```
 
@@ -116,7 +117,7 @@ Keep the receipt and `.crapkit/release-dist/` together, then rerun:
 python tools/release/release.py run stage2b VERSION
 ```
 
-The command repeats all clean-tree, tag and ledger checks. It reuses matching local files, reads published files again, skips matching uploads, and continues with the next missing file. The local Claude plugin update is recorded after success. An interrupted local update can run again. Registry login/publish remains its own stage. It logs in with `mcp-publisher login github --token` and the `gh auth token` value, so there is no device flow, and publishes straight after, because the registry session lasts only minutes. The echoed command shows `$(gh auth token)`, never the token. Glama's Repository admin **Sync Server** action stays manual, and is the only step in the chain no command performs.
+The command repeats all clean-tree, tag and ledger checks. It reuses matching local files, reads published files again, skips matching uploads, and continues with the next missing file. The local Claude plugin update is recorded after success. An interrupted local update can run again. Registry login/publish remains its own stage. It logs in with `mcp-publisher login github --token` and the `gh auth token` value, so there is no device flow, and publishes straight after, because the registry session lasts only minutes. The echoed command shows `$(gh auth token)`, never the token. Glama's Repository admin **Sync Server** action stays manual, and is the only step in the chain no command performs: `run glama VERSION` prints that step and runs nothing.
 
 Pages can finish after the command stops. A `queued` or `building` status at the release commit asks you to wait and rerun; it does not send a second POST. A `built` result at that commit completes the stage. A later `errored` result at that commit proves the build ended and permits one new request on the next invocation. A build whose commit does not carry the release commit cannot confirm this release; a build at a later commit on main that carries it does, by the same ancestry test `verify` applies.
 
@@ -165,7 +166,7 @@ After stage 2b and the MCP Registry stage, check every distribution route:
 | Local CLI | Stage 1 updates only its selected Python environment. Upgrade the intended user CLI with its owning installer, read its resolved executable and version, and run `crapkit doctor --plugin-root` against installed plugins. |
 | Claude Code plugin | Refresh its registered marketplace, update the user-scope plugin, read back its version and check `doctor --plugin-root`. Existing sessions need a restart to apply the update. |
 | Codex plugin | Refresh its registered marketplace, install the current plugin with the supported manager, and check its listed version and explicit installed plugin root. Verify its three skills and MCP configuration. |
-| MCP Registry | The canonical server name has the new version and matching PyPI package. |
+| MCP Registry | The canonical server name has the new version and matching PyPI package. A search on a cold registry cache took 78 to 87 s, so `verify` gives registry reads 120 s where every other read gets 20 s. |
 | Glama | `verify` reads the server page and requires the README action pin to name this release's tag. Until the sync runs it reports an earlier revision. Use the Repository admin **Sync Server** action after the GitHub release exists, then confirm build and tool schema, and correct stale profile text separately. |
 
 After publication, refresh the clients' marketplace snapshots before updating their

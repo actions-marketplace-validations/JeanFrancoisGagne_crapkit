@@ -128,7 +128,7 @@ $ crapkit next-item
 | `cov` | float | Branch coverage in the span, 0.0 to 1.0. |
 | `flag` | string | `measured`, `untested`, `no-lane` or `cc-only`. See the [README](../README.md#flags-why-a-coverage-number-is-missing). |
 | `crap` | float | The score. |
-| `remedy` | string | `decompose`, `split-lines`, `add-tests` or `ok`. `split-lines` means another function shares the source lines, or a Python def sits on one line under a coverage.py lane, where its only line is the `def` statement that runs at import; either way no test lowers the score until the definitions, or the def and its body, are on separate lines. Judged against `target`, the ceiling `crapkit.toml` holds now, not the one the run was scored under: an uncommitted ceiling edit moves the remedy, and what the queue offers, before the next run lands. |
+| `remedy` | string | `decompose`, `split-lines`, `add-tests` or `ok`. `split-lines` means another function shares the source lines, or a Python def's body starts on the line its signature ends under a coverage.py lane, which reads that body as the `def` statement that runs at import; either way no test lowers the score until the definitions, or the signature and its body, are on separate lines. Judged against `target`, the ceiling `crapkit.toml` holds now, not the one the run was scored under: an uncommitted ceiling edit moves the remedy, and what the queue offers, before the next run lands. |
 | `target` | int | This scope's effective ceiling. |
 | `commits`, `authors` | int | Churn for the file in the window. |
 | `est_splits` | int | `0` when `ccn <= target`, else `ceil(ccn / target)`. Roughly how many functions this needs to become. |
@@ -382,7 +382,7 @@ $ crapkit brief app/parse_csv.py parse_row --json
   "stale": false,
   "target": 6,
   "uncovered_lines": [6, 8, 12, 14],
-  "versions": {"analysis_version": 10, "crapkit": "<version>", "lizard": "1.24.0", "python": "3.11.2"}
+  "versions": {"analysis_version": 11, "crapkit": "<version>", "lizard": "1.24.0", "python": "3.11.2"}
 }
 ```
 
@@ -516,7 +516,9 @@ packet and three in a trajectory.
 The start line resolves a function only when that line names one source position.
 When several functions start there, the command refuses the numeric selector and lists
 their handles. Use the handle to select one. `explain` resolves against the run `brief`
-reads, the newest trusted one:
+reads, the newest trusted one. When that run dropped the file, `brief` refuses it and
+`explain` reads the newest trusted run that still holds it. On a file the newest trusted
+run holds, both answer alike:
 
 ```
 $ crapkit explain calc/grade.py 1
@@ -600,16 +602,16 @@ $ crapkit brief --batch 3 --json
 | `schema` | `1`, as everywhere. |
 
 `--batch` takes no `FILE` or `NAME`: the queue picks the functions. It exists so an
-orchestrator pays the store, churn-log and ratchet-file reads once for a whole fleet instead
-of once per session, and so every session starts at step 1 with nothing left to look up.
-Since 0.4.5 it also shingles the repo once per batch rather than once per packet, which is
-what `duplication_twins` costs: a batch of 5 on the 31,459-file corpus the 0.4.5 work was
-measured against fell from 11.8 s to 5.2 s, output byte-identical. Since 0.8.0 the store
-keeps the run's shingle index, so only a brief that finds none stored shingles the repo;
-every later brief, batched or not and in any process, shingles its own function and looks
-the rest up ([read commands that write](#read-commands-that-write)). Hand one packet to one
-session, and see [Multi-agent sessions](../AGENTS.md#multi-agent-sessions) for the
-file-disjoint split that keeps their diffs mergeable.
+orchestrator pays the store, churn-log and ratchet-file reads once for a whole fleet
+instead of once per session, and so every session starts at step 1 with nothing left to
+look up. Since 0.4.5 it also shingles the repo once per batch rather than once per packet,
+which is what `duplication_twins` costs: a batch of 5 on the 31,459-file corpus the 0.4.5
+work was measured against fell from 11.8 s to 5.2 s, output byte-identical. The run's
+shingle index now lives in the store: `inventory` and `coverage` write it as they record the
+run, the first `brief` or `duplication` on a `verify` run builds and stores it, and every
+later packet shingles only its own function. Hand one packet to one session, and see
+[Multi-agent sessions](../AGENTS.md#multi-agent-sessions) for the file-disjoint split
+that keeps their diffs mergeable.
 
 ---
 
@@ -628,15 +630,16 @@ $ crapkit worklist --json
     {
       "authors": 1, "ccn": 7, "ccn_std": 7, "commits": 2, "cov": 0.0, "crap": 56.0,
       "end": 15, "flag": "measured", "function": "render( rows , wide , totals , header )",
-      "nloc": 12, "path": "calc/report.py", "ratchet_mark": null, "remedy": "decompose",
-      "risk": 3.5, "scope": "calc", "start": 4, "weight": 0.5
+      "handle": "render", "nloc": 12, "occurrence": 1, "path": "calc/report.py",
+      "ratchet_mark": null, "remedy": "decompose", "risk": 3.5, "scope": "calc", "start": 4,
+      "weight": 0.5
     },
     {
       "authors": 1, "ccn": 14, "ccn_std": 14, "commits": 2, "cov": 0.45,
       "crap": 46.60950000000001, "end": 27, "flag": "measured",
-      "function": "classify( score , attempts , late , bonus )",
-      "nloc": 24, "path": "calc/grade.py", "ratchet_mark": null, "remedy": "decompose",
-      "risk": 0.0252, "scope": "calc", "start": 4, "weight": 0.0018
+      "function": "classify( score , attempts , late , bonus )", "handle": "classify",
+      "nloc": 24, "occurrence": 1, "path": "calc/grade.py", "ratchet_mark": null,
+      "remedy": "decompose", "risk": 0.0252, "scope": "calc", "start": 4, "weight": 0.0018
     }
   ],
   "active_total": 2,
@@ -668,7 +671,8 @@ Each entry carries `scope`, `path`, `function`, `start`, `end`, `occurrence`, `c
 run that scored it, and `ratchet_mark`: the committed mark's value, or `null` when the
 function carries no mark or the repo has no marks file. The mark is read under the
 function's own ratchet key, so twins sharing a long name report their own marks and not
-each other's. The four run fields are `null` on an inventory-only run, which scored no
+each other's. `handle` is the short name form `brief`, `explain` and `claims release` take:
+the bare identifier, or `(anonymous)#N` for a function lizard could not name. The four run fields are `null` on an inventory-only run, which scored no
 verdict. `worklist` still ranks on complexity times churn, never on `crap`: `next-item` is
 the queue ordered by score, and `brief` the whole packet.
 
@@ -918,7 +922,7 @@ $ crapkit coverage --json
 | `crap_load` | Sum of every function's CRAP, rounded to 2dp. |
 | `grade` | The letter for over-ceiling density over the same functions `over_target` counts. `A+` only at exactly zero. |
 | `by_scope` | Per scope: `{functions, over_target, crap_load, grade}`. |
-| `lanes` | Provenance per lane that succeeded: `artifact_sha256`, the command's `exit_code` (`null` when the artifact was reused), `parser`, `scopes`, plus `results_artifact_sha256`, `failures`, `tests_total` and `tests_skipped` when the lane declares a `results_artifact`. The digests bind coverage and JUnit to the bytes read for this run. |
+| `lanes` | Provenance per lane that succeeded: `artifact_sha256`, the command's `exit_code` (`null` when the artifact was reused), `parser`, `scopes`, plus `results_artifact_sha256`, `failures`, `tests_total` and `tests_skipped` when the lane declares a `results_artifact`. The digests bind coverage and JUnit to the bytes read for this run. Under `--reuse-unchanged` each lane also carries `rerun_reason`: `""` when its artifact was reused, else the sentence its `rerunning:` stderr line gave, such as `the working tree has 1 uncommitted change(s): src/app.ts`. |
 | `lane_failures` | Lane name to failure text, for lanes that produced no artifact, or one that reaches none of the paths their scopes declare: measured files outside this checkout (another tree), or absolute paths that resolve under it (this tree, spelled absolutely, which the root-relative join still matches nothing of). Non-empty means the run is typed `partial` and cannot be a baseline; `coverage` exits 5 only when every lane failed, and then the payload is the [error object](#errors). |
 | `kind` | `coverage` for a full run, `partial` when a lane was skipped (`--lane`) or failed: the word `runs` lists it under. A partial run is never a baseline. |
 | `unmeasured_scopes` | Scopes a declared lane measures that no succeeding lane reached this run, in declaration order; `[]` on a full run. A scope no lane declares at all is not listed: that is a configuration `doctor` names, not this run's shape. |
@@ -949,7 +953,9 @@ With a scope at its own ceiling the label reads `over their ceilings (6; reports
 partial run opens with `partial run (lane py; web unmeasured; not a baseline)`, a failed
 lane named in it as `lane ui failed` and listed after the line as `  lane 'ui' FAILED: ...`,
 counts `over` and the grade over the measured scopes only, and ends with `-> rerun changed
-lanes: crapkit coverage --reuse-unchanged`.
+lanes: crapkit coverage --reuse-unchanged`. With uncommitted changes in the tree that line
+adds ``(the working tree has uncommitted changes, so every lane that lists no `inputs`
+reruns)``.
 
 ---
 
@@ -1024,9 +1030,10 @@ The additive `resources` object in ordinary `doctor --json` reports
 `pool_worker_limit`, `default_chunks_per_worker`, `default_source_bytes_per_worker`,
 `inherited_analysis_workers`, `memory_budget_mb`, `worker_memory_estimate_mb`,
 `memory_is_hard_limit`, `estimated_pool_memory_mb`, `budget_directory`,
-`coordination` and `serial_fallback`. It also carries `log_max_bytes`, plus
-`test_retention_days` and `test_retention_count`, which are always `0`: test
-evidence retention moved to crapkit's development runner. These describe the
+`coordination` and `serial_fallback`. It also carries `log_max_bytes`.
+`test_retention_days` and `test_retention_count` are deprecated and always `0`:
+crapkit applies no test evidence retention, and its development runner takes
+`--retention-days` and `--retention-count` instead. These fields describe the
 effective policy, not sampled utilization. A memory budget is a pool-sizing
 estimate, not an operating-system allocation limit.
 
@@ -1043,15 +1050,15 @@ These fields report policy; they are not configuration keys or memory limits.
 ### `clean --json`
 
 `clean --dry-run --json` previews temporary mutation recovery. Removing
-`--dry-run` performs the eligible removals. The response has
-`schema: 1`, `dry_run`, `test_runs` and `temporary_mutations`.
+`--dry-run` performs the eligible recoveries. The response has `schema: 1`,
+`dry_run`, `test_runs` and `temporary_mutations`.
 
 | Field | Shape |
 |---|---|
-| `test_runs` | Object with path arrays `removed`, `planned`, `active`, `unproven` and `changed`, always empty. `clean` leaves test evidence to crapkit's development runner; the object stays so existing readers keep the key. |
+| `test_runs` | Object with path arrays `removed`, `planned`, `active`, `unproven` and `changed`, always empty. `clean` applies no test evidence retention; crapkit's own development runner does, with `tools/testing/run.py --retention-days N --retention-count N`. The object stays so readers keep every key. |
 | `temporary_mutations` | Array of `{path, status, reason}`. Status is `recovered`, `planned`, `active`, `unproven` or `failed`. A failed recovery exits 1. |
 
-Active leases, unrecognized evidence and caller-managed output are preserved.
+Active leases and unrecognized evidence are preserved.
 Intentional mutation pools require the existing `mutate --drop-pool` command.
 
 ### `doctor --plugin-root PATH`

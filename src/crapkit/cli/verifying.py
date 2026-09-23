@@ -35,9 +35,24 @@ def _emit_verify_findings(root: Path, args, verdict, uncovered: list) -> None:
                    + diff_uncovered_results(uncovered))
 
 
-def _no_baseline(root: Path) -> str:
-    return (f"no trusted scored baseline in {root} — run `{_self()} coverage` first "
-            "(failed verifies and hook runs never serve as baselines)")
+def _no_baseline(root: Path, runs: list[dict] = ()) -> str:
+    """No trusted run to measure against. When the store holds a partial run,
+    the line names the lanes it went without: while one of them keeps failing,
+    every `coverage` comes back partial, and "run coverage first" loops."""
+    partial = next((r for r in reversed(runs) if r["kind"] == "partial"), None)
+    if partial is None:
+        return (f"no trusted scored baseline in {root} — run `{_self()} coverage` first "
+                "(failed verifies and hook runs never serve as baselines)")
+    return (f"no trusted scored baseline in {root}: run {partial['id']} is partial, measured "
+            f"without {_missing_lanes(root, partial)} (a lane that failed, or one `--lane` "
+            f"left out), and a partial run never serves as a baseline; `{_self()} coverage` "
+            "records one once every lane passes")
+
+
+def _missing_lanes(root: Path, run: dict) -> str:
+    """`lane ui` or `lanes a, b`: the declared lanes a run holds no provenance for."""
+    missing = [lane.name for lane in _load_repo_config(root).lanes if lane.name not in run["lanes"]]
+    return f"lane{'s' if len(missing) > 1 else ''} {', '.join(missing)}"
 
 
 def _taint_note(pick) -> str:
@@ -69,9 +84,10 @@ def _verify_baseline(root: Path, store: SnapshotStore, requested: int | None) ->
 
     if requested is not None:
         return _named_baseline(store, root, requested)
-    pick = pick_baseline(store.list_runs())
+    runs = store.list_runs()
+    pick = pick_baseline(runs)
     if pick.run is None:
-        raise CrapkitError(_taint_note(pick) if pick.blocker else _no_baseline(root))
+        raise CrapkitError(_taint_note(pick) if pick.blocker else _no_baseline(root, runs))
     if pick.blocker:
         print(f"warning: {_taint_note(pick)}", file=sys.stderr)
     return pick.run
@@ -286,6 +302,17 @@ def _override_refusal(verdict) -> str | None:
     verb = "qualifies" if count == 1 else "qualify"
     return (f"override refused: {' and '.join(causes)} never {verb} for an override; "
             f"{'; '.join(escapes)}")
+
+
+def _require_override_reason(reason: str | None) -> None:
+    """Refuse an empty or blank --override before any lane runs.
+
+    `--override ""` was falsy, so it ran as a plain verify and recorded the
+    failure it was meant to grant; a blank one was refused only after the lanes,
+    by the audit. The audit keeps its own check for the hook's grant.
+    """
+    if reason is not None and not reason.strip():
+        raise ConfigError("an override requires a non-empty reason")
 
 
 def _refuse_override(verdict, reason: str | None) -> None:
@@ -648,6 +675,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     from ..ratchetfile import RatchetFile
     from ._shared import _check_ratchet_identity
 
+    _require_override_reason(args.override)
     root = _command_root(args.repo)
     cfg = _load_repo_config(root)
     _refuse_lane_less_verify(cfg)
@@ -673,7 +701,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
     ranges = changed_ranges(diff_since(root, basis))
     ratchet = saved.entries
-    key_version = _check_ratchet_identity(saved.text or "", root, cfg.ratchet_file, scored, store)
+    key_version = _check_ratchet_identity(saved.text or "", root, cfg.ratchet_file, scored, store,
+                                          entries=ratchet)
 
     verdict = evaluate(fresh=scored, changed_ranges=ranges, ratchet=ratchet,
                        baseline_failures=_baseline_failures(baseline), fresh_failures=fresh_failures,
@@ -683,7 +712,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
     # diff_uncovered walks the changed ranges, so an empty diff is [] whatever
     # the artifacts say — and reading every lane's artifact to spell that [] is
     # the whole cost of the post-commit verify on an unchanged tree.
-    uncovered = diff_uncovered(ranges, missing_by_path(root, cfg, folded=run.dead_lines)) if ranges else []
+    uncovered = diff_uncovered(ranges, missing_by_path(root, cfg, folded=run.dead_lines),
+                               scored) if ranges else []
     _warn_diff_uncovered(uncovered)
     unmarked = unmarked_over_ceiling(scored, ratchet, cfg.target, cfg.scope_targets)
     _warn_standing_debt(unmarked)
@@ -885,11 +915,14 @@ def _clearing_spellings() -> str:
     `unset` is a POSIX builtin, and the receipt prescribed it everywhere. On
     Windows the command errors, the variable stays set, and the next commit is
     granted a full override for a brand new violating function without anyone
-    typing a reason. Windows gets both spellings because `SHELL_IS_CMD` knows
-    the platform and not which of the two shells the operator typed into.
+    typing a reason. Windows gets all three spellings because `SHELL_IS_CMD`
+    knows the platform and not the shell the operator typed into, and the hook
+    cannot tell either: git for Windows sets MSYSTEM and SHELL for it whether
+    PowerShell or Git Bash started the commit.
     """
     if config.SHELL_IS_CMD:
-        return ("`$env:CRAPKIT_OVERRIDE_REASON = $null` in PowerShell, "
+        return ("`unset CRAPKIT_OVERRIDE_REASON` in Git Bash, "
+                "`$env:CRAPKIT_OVERRIDE_REASON = $null` in PowerShell, "
                 "`set CRAPKIT_OVERRIDE_REASON=` in cmd.exe")
     return "`unset CRAPKIT_OVERRIDE_REASON`"
 
@@ -986,7 +1019,7 @@ def _gated_violations(root: Path, cfg, violations: list, records=()) -> list:
     if not violations:
         return []
     entries = _load_ratchet_or_die(root / cfg.ratchet_file, cfg.ratchet_file)
-    _ratchet_key_version(root, cfg, records)
+    _ratchet_key_version(root, cfg, records, entries=entries)
     gated, exempt = _split_marked(violations, entries)
     _note_marked_staged(exempt)
     return gated

@@ -34,11 +34,16 @@ _NAME_DESCRIPTION = ("the bare identifier (classify, or route for a Rust "
 # its outputSchema does not list is rejected whole by a validating client.
 _REMEDIES = ("decompose", "split-lines", "add-tests", "ok")
 _REMEDY_DESCRIPTION = ("decompose (ccn over ceiling), split-lines (another function shares its "
-                       "source lines, or a one-line Python def shares its only line with its def "
-                       "statement, so coverage cannot tell them apart and no test lowers the "
-                       "score until they sit on separate lines), add-tests (coverage short) or ok "
-                       "(nothing left to do)")
+                       "source lines, or a Python def's body starts on the line its signature "
+                       "ends, where coverage.py reads it as the def statement, so coverage cannot "
+                       "tell them apart and no test lowers the score until they sit on separate "
+                       "lines), add-tests (coverage short) or ok (nothing left to do)")
 _REMEDY = {"type": "string", "description": _REMEDY_DESCRIPTION, "enum": _REMEDIES}
+
+# Every function row carries it (docs/agent-json.md), so every row schema says so once.
+_OCCURRENCE = {"type": "integer", "description": (
+    "source creation order among functions sharing start, from 1; 0 on an older row with no "
+    "recorded position")}
 
 # The partition a large repo needs before `top` means anything: one --scope
 # per element, exact names as declared in crapkit.toml.
@@ -60,6 +65,7 @@ _PACKET_PROPERTIES = {'scope': {'type': 'string', 'description': 'the declared s
                            'the edit this item asks for; pass it back as name'},
  'start': {'type': 'integer', 'description': 'first line, 1-based inclusive'},
  'end': {'type': 'integer', 'description': 'last line, 1-based inclusive'},
+ 'occurrence': _OCCURRENCE,
  'ccn': {'type': 'integer',
          'description': 'min(ccn_std, ccn_mod): the complexity the gate and the ratchet judge'},
  'ccn_std': {'type': 'integer', 'description': 'standard cyclomatic complexity'},
@@ -119,12 +125,12 @@ _WORKLIST_ITEM = {'type': 'object',
                                         'inventory-only run',
                          'enum': ('measured', 'untested', 'no-lane', 'cc-only', None)},
                 'remedy': {'type': ('string', 'null'),
-                           'description': 'decompose, split-lines, add-tests or ok, as the '
-                                          'ranked run judged it; null on an inventory-only run. '
-                                          'Every row but ok reaches get_next_item when a lane '
-                                          'measures it, unless crapkit.toml changed a ceiling '
-                                          'since that run: get_next_item judges each row against '
-                                          'the ceiling on disk',
+                           'description': 'decompose, split-lines, add-tests or ok, as the run '
+                                          'judged it; null on an inventory-only run. A row a '
+                                          'lane measures reaches get_next_item unless its remedy '
+                                          'is ok. After a crapkit.toml ceiling edit no run has '
+                                          "scored, get_next_item's own remedy decides that, "
+                                          'and it can differ from this one',
                            'enum': (*_REMEDIES, None)},
                 'crap': {'type': ('number', 'null'),
                          'description': 'the score from the ranked run; null on an inventory-only '
@@ -134,7 +140,12 @@ _WORKLIST_ITEM = {'type': 'object',
                 'ratchet_mark': {'type': ('number', 'null'),
                                  'description': 'the committed ratchet mark on this function, read '
                                                 'under its own ratchet key; null when it carries '
-                                                'none or the repo has no marks file'}}}
+                                                'none or the repo has no marks file'},
+                'occurrence': _OCCURRENCE,
+                'handle': {'type': 'string',
+                           'description': 'short name form: the bare identifier, or '
+                                          '(anonymous)#N for a function lizard could not name; '
+                                          'pass it to get_function_brief as name'}}}
 
 TOOLS: tuple[dict, ...] = (
     {
@@ -506,6 +517,7 @@ TOOLS: tuple[dict, ...] = (
                     "end": {
                         "type": "integer",
                         "description": "last line, inclusive"},
+                    "occurrence": _OCCURRENCE,
                     "ccn": {
                         "type": "integer",
                         "description": "min(ccn_std, ccn_mod)"},
@@ -597,7 +609,8 @@ TOOLS: tuple[dict, ...] = (
                         "crap": {
                             "type": "number",
                             "description": "score"},
-                        "remedy": _REMEDY}}},
+                        "remedy": _REMEDY,
+                        "occurrence": _OCCURRENCE}}},
             "file_totals": {
                 "type": "object",
                 "description": "the file rolled up",
@@ -1352,6 +1365,7 @@ TOOLS: tuple[dict, ...] = (
                             "type": "number",
                             "description": "score from fresh ccn and baseline cov"},
                         "remedy": _REMEDY,
+                        "occurrence": _OCCURRENCE,
                         "stale_coverage": {
                             "type": "boolean",
                             "description": ("always true: complexity is the working tree's, coverage "
@@ -1371,7 +1385,9 @@ TOOLS: tuple[dict, ...] = (
                     "ceilings": {
                         "type": "object",
                         "properties": {},
-                        "description": "map of path to the ccn ceiling it was judged against"},
+                        "additionalProperties": {"type": "integer"},
+                        "description": ("map of repo-relative path to the ccn ceiling it was "
+                        "judged against")},
                     "breaches": {
                         "type": "array",
                         "description": "the failing functions; empty when ok",

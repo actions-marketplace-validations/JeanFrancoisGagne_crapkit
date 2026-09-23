@@ -102,7 +102,7 @@ single attempt and its whole output is in scope.
 | The report landed somewhere the lane does not name | the suite passed and `artifact` still points at nothing | [docs: where artifacts live](https://github.com/JeanFrancoisGagne/crapkit/blob/main/docs/lanes.md#where-artifacts-live) |
 | Killed or refused before it could write | `timed out after Ns (attempt N)`, `wrote no output for Ns (attempt N), so crapkit killed it` (the `no_progress_seconds` watch), or `host-only (container runs OOM)` | [docs: a suite that stops making progress](https://github.com/JeanFrancoisGagne/crapkit/blob/main/docs/lanes.md#a-suite-that-stops-making-progress), [docs: timeouts and retries](https://github.com/JeanFrancoisGagne/crapkit/blob/main/docs/lanes.md#timeouts-and-retries) |
 | pytest died during collection, so the coverage plugin wrote nothing | "Interrupted: N error during collection" in the log, with the junit on disk and the coverage JSON missing | Add `--continue-on-collection-errors` to the lane command, which `crapkit init` now writes: [docs: --continue-on-collection-errors](https://github.com/JeanFrancoisGagne/crapkit/blob/main/docs/lanes.md#--continue-on-collection-errors) |
-| The lane reran and rewrote nothing | "wrote no artifact this run — the PATH on disk predates it and is the previous run's" | [docs: the artifact has to be the one this run wrote](https://github.com/JeanFrancoisGagne/crapkit/blob/main/docs/lanes.md#the-artifact-has-to-be-the-one-this-run-wrote) |
+| The lane reran and rewrote nothing | "wrote no artifact this run — the PATH on disk predates it and is the previous run's", or with a results file left too "the PATH and PATH on disk predate it and are the previous run's" | [docs: the artifact has to be the one this run wrote](https://github.com/JeanFrancoisGagne/crapkit/blob/main/docs/lanes.md#the-artifact-has-to-be-the-one-this-run-wrote) |
 
 Before triaging any of the seven, check that the command ran at all. `crapkit doctor` reads
 each lane with the shell that will run it and FAILs one whose first word will not start:
@@ -188,6 +188,11 @@ as `crapkit verify --baseline N`. It is the way out when seed refuses the pinned
 means run M was stored before crapkit recorded where same-line functions sit, and no
 coverage run changes which run seed reads. The line ends with the `--baseline` to pass:
 [docs: naming the run to seed from](https://github.com/JeanFrancoisGagne/crapkit/blob/main/docs/ratchet.md#naming-the-run-to-seed-from).
+The named seed can then refuse at exit 3 with `N mark(s) name functions run M does not hold`
+and `same-line twins in K group(s) this seed would mark`: the marks file has no
+`# crapkit-keys=1` line, and those marks hold it at the old key format. Run the
+`crapkit ratchet prune --baseline M` it names, then the seed again. The twin groups it lists
+are marks the seed would add, not saved marks to reconcile.
 
 Owner: [README: the trusted baseline](https://github.com/JeanFrancoisGagne/crapkit/blob/main/README.md#the-trusted-baseline).
 `crapkit runs list` prints `verdict=-` on runs that rendered no verdict.

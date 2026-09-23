@@ -26,7 +26,7 @@ with deferred_pygments():  # lizard's Erlang reader would load pygments here
     from .lizardrust import register as _register_rust
     from .lizardshell import register as _register_shell
     from .lizardtypescript import LizardExtension as _TypeScriptExpressions
-    from .lizardtypescript import uses_type_syntax
+    from .lizardtypescript import mask_templates, reads_templates, uses_type_syntax
 
 from .cache import partition_by_cache, updated_cache
 from .errors import ToolError
@@ -69,6 +69,11 @@ ANALYSIS_VERSION = 11  # A Python def is named by its name token and names each 
 #                       signature's continuation lines no longer do. Measured over
 #                       5,746 stdlib, site-packages and application files: 19 of
 #                       123,320 rows move cognitive, 2 of them nesting too.
+#                       A record marks a def whose body starts on its colon's line
+#                       (inline_body); the cache's own `cache=5` drops records
+#                       read before the mark existed. A JavaScript-family
+#                       template literal ends at its own closing backtick; the
+#                       cache's `cache=6` drops records read before that.
 # 10: separate sibling JavaScript/TypeScript expression arrows.
 # 9: a Python row's nesting is the depth the cognitive
 #                          pass measured, not lizard's ND count of structures,
@@ -207,6 +212,11 @@ class _DefSignatures:
     A function some other reader produced never gets the attribute, which is
     what keeps `_unread_defs` to Python.
 
+    `crapkit_inline_body` is True on a def whose first body token sits on the
+    colon's line, or behind a backslash that joins the colon's line to the
+    next: coverage.py reads such a body as the `def` statement itself
+    (FunctionRecord.inline_body).
+
     `signature_owner` is the last def current at a signature token. A file
     that ends before that signature's colon leaves its def pending, and lizard
     lists a pending def only when an enclosing def is popped at the end of the
@@ -220,12 +230,13 @@ class _DefSignatures:
         self.context = context
         self.depth = None
         self.colon_owner = None
+        self.colon_line = 0
         self.signature_owner = None
 
     def step(self, token: str) -> None:
         fn = self.context.current_function
         if self.colon_owner is not None:
-            self._settle_colon(fn)
+            self._settle_colon(fn, token)
         if self.depth is not None:
             self._signature(fn, token)
         elif token == "def":
@@ -237,9 +248,10 @@ class _DefSignatures:
         if self.depth is not None and self.signature_owner is not None and self.signature_owner not in listed:
             listed.append(self.signature_owner)
 
-    def _settle_colon(self, fn) -> None:
+    def _settle_colon(self, fn, token: str) -> None:
         if fn is self.colon_owner:
             fn.crapkit_body = True
+            fn.crapkit_inline_body = token == "\\\n" or self.context.current_line == self.colon_line
         self.colon_owner = None
 
     def _signature(self, fn, token: str) -> None:
@@ -250,6 +262,7 @@ class _DefSignatures:
             self.signature_owner = fn
         if token == ":" and self.depth == 0:
             self.colon_owner, self.depth = fn, None
+            self.colon_line = self.context.current_line
         else:
             self.depth += _DEPTH_CHANGE.get(token, 0)
 
@@ -346,6 +359,7 @@ def _record(rel_path: str, fn, occurrence: int = 0) -> FunctionRecord:
         nesting=_nesting_depth(rel_path, fn),
         cognitive=getattr(fn, "cognitive_complexity", 0) or 0,
         occurrence=occurrence,
+        inline_body=int(getattr(fn, "crapkit_inline_body", False)),
     )
 
 
@@ -395,6 +409,24 @@ def _note_twin_keys(rel_path: str, records: list[FunctionRecord]) -> None:
     print(f"crapkit: {rel_path} defines {_listed(names)} more than once; each one takes "
           f"its own ratchet key — the first as written, later ones suffixed #2, #3 in "
           f"file order", file=sys.stderr)
+
+
+# How many files one batch's twin-key notes name before counting the rest, the
+# cap _note_unanalyzable keeps. The first run after an analysis version bump
+# analyzes every file again, and on a large consumer repo that printed 1,021
+# notes over the lane progress lines.
+_TWIN_FILES_NAMED = 5
+
+
+def _note_twin_files(fresh: dict[str, list[FunctionRecord]]) -> None:
+    """The twin-key note for the first five such files in path order, then one
+    line counting the rest."""
+    noted = [path for path, records in sorted(fresh.items()) if _colliding_names(records)]
+    for path in noted[:_TWIN_FILES_NAMED]:
+        _note_twin_keys(path, fresh[path])
+    if len(noted) > _TWIN_FILES_NAMED:
+        print(f"crapkit: ... and {len(noted) - _TWIN_FILES_NAMED} more file(s) define a name "
+              f"more than once", file=sys.stderr)
 
 
 def _listed(names: list[str]) -> str:
@@ -533,10 +565,25 @@ _install_decoder()
 lizard.get_reader_for = _reader_for
 
 
+class _Analyzer(lizard.FileAnalyzer):
+    """lizard's FileAnalyzer, handing a JavaScript-family reader its source with
+    the template-literal characters its tokenizer misreads blanked.
+
+    Every path into lizard comes through here: a file on disk
+    (`FileAnalyzer.__call__` reads it and calls this method), a staged blob and
+    a verified worker input.
+    """
+
+    def analyze_source_code(self, filename, code):
+        if reads_templates(lizard.get_reader_for(filename)):
+            code = mask_templates(code)
+        return super().analyze_source_code(filename, code)
+
+
 def analyze_one(args: tuple[str, str]) -> tuple[str, list[FunctionRecord]]:
     abs_path, rel_path = args
     try:
-        analysis = lizard.FileAnalyzer(_extensions_for(rel_path))(abs_path)
+        analysis = _Analyzer(_extensions_for(rel_path))(abs_path)
         return rel_path, _trusted_records(rel_path, analysis.function_list)
     except Exception as exc:  # loud and counted, never fatal: see _note_unanalyzable
         return rel_path, UnanalyzableFile(f"lizard failed on {rel_path}: {exc}")
@@ -553,7 +600,7 @@ def analyze_source(rel_path: str, code: str, *, note: bool = True) -> list[Funct
     half-typed edit on purpose.
     """
     try:
-        analyzer = lizard.FileAnalyzer(_extensions_for(rel_path))
+        analyzer = _Analyzer(_extensions_for(rel_path))
         analysis = analyzer.analyze_source_code(rel_path, code)
         records = _trusted_records(rel_path, analysis.function_list)
     except Exception as exc:  # per-file, exactly as in analyze_one; the hook keeps going
@@ -571,8 +618,10 @@ def content_hash(path: Path) -> str:
 
 
 def fingerprint() -> str:
+    """cache=6: a JavaScript-family template literal ends at its own closing backtick,
+    which a cache=5 record's reader did not do; cache=5 added inline_body."""
     from . import __version__
-    return f"crapkit={__version__};analysis={ANALYSIS_VERSION};lizard={lizard.version};cache=4"
+    return f"crapkit={__version__};analysis={ANALYSIS_VERSION};lizard={lizard.version};cache=6"
 
 
 def _analysis_key(path: str, digest: str) -> str:
@@ -582,15 +631,23 @@ def _analysis_key(path: str, digest: str) -> str:
     return f"{reader.__module__}.{reader.__qualname__}:{chain}:{int(uses_type_syntax(path))}:{digest}"
 
 
+_CACHED_TYPES = (str, str) + (int,) * (len(FunctionRecord._fields) - 2)
+
+
 def _cached_record(values) -> FunctionRecord:
-    if not isinstance(values, list) or len(values) != 12:
+    if not isinstance(values, list) or len(values) != len(_CACHED_TYPES):
         raise ValueError("cached function fields must be a record list")
-    types = (str, str) + (int,) * 10
-    if any(type(value) is not expected for value, expected in zip(values, types)):
+    if any(type(value) is not expected for value, expected in zip(values, _CACHED_TYPES)):
         raise ValueError("cached function fields have invalid types")
-    if values[-1] < 0:
+    return _in_range(FunctionRecord(*values))
+
+
+def _in_range(record: FunctionRecord) -> FunctionRecord:
+    if record.occurrence < 0:
         raise ValueError("cached function occurrence must be nonnegative")
-    return FunctionRecord(*values)
+    if record.inline_body not in (0, 1):
+        raise ValueError("cached function inline_body must be 0 or 1")
+    return record
 
 
 def _cached_rows(rows) -> list[FunctionRecord]:
@@ -805,7 +862,7 @@ def _analyze_verified(job: tuple[str, str, str]) -> tuple[str, list[FunctionReco
     if hashlib.sha256(raw).hexdigest() != expected:
         raise ToolError(f"{relative}: source changed during analysis; rerun analysis")
     try:
-        analyzer = lizard.FileAnalyzer(_extensions_for(relative))
+        analyzer = _Analyzer(_extensions_for(relative))
         analysis = analyzer.analyze_source_code(relative, decode_source(raw))
         return relative, _trusted_records(relative, analysis.function_list)
     except Exception as exc:  # a parse refusal, unlike the read and hash above, is per-file
@@ -826,6 +883,7 @@ def analyze_jobs(
     chunksize: int = 32,
     hashes: dict[str, str] | None = None,
     worker_budget: int = 0,
+    note_twins: bool = True,
 ) -> dict[str, list[FunctionRecord]]:
     """Run lizard over (abs_path, rel_path) jobs, pooled once there are enough.
 
@@ -833,7 +891,8 @@ def analyze_jobs(
     different scales: an inventory feeds thousands of files and wants fat
     chunks, a hook feeds a commit's worth and needs each job dealt to a
     different worker (a chunksize above the job count leaves one worker doing
-    all of them, serially, after paying for the pool).
+    all of them, serially, after paying for the pool). NOTE_TWINS=False leaves
+    the twin-key note to a caller that notes more paths than these jobs.
     """
     worker, inputs = _job_inputs(jobs, hashes)
     with _pool_for(jobs, pool_threshold, workers, worker_budget, chunksize) as pool:
@@ -842,8 +901,8 @@ def analyze_jobs(
     # The parent says things; a worker only measures. A spawned child's stderr
     # never saw `_reconfigure_streams`, so a note printed from analyze_one
     # reached a UTF-8 reader in the legacy codepage on Windows (#31).
-    for rel_path, records in fresh.items():
-        _note_twin_keys(rel_path, records)
+    if note_twins:
+        _note_twin_files(fresh)
     _note_unanalyzable(fresh)
     return fresh
 
@@ -921,11 +980,10 @@ def _analyze_misses(root: Path, misses: list[str], identities: dict, hashes: dic
                     workers, worker_budget: int) -> dict:
     origins = _miss_origins(misses, identities)
     jobs = [(str(root / path), path) for path in dict.fromkeys(origins.values())]
-    parsed = analyze_jobs(jobs, workers=workers, hashes=hashes, worker_budget=worker_budget)
+    parsed = analyze_jobs(jobs, workers=workers, hashes=hashes, worker_budget=worker_budget,
+                          note_twins=False)
     records = {path: _rows_for(path, parsed[origin]) for path, origin in origins.items()}
-    for path, origin in origins.items():
-        if path != origin:
-            _note_twin_keys(path, records[path])
+    _note_twin_files(records)
     return records
 
 

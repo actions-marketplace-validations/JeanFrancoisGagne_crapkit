@@ -14,9 +14,14 @@ from pathlib import Path
 
 import lizard
 
+from crapkit import analyze
 from crapkit.analyze import analyze_one
 from crapkit.lizardcognitive import LizardExtension as Cognitive
+from crapkit.merge import FunctionRecord
 from merge_oracle import RawFn, merge_passes
+
+# The fields the retired two-pass parser produced, path through cognitive.
+_RETIRED_FIELDS = FunctionRecord._fields.index("occurrence")
 
 TS_SWITCH = """export function dispatch(kind: string): number {
   switch (kind) {
@@ -87,14 +92,14 @@ def test_analyze_one_reads_each_file_in_a_single_lizard_pass(tmp_path, monkeypat
     """Two passes over a 14k-file corpus cost 10.7 s of the cold run's lizard
     phase; one costs 6.4 s. Counting analyzer runs is what keeps it at one."""
     runs = []
-    real = lizard.FileAnalyzer
+    real = analyze._Analyzer  # lizard's FileAnalyzer, masking template literals first
 
     class CountingAnalyzer(real):
-        def __call__(self, filename):
+        def analyze_source_code(self, filename, code):
             runs.append(filename)
-            return super().__call__(filename)
+            return super().analyze_source_code(filename, code)
 
-    monkeypatch.setattr(lizard, "FileAnalyzer", CountingAnalyzer)
+    monkeypatch.setattr(analyze, "_Analyzer", CountingAnalyzer)
     _records(tmp_path, "d.ts", TS_SWITCH)
 
     assert len(runs) == 1, f"the file was tokenized {len(runs)} times"
@@ -151,10 +156,11 @@ def test_the_single_pass_reproduces_the_two_pass_record_for_every_committed_sour
     for path in files:
         rel = path.name
         _, produced = analyze_one((str(path), rel))
-        # The retired parser had no occurrence field. Compare every field it
-        # did produce; real same-line fixtures test the added identity field.
+        # The retired parser stopped at cognitive: no occurrence, no inline_body.
+        # Compare every field it did produce; real same-line and inline-body
+        # fixtures test the fields added after it.
         expected = _two_pass(str(path), rel)
-        assert [r[:-1] for r in produced] == [r[:-1] for r in expected], (
+        assert [r[:_RETIRED_FIELDS] for r in produced] == [r[:_RETIRED_FIELDS] for r in expected], (
             f"single pass diverged on {path}")
         split += sum(1 for r in produced if r.ccn_mod != r.ccn_std)
 

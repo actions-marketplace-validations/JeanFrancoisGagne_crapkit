@@ -71,6 +71,11 @@ has an explanation:
 crapkit: calc/iso_cost.py defines __post_init__( self ) more than once; each one takes its own ratchet key — the first as written, later ones suffixed #2, #3 in file order
 ```
 
+One run names five such files at most, in path order, and counts the rest on one line:
+`crapkit: ... and 1016 more file(s) define a name more than once`. The first run after
+an analysis version change analyzes every file again, which on a large consumer repo
+meant 1,021 notes before the cap.
+
 To address one twin by hand, `brief` and `explain` take the same suffix:
 `crapkit brief calc/iso_cost.py "__post_init__#2"`. A bare name still resolves, to the
 worst twin: the one the queue ranks. `brief`, `explain` and the MCP tool
@@ -236,7 +241,9 @@ EXIT=1
 
 The line says why a fresh `coverage` is not the escape: the new run would be refused by the
 same rule. Fix the findings, or accept a newer run by name with `crapkit verify --baseline
-ID` and let that verify pass.
+ID` and let that verify pass. A store whose only run is the failed verify, such as a fresh
+clone whose first `verify --baseline-tsv` failed, gets the same line before any `coverage`
+has run, since that run would stand behind the same failure.
 
 ### Naming the run to seed from
 
@@ -270,6 +277,20 @@ advice: `refresh analysis before selecting or comparing these functions`. When t
 carry an older metric stamp, the way out is the same name; see
 [the metric stamp](#the-metric-stamp).
 
+The named run can then meet a marks file written before the key stamp. That file keeps the
+start-only key format while any of its marks names a function the run lacks, and the format
+cannot key two functions that start on one line. So seed refuses to add a mark for either
+and names the prune that drops the marks the run lacks:
+
+```
+$ crapkit ratchet seed --baseline 3
+crapkit: crapkit-ratchet.tsv: 1 mark(s) name functions run 3 does not hold, first src/gone.ts: gone( ), so the file keeps the start-only key format, which cannot key the same-line twins in 1 group(s) this seed would mark, first src/a.ts: (anonymous); run `crapkit ratchet prune --baseline 3` first, then seed again: prune drops those marks and seed then writes the positioned keys
+EXIT=3
+```
+
+After the prune every mark names a function run 3 holds, and the seed writes
+`# crapkit-keys=1`; see [same-line function identity](#same-line-function-identity).
+
 ---
 
 ## The metric stamp
@@ -295,7 +316,7 @@ EXIT=3
 ```
 $ crapkit verify
 warning: crapkit-ratchet.tsv carries no metric stamp (written before stamping) — run `crapkit coverage`, then re-baseline with `crapkit ratchet seed` to stamp it
-verify OK @ 525a3276065 vs baseline 525a3276065 (1 changed files)
+verify OK @ 525a3276065 vs baseline 525a3276065 (1 changed files) ratchet: restamped -> git add crapkit-ratchet.tsv
 EXIT=0
 ```
 
@@ -763,9 +784,11 @@ crapkit: clear CRAPKIT_OVERRIDE_REASON now (`unset CRAPKIT_OVERRIDE_REASON`) —
 crapkit: a CI job or a launcher that exported it is not cleared by any command here — clear it where it was set.
 ```
 
-That first line is spelled for the shell you are in: `unset` is a POSIX builtin, so on
-Windows the receipt names `$env:CRAPKIT_OVERRIDE_REASON = $null` for PowerShell and
-`set CRAPKIT_OVERRIDE_REASON=` for cmd.exe instead.
+That first line is spelled for the platform you are on. On Windows the receipt names all
+three shells git runs from there: `unset CRAPKIT_OVERRIDE_REASON` for Git Bash,
+`$env:CRAPKIT_OVERRIDE_REASON = $null` for PowerShell and `set CRAPKIT_OVERRIDE_REASON=`
+for cmd.exe. The hook cannot tell which one you typed into: git for Windows sets `MSYSTEM`
+and `SHELL` for the hook whichever shell started the commit.
 
 The hook path never raises an existing mark. It has no coverage data, so it synthesizes a
 worst-case score, and letting that overwrite a real measurement would blind the ratchet to a
@@ -786,7 +809,8 @@ has no reader proof, and every later reader would refuse the file (see
 and writes no alert line, no store row and no mark. The grant is refused until
 `crapkit coverage` and `crapkit ratchet seed` restamp the file.
 
-An empty reason is refused. Runs an override names are pinned in the store: `runs prune`
+An empty or blank reason is refused with exit 3 before any lane runs, so it records no run.
+Runs an override names are pinned in the store: `runs prune`
 never deletes them.
 
 ---
@@ -821,7 +845,10 @@ The two stamps answer different questions:
 A missing key-version comment means the old start-only rule. For unchanged groups
 whose reader identity is proved, seed, prune and a successful tightening can keep
 the keys and values and add the new key marker. Marks for absent names retain the
-old key format until their mapping can be checked. Named functions and functions
+old key format until their mapping can be checked. While they do, seed refuses to add
+a mark for a function that shares its start line with another, since the old format
+cannot key it, and names `ratchet prune`, which drops those marks, as the way on; see
+[naming the run to seed from](#naming-the-run-to-seed-from). Named functions and functions
 in other languages keep compatible reseed behavior when their groups have no
 unresolved collision. An explicit move preserves both stamps; a merge refuses
 different key versions without rewriting OURS.

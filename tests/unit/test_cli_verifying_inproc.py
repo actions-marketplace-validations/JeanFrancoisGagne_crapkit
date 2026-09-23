@@ -322,6 +322,20 @@ def _knotty(repo):
     return repo
 
 
+@pytest.mark.parametrize("reason", ["", "   "])
+def test_an_empty_override_reason_is_refused_before_anything_runs(baselined, capsys, reason):
+    """`--override ""` ran as a plain verify and recorded the failure it was
+    meant to grant, which then held every later run back as tainted."""
+    runs = len(store_of(baselined).list_runs())
+
+    code, out, err = run(["verify", "--reuse-artifacts", "--override", reason],
+                         _knotty(baselined), capsys)
+
+    assert (code, out) == (3, "")
+    assert err == "crapkit: an override requires a non-empty reason\n", err
+    assert len(store_of(baselined).list_runs()) == runs, "a refused override records no run"
+
+
 def test_an_override_grants_a_pure_gate_violation_and_leaves_a_record(baselined, capsys):
     """--override is not a bypass: the violation is printed as OVERRIDDEN, the
     debt lands in the marks file, and the store carries the reason."""
@@ -511,6 +525,25 @@ def test_dead_lines_in_the_diff_warn_and_breach_the_ceiling(baselined, capsys):
     assert "warning: 1 changed line(s) have no coverage" in err, err
     assert "uncovered src/app.ts:17" in err, err
     assert "1 uncovered changed line(s) over the ceiling 0" in err, err
+
+
+def test_a_new_module_no_test_imports_breaches_the_ceiling(baselined, capsys):
+    """No artifact mentions a file nothing imports, so its functions score flag
+    untested and none of their lines ran. A ceiling of 0 passed such a module."""
+    text = (baselined / "crapkit.toml").read_text(encoding="utf-8")
+    (baselined / "crapkit.toml").write_text(
+        text.replace("target = 6", "target = 6\ndiff_uncovered_max = 0"), encoding="utf-8")
+    (baselined / "src" / "fresh.ts").write_text(
+        "export function small(a: number): number {\n  return a > 0 ? a : -a;\n}\n",
+        encoding="utf-8")
+    commit_all(baselined, "a module no test imports")
+
+    code, _, err = run(["verify", "--reuse-artifacts"], baselined, capsys)
+
+    assert code == 9, err
+    assert "warning: 3 changed line(s) have no coverage" in err, err
+    assert "uncovered src/fresh.ts:1" in err, err
+    assert "3 uncovered changed line(s) over the ceiling 0" in err, err
 
 
 def test_dead_changed_lines_under_the_ceiling_warn_without_failing(baselined, capsys):
@@ -811,17 +844,19 @@ def test_the_posix_receipt_names_unset(capsys, monkeypatch):
     assert "$env:" not in out
 
 
-def test_the_windows_receipt_names_both_windows_shells(capsys, monkeypatch):
-    """SHELL_IS_CMD knows the platform, not which of the two shells the operator
-    typed into, so the receipt hands over both spellings."""
+def test_the_windows_receipt_names_each_shell_git_runs_from_there(capsys, monkeypatch):
+    """SHELL_IS_CMD knows the platform, not the shell the operator typed into,
+    and the hook cannot tell either: git for Windows sets MSYSTEM and SHELL for
+    it whether PowerShell or Git Bash started the commit. Git Bash, where most
+    Windows users run git, clears it with `unset`, which the receipt left out."""
     monkeypatch.setattr(config, "SHELL_IS_CMD", True)
 
     verifying._print_clear_the_reason()
 
     out = capsys.readouterr().out
-    assert "$env:CRAPKIT_OVERRIDE_REASON = $null" in out, out
-    assert "set CRAPKIT_OVERRIDE_REASON=" in out, out
-    assert "unset CRAPKIT_OVERRIDE_REASON" not in out, "the builtin neither shell has"
+    assert "`unset CRAPKIT_OVERRIDE_REASON` in Git Bash" in out, out
+    assert "`$env:CRAPKIT_OVERRIDE_REASON = $null` in PowerShell" in out, out
+    assert "`set CRAPKIT_OVERRIDE_REASON=` in cmd.exe" in out, out
 
 
 def test_the_receipt_says_an_exported_variable_is_cleared_where_it_was_set(capsys):
@@ -961,6 +996,38 @@ def test_a_green_run_with_nothing_to_move_prints_no_ratchet_suffix(marked_debt, 
     _, out, _ = run(["verify", "--reuse-artifacts"], marked_debt, capsys)
 
     assert "ratchet:" not in out and "git add" not in out, out
+
+
+def _crlf_marks(repo, *entries: tuple[str, str, float]) -> bytes:
+    """The marks file as a Windows checkout under core.autocrlf=true holds it."""
+    data = dump_ratchet([RatchetEntry(*e) for e in entries], stamp=metric_version(),
+                        key_version=1).replace("\n", "\r\n").encode("utf-8")
+    (repo / MARKS).write_bytes(data)
+    return data
+
+
+def test_a_crlf_checkout_with_nothing_to_move_leaves_the_marks_file_alone(marked_debt, capsys):
+    """Line endings are the checkout's, not the marks': a green run that moved no
+    mark rewrote the file as LF and asked for a `git add` of a diff git showed as
+    empty."""
+    before = _crlf_marks(marked_debt, ("src/app.ts", "knotty ( n )", 16.0))
+
+    code, out, err = run(["verify", "--reuse-artifacts", "--json"], marked_debt, capsys)
+
+    assert (code, err) == (0, "")
+    assert json.loads(out)["ratchet_changes"] is None
+    assert (marked_debt / MARKS).read_bytes() == before, "the file was rewritten"
+
+
+def test_a_crlf_checkout_keeps_its_line_endings_through_a_tighten(marked_debt, capsys):
+    _crlf_marks(marked_debt, ("src/app.ts", "knotty ( n )", 100.0))
+
+    code, out, err = run(["verify", "--reuse-artifacts"], marked_debt, capsys)
+
+    assert (code, err) == (0, "")
+    assert "ratchet: 0 dropped, 1 tightened" in out, out
+    data = (marked_debt / MARKS).read_bytes()
+    assert b"knotty ( n )\t16.0000\r\n" in data and data.count(b"\n") == data.count(b"\r\n"), data
 
 
 def test_a_marks_file_written_before_stamping_is_restamped_and_says_so(marked_debt, capsys):

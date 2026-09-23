@@ -876,6 +876,20 @@ def _doctor_artifact_litter(cfg) -> list[Finding]:
             for item in artifact_litter(cfg.lanes, scope_top_dirs(cfg.scopes))]
 
 
+def _doctor_shared_coverage_data(cfg) -> list[Finding]:
+    """WARN when lanes whose coverage.py data files one of them deletes and
+    combines may run at once. A serial lane deletes the others' files before it
+    starts and they are done with them, so max_parallel_lanes = 1 says nothing."""
+    from ..doctor import shared_coverage_data, shared_data_words
+
+    if cfg.max_parallel_lanes < 2:
+        return []
+    return [Finding("WARN", f"{what}, and max_parallel_lanes = {cfg.max_parallel_lanes} can "
+                            "start them together, which can fail one lane and leave the run "
+                            f"partial; {fix}")
+            for what, fix in map(shared_data_words, shared_coverage_data(cfg.lanes))]
+
+
 def _lizard_version() -> str | None:
     try:
         import lizard
@@ -998,8 +1012,9 @@ def _doctor_hook_encoding(root: Path) -> list[Finding]:
 
     A Windows author who wrote the hook with `Out-File` got a BOM (or UTF-16)
     in front of the shebang, git said `cannot spawn .git/hooks/pre-commit` at
-    the first commit and let it through ungated, and doctor had passed the
-    file. WARN, not FAIL: the config is fine, the file beside it is not.
+    the first commit and refused it without running the gate (git 2.43 for
+    Windows), and doctor had passed the file. WARN, not FAIL: the config is
+    fine, the file beside it is not.
     """
     named = _hook_file(root)
     mark = _leading_mark(root / named) if named else None
@@ -1086,14 +1101,26 @@ def _doctor_findings(root: Path, cfg, raw: dict, files: list[str],
     return (_doctor_keys(raw)
             + _doctor_scopes(root, cfg, files, show_files)
             + _doctor_lanes(root, cfg)
+            + _doctor_inputs(root, cfg.lanes)
             + _doctor_stamps(root, cfg.lanes)
             + _doctor_artifact_litter(cfg)
+            + _doctor_shared_coverage_data(cfg)
             + _doctor_hook_modes(root)
             + _doctor_hook_encoding(root)
             + _doctor_commit_graph(root)
             + _doctor_tools()
             + _doctor_scoped_tests(cfg, files)
             + _doctor_unmeasured(root, cfg, files))
+
+
+def _doctor_inputs(root: Path, lanes) -> list[Finding]:
+    """A lane `inputs` entry that matches no file git sees (FAIL). One git read
+    narrowed to the entries, and none when no lane declares inputs."""
+    from ..doctor import unmatched_inputs
+    from ..lane_changes import visible_paths
+
+    entries = sorted({entry for lane in lanes for entry in lane.inputs})
+    return list(unmatched_inputs(lanes, visible_paths(root, entries)))
 
 
 def _doctor_scoped_tests(cfg, files: list[str]) -> list[Finding]:
@@ -1247,13 +1274,13 @@ def _lane_durations(root: Path, cfg) -> tuple[float, ...]:
 def _doctor_tune(root: Path, cfg) -> int:
     """Advisory only: knob lines from this machine's cpu count and whatever lane
     durations are already on disk. Nothing is written and nothing is executed."""
-    from ..doctor import suggest_knobs, tune_lines
+    from ..doctor import shared_coverage_data, suggest_knobs, tune_lines
     from ..resources import available_cpus
 
     for finding in _doctor_stamps(root, cfg.lanes):
         print(f"{finding.level} {finding.text}", file=sys.stderr)
     cpus, _ = available_cpus()
-    knobs = suggest_knobs(cpus=cpus, lanes=len(cfg.lanes))
+    knobs = suggest_knobs(cpus=cpus, lanes=len(cfg.lanes), shared=shared_coverage_data(cfg.lanes))
     for line in tune_lines(cpus=cpus, knobs=knobs, durations=_lane_durations(root, cfg)):
         print(line)
     return 0

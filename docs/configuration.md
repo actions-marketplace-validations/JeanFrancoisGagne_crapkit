@@ -24,6 +24,7 @@ Four tables hold them: `[crapkit]`, `[[scope]]`, `[[lane]]`, `[exclude]`.
 
 ```
 $ crapkit doctor
+resources: up to 8 analysis worker(s) per pool, 8 shared slot(s); lane log limit 16777216 bytes per file
 FAIL unknown key crapkit.churn_windo_months — crapkit ignores it (typo?); [crapkit] accepts these keys: alert_command, analysis_worker_budget, analysis_workers, churn_window_months, debt_max_age_months, diff_uncovered_max, log_max_bytes, max_parallel_lanes, mutation_command, mutation_timeout_seconds, mutation_workers, notes, ratchet_file, repayment_min_per_30d, scoped_tests, target, tighten_max_jump, worklist_floor, worklist_top
 doctor: 1 problem(s)
 ```
@@ -79,7 +80,7 @@ fallback. UTF-16 source is outside that reader policy.
 | `mutation_command` | string | `""` | The suite run once per mutant. A nonzero exit means the mutant was killed, so the command is also run **once against the unmutated tree** before the first mutant and must exit 0 there: without that baseline a command that cannot start here killed every mutant and scored 100%. `mutate` refuses to run without it. Shell and PowerShell files in the diff are skipped and named on stderr: `<` and `>` are redirections in both, so their mutants would be noise. So is every file outside the scored corpus (a test file, an excluded path, a file over `max_file_bytes`, a file no scope claims): `mutate` never mutates a test, and a diff with nothing left says `nothing to mutate` at exit 0 without running the command. |
 | `mutation_timeout_seconds` | int >= 1 | `300` | Per-mutant timeout. Expiry counts as killed, and the kill takes the suite's whole process tree, so a looping mutant does not outlive the run that gave up on it. At the default cap of 100 mutants this bounds one `mutate` run at over 8 hours, so lower it for a slow suite. |
 | `mutation_workers` | int >= 1 | `1` | Mutants run at once. Every worker uses a kept detached Git worktree, including one. See [mutation worktrees](#mutation-worktrees) for preparation, concurrent runs and cleanup. |
-| `diff_uncovered_max` | int >= 0 | absent | Ceiling on changed lines that never ran. **Absent means warn only**: `verify` still prints `warning: N changed line(s) have no coverage` on stderr and lists the first 20, but exits 0. Set it and a breach exits 9. |
+| `diff_uncovered_max` | int >= 0 | absent | Ceiling on changed lines that never ran. **Absent means warn only**: `verify` still prints `warning: N changed line(s) have no coverage` on stderr and lists the first 20, but exits 0. Set it and a breach exits 9. A changed file no lane artifact mentions, such as a new module no test imports, counts every line of its functions (flag `untested`); its lines outside any function do not count, because no artifact says which of them are statements. |
 | `debt_max_age_months` | int >= 0 | absent | `ratchet report --enforce` flags open marks older than this (counted at 30 days per month). |
 | `repayment_min_per_30d` | int >= 0 | absent | `ratchet report --enforce` flags a burn-down that repaid fewer marks than this in the last 30 days while debt is open. |
 | `max_parallel_lanes` | int >= 1 | `1` | Lanes running at once. `1` is strictly serial. See [lanes.md](lanes.md#running-lanes-in-parallel). |
@@ -251,6 +252,7 @@ Declaring `src` first and `src/hot` second, `src/hot` still gets its file:
 
 ```
 $ crapkit doctor
+resources: up to 8 analysis worker(s) per pool, 8 shared slot(s); lane log limit 16777216 bytes per file
 ok   config keys all recognized
 ok   scope 'src': 1 file
 ok   scope 'hot': 1 file
@@ -300,7 +302,7 @@ An array of tables. One lane per coverage command. Full recipes in [lanes.md](la
 | `cwd` | string | no | repo root | Repo-relative working directory for the command. `doctor` fails when it does not exist. |
 | `path_prefix` | string | no | `""` | Prefix joined onto coverage.py's relative paths, for a suite run from a subdirectory. A coveragepy key: the istanbul reader never reads it. It only ever prepends, so it cannot rebase a path the runner wrote absolutely, which is the runner's own switch instead ([The same tree, spelled absolutely](lanes.md#the-same-tree-spelled-absolutely)). |
 | `env` | table of string | no | `{}` | Extra environment for the command, merged over the inherited environment. Use it to cap a runner that sizes its own worker pool from free memory, and to hand a junit reporter its output path when the reporter reads no path off the command line (`jest-junit` is one). Every lane gets it, so raising `max_parallel_lanes` without one lets N lanes each claim the whole box. A `PATH` here **replaces** the inherited one for that lane, and `doctor` looks for the lane's runner on it, so a lane that ships its own toolchain is checked the way it runs. |
-| `inputs` | array of string | no | `[]` | Root-relative paths the command reads: its source, tests, fixtures and runner config. With them, `--reuse-unchanged` reuses the lane while the commit its artifact was built at is still behind HEAD, no committed, staged, unstaged or untracked change touches these paths, the artifact bytes still match, and this lane's own table, `env` included, is the one it was measured with. Other `crapkit.toml` settings and environment variables the lane does not set are outside that proof. Without `inputs` a lane is reused only at the same clean HEAD. Entries are literal paths, no globs: an entry holding `*` or `?`, or one that is absolute or climbs out of the root, is a config error. A file the command reads that the list leaves out is never checked, so an edit to it reuses a stale artifact. See [Reusing artifacts](lanes.md#reusing-artifacts). |
+| `inputs` | array of string | no | `[]` | Root-relative paths the command reads: its source, tests, fixtures and runner config. With them, `--reuse-unchanged` reuses the lane while the commit its artifact was built at is still behind HEAD, no committed, staged, unstaged or untracked change touches these paths (a lane's declared `artifact` or `results_artifact` is not such a change), the artifact bytes still match, and this lane's own table, `env` included, is the one it was measured with. Other `crapkit.toml` settings and environment variables the lane does not set are outside that proof. Without `inputs` a lane is reused only at the same clean HEAD. Entries are literal paths, no globs: an entry holding `*` or `?`, or one that is absolute or climbs out of the root, is a config error. An entry that matches no tracked file, and no untracked file outside `.gitignore`, such as a misspelled directory, still loads, but reuse can see no change through it, so `doctor` fails on it. A file the command reads that the list leaves out is never checked, so an edit to it reuses a stale artifact. See [Reusing artifacts](lanes.md#reusing-artifacts). |
 | `full_suite` | bool | no | `true` | `false` permits a positional argument in a pytest coverage command. At `true`, a positional is a config error: subset coverage under a suite with cross-file pollution is run-order dependent. A flag's value is not a positional (`-n 8`, `-o timeout=300`, `-p no:randomly` all pass), and the command is read by the shell that will run it, one argv per `&&`, `\|\|`, `&` or `\|` segment, with every segment that runs pytest checked. On cmd.exe a `;` starts nothing, so `pytest --cov; echo done` hands pytest `echo` and is refused; write the second command after `&&`. Use double quotes for values, since cmd.exe does not treat `'` as a quote. Set it false deliberately for a genuinely scoped suite. |
 | `container_ok` | bool | no | `false` | Lets a `coveragepy` lane run inside a container. Without it such a lane refuses with exit 5 whenever `/.dockerenv` exists or `CRAPKIT_INSIDE_CONTAINER=1`. |
 | `results_artifact` | string | no | `""` | A JUnit XML report, under `.crapkit/cov/` for the same reason as `artifact`. Two checks read it and neither runs without it: no-new-failures (`verify` exit 8) and the crashed-worker trust check, plus the suite-shrink warning. `doctor` WARNs on a `coveragepy` or `istanbul` lane that declares none, naming both, and `crapkit init` writes it on the lanes it detects. Declared but missing is exit 5, so the check can never pass vacuously, and so is a report saying the run never finished ([a crashed xdist worker or a session error](lanes.md#a-junit-that-says-the-run-did-not-finish)). Under `--reuse-artifacts` both of those are one warning instead, and the lane records no test counts: there the operator is reading a report off disk, which can be the junit of a run whose coverage was salvaged by hand. |
@@ -374,7 +376,10 @@ dropped. Run `crapkit doctor` after upgrading and read the per-scope file counts
 
 ```
 $ crapkit doctor
+resources: up to 8 analysis worker(s) per pool, 8 shared slot(s); lane log limit 16777216 bytes per file
+...
 note app/core.py (181 bytes) skipped: over max_file_bytes
+...
 ```
 
 ---
@@ -397,7 +402,10 @@ mutation_workers = 6
 
 The cost line needs at least one recorded lane duration. With none it says so and the
 suggestion comes from the cpu count alone. The suggestion never proposes more lane slots
-than there are lanes.
+than there are lanes, and it stays at 1 while one `coveragepy` lane deletes and combines
+another's coverage.py data files, as a lane left on `.coverage` does to a lane on
+`.coverage.b` in the same directory: a `# held at 1:` line names them and the `COVERAGE_FILE`
+each lane needs ([lanes.md](lanes.md#running-lanes-in-parallel)).
 
 ---
 

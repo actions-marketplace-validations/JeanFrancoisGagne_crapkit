@@ -15,6 +15,7 @@ from ..errors import ConfigError, CrapkitError
 from ..gitio import head_commit, ls_files
 from ..invocation import _self
 from ..keys import claim_key, key_names, key_of, lookup, position, split_ordinal
+from ..score import SCORED_COLUMNS
 from ..store import SnapshotStore
 from ..uncovered import load_uncovered
 from ..worklist import (NO_RATCHET, Marks, RatchetMarks, Worklist, admission, build_worklist,
@@ -339,7 +340,8 @@ def _next_item_payload(top, adm, cfg, uncovered, handle: str | None = None) -> d
         # the name form that survives the session's own edit: a start line moves,
         # a position among the file's anonymous functions does not
         "handle": handle,
-        "start": top.start, "end": top.end, "ccn": top.ccn, "ccn_std": top.ccn_std,
+        "start": top.start, "end": top.end, "occurrence": position(top)[1],
+        "ccn": top.ccn, "ccn_std": top.ccn_std,
         "cov": top.cov, "flag": top.flag, "crap": top.crap, "remedy": top.remedy,
         "nloc": top.nloc, "nesting": top.nesting, "cognitive": top.cognitive,
         "commits": c.commits, "authors": c.authors,
@@ -755,8 +757,8 @@ def _brief_packet(loader, row) -> dict:
     return {
         "run_id": loader.latest["id"], "commit": loader.latest["commit"],
         "path": row.path, "function": row.long_name,
-        "handle": keys.handles(rows)[lookup(row)],
-        "scored": dict(row._asdict()),
+        "handle": keys.handles(rows, run_id=loader.latest["id"])[lookup(row)],
+        "scored": dict(zip(SCORED_COLUMNS, row)),
         "target": ceiling,
         "remedy": row.remedy,
         **packet.budget(row, ceiling),

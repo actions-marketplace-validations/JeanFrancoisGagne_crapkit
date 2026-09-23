@@ -19,8 +19,11 @@ MCP server before upgrading on Windows; see [launcher locks](#windows-launcher-l
 0.8.0 moves the reader to analysis version 11, so a marks file stamped under 10
 needs one re-seed; [analysis version 11](#analysis-version-11) says what moved.
 The package upgrade rebuilds the versioned analysis cache automatically, and the
-first `inventory` or `coverage` after it analyzes every file again. Restart each
-client's MCP session after upgrading so its running server uses the new code.
+first `inventory` or `coverage` after it analyzes every file again. That run's
+[twin-key note](ratchet.md#twins-one-name-several-functions) names the first five
+files that give one name to several functions and ends with `... and N more file(s)
+define a name more than once`. Restart each client's MCP session after upgrading so
+its running server uses the new code.
 
 Keep a copy of the committed ratchet and its diff before an upgrade. In each repo:
 
@@ -54,7 +57,11 @@ numbers, and the stamp records the rules, so every marks file re-seeds once:
   it read `a.a.b.c( x )`.
 - A def whose body sits on its colon line, such as `def one(x): return x`, is listed
   as its own function. Before, no report showed it and the lines after it counted
-  toward it. A def that encloses one can gain conditions it had lost.
+  toward it. A def that encloses one can gain conditions it had lost. A same-named
+  def after it moves to the next twin key: where a one-line `f( x )` sits above a
+  multi-line `f( x )`, the multi-line def is now `f( x )#2`, a mark recorded under
+  `f( x )` binds the one-line def, and `ratchet seed` marks `f( x )#2` if it is over
+  its ceiling.
 - Cognitive complexity and nesting count a def's body from the colon that ends its
   signature, so a one-line body counts and a signature's continuation lines do not.
 - A Python file that ends inside a def's signature is refused and names that def;
@@ -64,25 +71,38 @@ The one-line change moves `ccn` for the def and for the defs whose lines it used
 take, and a generic def with a constrained bound and a line break after a default,
 which read two lines at ccn 1, now reads its whole body. A newly listed def, or an
 enclosing def that read short before, can be over its ceiling and fails the gate the
-next time its file changes. Under a coverage.py lane a one-line def scores as
-uncovered with remedy `split-lines`, because its only line is the `def` statement
-that runs at import.
+next time its file changes. Under a coverage.py lane a def whose body starts on the
+line its signature ends, a one-line def or a body on the last line of a signature
+that spans several lines, scores as uncovered with remedy `split-lines`, because
+coverage.py reads that body as the `def` statement that runs at import.
+
+Version 11 also reads JavaScript and TypeScript template literals whole. lizard ended
+a template at the first backtick inside it, so a template nested in another's `${...}`,
+an escaped backtick, or a brace inside a string within `${...}` hid every function
+after it in the file: each was folded into the function around it or not listed at
+all. Those functions are now listed, and the function that held them reads only its
+own lines and branches. A newly listed function can be over its ceiling and fails the
+gate the next time its file changes. A function written inside `${...}` is still not
+listed.
 
 After upgrading, in each repo:
 
 ```sh
 crapkit coverage
-crapkit ratchet seed
 crapkit ratchet prune
+crapkit ratchet seed
 ```
 
-`coverage` measures under version 11, and `ratchet seed` stamps the marks with the
-metric of the run it reads, so a seed from a run 0.7.x measured keeps the old stamp.
-`ratchet prune` then drops the marks left under the old names. When a failed verify
+`coverage` measures under version 11, and `ratchet prune` drops the marks left under
+the old names. `ratchet seed` then stamps the marks with the metric of the run it
+reads, so a seed from a run 0.7.x measured keeps the old stamp. Prune goes first
+because a marks file with no `# crapkit-keys=1` line keeps the old key format while
+any mark names a function the run lacks, and that format cannot key a function that
+shares its start line with another, so seed refuses to add one. When a failed verify
 pins the baseline, seed and prune both read the pinned run: pass the new run's id to
-each, `crapkit ratchet seed --baseline N` then `crapkit ratchet prune --baseline N`;
-the seed line and verify's refusal both name it. Review the diff and commit it before
-the next `crapkit verify`.
+each, `crapkit ratchet prune --baseline N` then `crapkit ratchet seed --baseline N`;
+their lines and verify's refusal name it. Review the diff and commit it before the
+next `crapkit verify`.
 
 ### Analysis version 10
 
@@ -112,8 +132,9 @@ environment and artifact bytes. Since 0.8.0 a lane can list the paths its comman
 reads as `inputs`, and `--reuse-unchanged` then reuses it across commits while
 nothing under those paths, its lane table or its `env` changed. The reuse proof
 covers that field, so the first `--reuse-unchanged` after upgrading to 0.8.0 reruns
-every lane once, and an older stamp without the proof reruns its lane. Ignored
-files, installed dependencies and external services remain outside this proof. See
+every lane once, and an older stamp without the proof reruns its lane; each rerun
+prints `lane 'x': rerunning:` and the reason. Ignored files, installed dependencies and
+external services remain outside this proof. See
 [artifact reuse](lanes.md#reusing-artifacts) before choosing an explicit
 saved-artifact read.
 

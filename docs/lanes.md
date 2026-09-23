@@ -37,6 +37,7 @@ verifies blind. `doctor` says so, per lane, with the flag to add:
 
 ```
 $ crapkit doctor
+resources: up to 8 analysis worker(s) per pool, 8 shared slot(s); lane log limit 16777216 bytes per file
 ok   config keys all recognized
 ok   scope 'calc': 1 file
 ok   every tracked source file belongs to a scope
@@ -135,6 +136,7 @@ that exits 9009:
 
 ```
 $ crapkit doctor
+resources: up to 8 analysis worker(s) per pool, 8 shared slot(s); lane log limit 16777216 bytes per file
 ok   config keys all recognized
 ok   scope 'calc': 1 file
 ok   every tracked source file belongs to a scope
@@ -258,7 +260,7 @@ that ran is the number to read.
 One shape does fail loudly. An `fnMap` entry with no `decl` exits 5:
 
 ```
-crapkit: lane 'js' FAILED: unparseable istanbul artifact: 'decl'
+crapkit: lane 'js' FAILED: unparseable istanbul artifact /repo/.crapkit/cov/js/coverage-final.json: 'decl'
 ```
 
 ### What else lives in .crapkit/
@@ -284,7 +286,7 @@ coupling-cache-v1.json
 cov
 crap.sqlite
 lane-py.log
-stat-stamps.json
+measurement.lock
 
 .crapkit/cov:
 junit-py.xml
@@ -296,16 +298,17 @@ py.json
 | `crap.sqlite` | The store: run history, every scored function, the override audit trail, and the per-run rollups `trend` and `report` read. Durable, not a cache. The ratchet marks are not here; they live in the committed `crapkit-ratchet.tsv`. | |
 | `cov/` | Where `init` points every lane's `artifact` and `results_artifact`. | |
 | `lane-<name>.log` | One lane's streamed output, an `--- attempt N ---` header per retry. Current and `.log.1` files each have a 16 MiB default bound; see [log policies](resources.md#logs-and-retained-evidence). | |
-| `artifacts.json` | Per artifact: the commit it was built at, the lane that built it, how long that took, and, for an artifact the lane's last attempt failed to write, the modification time of the file it left (`refused_mtime_ns`). Drives `--reuse-unchanged`, `doctor --tune` and the [reuse refusal](#the-artifact-a-failed-attempt-left-behind-is-refused). | |
+| `artifacts.json` | Per artifact: the commit it was built at, the lane that built it, how long that took, the reuse `proof` with the digests it was taken over (`proof_parts`), and, for an artifact the lane's last attempt failed to write, the modification time of the file it left (`refused_mtime_ns`). Drives `--reuse-unchanged`, `doctor --tune` and the [reuse refusal](#the-artifact-a-failed-attempt-left-behind-is-refused). | |
 | `cache.json` | Analysis records per file, so an unchanged file is not re-analyzed. | The file's content hash, under a fingerprint of the lizard pin and the analysis version. |
-| `stat-stamps.json` | What the last run saw for each file (mtime, size, hash), so unchanged files are not re-hashed. | |
+| `measurement.lock` | The lock a lane run holds on this checkout's lane logs and artifact stamps while its commands run, so two crapkit processes never measure one checkout at once. It stays behind between runs and holds nothing. | |
+| `stat-stamps.json` | What the last run saw for each file (mtime, size, hash), so unchanged files are not re-hashed. A file enters it once it has held still for two seconds, so a run right after the files were written, like the listing above, leaves no `stat-stamps.json` yet. | |
 | `churn-cache-v2.json` | Per-file churn for the window: commits, authors, weight. | HEAD sha, window months, today's UTC date, path format. |
 | `churn-commits-v1.json` | The window's commits: each one's author, author date and commit date, and each path's commits. Read only when the churn map misses; a HEAD that grew from it walks only the new commits. Not kept in a shallow clone. | HEAD sha, window months, path format and the --since cutoff its commits were cut at, plus the body's size and CRC. |
 | `churn-log-v2.z` | The window's `git log --name-only` output, deflated, with its key in `churn-log-v2.json` beside it. | Same four fields. The key also records the --since cutoff the log was cut at; a refresh below it walks the window again. |
 | `coupling-cache-v1.json` | Ranked co-change pairs at the default thresholds, ordered and uncut. | The churn map's key plus a digest of the tracked set. |
 | `mutate-pool/` | Kept worktrees for every mutation worker, including one. See [mutation worktrees](configuration.md#mutation-worktrees). | |
 | `mutate-tmp/` | Recognized concurrent mutation runs, removed after completion or recovered under an exclusive lease. | |
-| `test-runs/` | Marked default development test evidence. Crapkit's development runner expires it by age and count at each default start. Explicit output and active leases are preserved. | |
+| `test-runs/` | Marked default test evidence from crapkit's own development runner, `tools/testing/run.py`, which prunes it by age and count (`--retention-days`, `--retention-count`) before each default run. `clean` leaves it alone. Explicit output and active leases are preserved. | |
 | `report.html` | Where `crapkit report` writes by default. | |
 
 Since 0.4.5 the rollup is filled once per run and pruned with its run, which is why `trend`
@@ -733,8 +736,8 @@ write at all. The reported case is a `conftest.py` two testpaths both import, wh
 Setting `full_suite = false` on a single narrowed lane clears the refusal and measures one
 testpath; the other three go dark, their functions score `no-lane`, and nothing says so.
 
-Declare one lane per collectable testpath instead, each with `full_suite = false` and its
-own artifact:
+Declare one lane per collectable testpath instead, each with `full_suite = false`, its
+own artifact and its own coverage.py data file:
 
 ```toml
 [[lane]]
@@ -743,6 +746,7 @@ command = "python -m pytest conform --cov --cov-branch --cov-report=json:.crapki
 artifact = ".crapkit/cov/py-conform.json"
 results_artifact = ".crapkit/cov/junit-py-conform.xml"
 parser = "coveragepy"
+env = { COVERAGE_FILE = ".coverage.py-conform" }
 scopes = ["impl"]
 full_suite = false
 
@@ -752,9 +756,19 @@ command = "python -m pytest impl --cov --cov-branch --cov-report=json:.crapkit/c
 artifact = ".crapkit/cov/py-impl.json"
 results_artifact = ".crapkit/cov/junit-py-impl.xml"
 parser = "coveragepy"
+env = { COVERAGE_FILE = ".coverage.py-impl" }
 scopes = ["impl"]
 full_suite = false
 ```
+
+Both lanes start in the repo root, where coverage.py writes `.coverage` unless
+`COVERAGE_FILE` names another file. When a lane starts, pytest-cov deletes its data file and
+every file named after it plus a dot, and when it ends it combines those files, so a lane
+left on `.coverage` also takes in the other lane's `.coverage.py-impl`. Serial lanes take
+turns on these files. Under [`max_parallel_lanes`](#running-lanes-in-parallel), two lanes on
+one data file can lose one to `sqlite3.OperationalError: table coverage_schema already
+exists`, and a lane on `.coverage` beside one on `.coverage.py-impl` can lose one to
+`PermissionError: [WinError 32]` on Windows. Keep the `env` line in both.
 
 Several lanes may name the same scope: the parts table at the top of this page forbids
 two lanes sharing an `artifact` path, and nothing else. Both lanes above name `impl`, the
@@ -966,16 +980,45 @@ which is what [refuses that file on reuse](#the-artifact-a-failed-attempt-left-b
 | Flag | Behavior |
 |---|---|
 | `--reuse-artifacts` | Skip every lane command, parse whatever is on disk, except the artifact a lane's last attempt failed to write: that one is refused (exit 5) until something rewrites it. Warns per lane when files under that lane's scopes changed since the stamp. |
-| `--reuse-unchanged` | Reuse a lane only when its stamp proves nothing it reads changed; otherwise run it again. A lane without `inputs` needs the same clean HEAD, unchanged lane settings, `crapkit.toml` bytes, inherited environment and coverage/JUnit bytes. A lane with `inputs` needs its artifact's commit still behind HEAD, no change under those paths, its own lane table and `env` unchanged, and the same coverage/JUnit bytes. A failed attempt that wrote no artifact always reruns. |
+| `--reuse-unchanged` | Reuse a lane only when its stamp proves nothing it reads changed; otherwise run it again. A lane without `inputs` needs the same clean HEAD, unchanged lane settings, `crapkit.toml` bytes, inherited environment and coverage/JUnit bytes. A lane with `inputs` needs its artifact's commit still behind HEAD, no change under those paths, its own lane table and `env` unchanged, and the same coverage/JUnit bytes. A failed attempt that wrote no artifact always reruns. Each lane prints one line saying which it did, and a rerun names the first condition that failed. |
 
 Without `inputs`, automatic reuse covers the whole tracked tree, including tests and
 shared helpers: any tracked or untracked change, or a new commit, reruns the lane.
 With [`inputs`](configuration.md#lane) it covers exactly those paths, literal paths
 from the root with no globs, so a docs commit or an untracked draft elsewhere reruns
 nothing, and a file the command reads that the list leaves out is never checked.
+An entry that matches no tracked file, and no untracked file outside `.gitignore`,
+hides every change behind it, so `doctor` fails on it and names the entry.
 Measurements made while their proof did not hold (a dirty tree, or dirty inputs)
-and older stamps without this proof cannot be reused automatically. Environment
-values are hashed together; stamps do not store them.
+and older stamps without this proof cannot be reused automatically.
+
+The declared `artifact` and `results_artifact` of every lane in `crapkit.toml` are not
+changes to the tree or to a lane's inputs, whether git ignores them or not: every run
+rewrites them, and each stamp proves its own by their digests. Any other file a lane
+writes that git does not ignore is a change, and the rerun line names it; ignore it.
+
+The environment half of the proof leaves out what a shell or terminal keeps for its
+own bookkeeping: `OLDPWD`, `PWD`, `SHLVL`, `_` and terminal session ids such as
+`WT_SESSION`, `TERM_SESSION_ID` and `SSH_CONNECTION`, so a `cd` between two runs reruns
+nothing. Every other inherited variable counts. The stamp keeps a
+16-hex digest of each value under `proof_parts`, never the value, so a rerun can
+name the variable that changed.
+
+Each lane says what `--reuse-unchanged` decided, before any lane starts:
+
+```
+$ crapkit coverage --reuse-unchanged
+crapkit: lane 'py': measurement inputs unchanged; reusing without rerun (artifact built at 525a3276065)
+crapkit: lane 'web': rerunning: the working tree has 1 uncommitted change(s): web/src/app.ts
+```
+
+A rerun names the first condition that failed: `no artifact at PATH`, a last attempt
+that wrote none, `its stamp holds no proof` (measured with uncommitted changes, or by a
+crapkit that recorded none), uncommitted changes, `HEAD is X and its artifact was built
+at Y`, `crapkit.toml changed`, `its lane table changed`, `N environment variable(s)
+changed: NAME`, changes under a lane's `inputs` since its commit, or artifact bytes that
+differ from the stamp. `coverage --json` carries the same sentence per lane as
+`rerun_reason`, `""` for a lane it reused.
 
 Ignored inputs other than `crapkit.toml`, files outside the repository, installed
 dependencies and services are outside that proof. Run fresh coverage when those
@@ -1198,7 +1241,8 @@ Rules that keep this from hiding real failures:
 
 ## Running lanes in parallel
 
-Wall time, and nothing else. The scores come out identical.
+Wall time, and nothing else. The scores come out identical, as long as no two lanes
+write the same file.
 
 ```toml
 [crapkit]
@@ -1215,15 +1259,32 @@ Every reuse decision is taken up front on one thread, before any lane starts, be
 command writes to the working tree and deciding lane by lane would let one lane's output
 change the next lane's answer.
 
-Two things to check before raising it:
+Three things to check before raising it:
 
 - Raise it only when the suites are independent. Two lanes sharing a port or a temp
   directory manufacture failures that `verify` reads as a gate breach.
 - Runners that size their own worker pool from free memory (vitest does) need a per-lane
   `env` cap, or N lanes each claim the whole box.
+- Two `coveragepy` lanes that start in one directory can share coverage.py data there. Two
+  lanes left on `.coverage` write one file. A lane on `.coverage` also deletes and combines
+  every `.coverage.*` beside it, which takes in a lane on `.coverage.py-impl` and the pieces
+  that lane writes while it runs. Run at once, one of them intermittently dies, with
+  `sqlite3.OperationalError: table coverage_schema already exists` or, on Windows,
+  `PermissionError: [WinError 32]`, and the run comes back partial, exit 5. Give every lane
+  its own `COVERAGE_FILE`, none named after another's plus a dot:
+  `env = { COVERAGE_FILE = ".coverage.py-conform" }` in one and
+  `env = { COVERAGE_FILE = ".coverage.py-impl" }` in the other. `doctor` WARNs about such
+  lanes when `max_parallel_lanes` is above 1.
 
 `crapkit doctor --tune` suggests a value from your cpu count and the recorded lane durations,
-and estimates the makespan. It writes nothing.
+and estimates the makespan. It writes nothing. While one `coveragepy` lane deletes and
+combines another's data files, as happens to the two testpath lanes above once either drops
+its `env` line, it holds the suggestion at 1 and names them:
+
+```
+max_parallel_lanes = 1
+# held at 1: lanes 'py-conform', 'py-impl' write coverage.py data files that one of them deletes and combines, and two of them at once can fail one lane; give each lane its own COVERAGE_FILE, for example env = { COVERAGE_FILE = ".coverage.py-conform" } in lane 'py-conform' and env = { COVERAGE_FILE = ".coverage.py-impl" } in lane 'py-impl', then rerun doctor --tune
+```
 
 `[crapkit] analysis_workers` (default `0` = one process per core) caps the lizard pool
 separately. Set it when the analysis pass runs beside parallel lanes so the two are not both
@@ -1335,7 +1396,9 @@ run 3 @ 393b8dad2a1: 2 functions scored: 1 measured / 1 no-lane, 1 over ceiling 
 
 Exit 5. The summary opens by saying the run is partial, counts `over` and the grade over
 the measured scopes only (the failed lane's function is `scripts`' debt under
-`by_scope`, not this run's grade), and ends with the lanes to rerun. Four consequences:
+`by_scope`, not this run's grade), and ends with the lanes to rerun. On a tree with
+uncommitted changes that last line adds ``(the working tree has uncommitted changes, so
+every lane that lists no `inputs` reruns)``. Four consequences:
 
 1. **The failed lane's scopes fall back to `no-lane`, not `untested`.** The distinction is
    the point: `untested` means a working lane had nothing to say about this function,
@@ -1365,10 +1428,12 @@ there, and what came out was a confident grade off a measurement nothing took, s
 the current commit so `--reuse-unchanged` went on trusting it.
 
 A leftover artifact says so in its own words, because "produced no artifact at
-.crapkit/cov/py.json" about a path that holds a report reads as crapkit failing to see it:
+.crapkit/cov/py.json" about a path that holds a report reads as crapkit failing to see it.
+The lane below declares its junit file too, as every lane `init` writes does, so the line
+names both files the run left:
 
 ```
-crapkit: lane 'py' FAILED: lane 'py' wrote no artifact this run — the .crapkit/cov/py.json on disk predates it and is the previous run's (command exit 2); lane log: /repo/.crapkit/lane-py.log; last output: ...
+crapkit: lane 'py' FAILED: lane 'py' wrote no artifact this run — the .crapkit/cov/py.json and .crapkit/cov/junit-py.xml on disk predate it and are the previous run's (command exit 2); lane log: /repo/.crapkit/lane-py.log; last output: ...
 ```
 
 When the artifact is not on disk at all and the leftover is some other declared file, the

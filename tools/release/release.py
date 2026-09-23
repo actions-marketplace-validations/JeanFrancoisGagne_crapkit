@@ -57,6 +57,10 @@ GITHUB_API = "https://api.github.com/"
 # Stage 2b runs these through this interpreter (`python -m build`, `python -m
 # twine`) before the push, so `check` refuses an interpreter that cannot import one.
 RELEASE_TOOLING = ("build", "twine")
+# Seconds a live read may take. The registry's search answered in 78 and 87
+# seconds on a cold cache (2026-09-23), so its reads get their own bound.
+READ_TIMEOUT = 20
+REGISTRY_READ_TIMEOUT = 120
 # Seconds between readbacks of a surface that was just written.
 READBACK_PAUSE = 5
 # Reads of a just-written surface before it counts as unconfirmed: 55 seconds.
@@ -316,9 +320,13 @@ def _api_request(url: str) -> urllib.request.Request:
     return request
 
 
+def _read_timeout(url: str) -> int:
+    return REGISTRY_READ_TIMEOUT if url.startswith(REGISTRY_SEARCH) else READ_TIMEOUT
+
+
 def _urlopen(url: str) -> str:
     try:
-        with urllib.request.urlopen(_api_request(url), timeout=20) as response:
+        with urllib.request.urlopen(_api_request(url), timeout=_read_timeout(url)) as response:
             return response.read().decode("utf-8")
     except (urllib.error.URLError, OSError) as exc:
         raise ReleaseError(f"{url}: {exc}") from exc
@@ -1130,6 +1138,8 @@ def _stage1_files(root: Path) -> None:
 
 
 def _run_step(step: Step, root: Path, dry_run: bool) -> None:
+    if not step.commands:
+        print(f"{step.name} is a manual step: {step.note}")
     for command in step.commands:
         if step.stage == "stage1" and not dry_run:
             _stage1_files(root)
@@ -1226,12 +1236,21 @@ def _run_guarded(stage: str, steps: list, version: str, root: Path) -> None:
     _finish_stage(stage, root, version, receipt, before)
 
 
+def _stage_steps(stage: str, version: str) -> list:
+    """The plan's steps for one stage. The refusal names the stages from the plan,
+    so a stage the plan gains is one the refusal lists."""
+    chain = plan(version)
+    steps = [s for s in chain if s.stage == stage]
+    if not steps:
+        stages = ", ".join(dict.fromkeys(s.stage for s in chain))
+        raise ReleaseError(f"no stage {stage!r}; stages: {stages}")
+    return steps
+
+
 def run(stage: str, version: str, root: Path, *, dry_run: bool = False) -> None:
     """Check repository proof, then execute a stage; a dry run only prints it."""
     root = root.resolve()
-    steps = [s for s in plan(version) if s.stage == stage]
-    if not steps:
-        raise ReleaseError(f"no stage {stage!r}; stages: stage1, stage2a, verify, stage2b, registry, surfaces")
+    steps = _stage_steps(stage, version)
     if dry_run:
         for step in steps:
             _run_step(step, root, True)

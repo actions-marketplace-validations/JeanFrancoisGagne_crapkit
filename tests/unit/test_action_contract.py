@@ -751,11 +751,27 @@ def test_no_verdict_falls_back_to_the_job_log_when_coverage_printed_no_summary()
 
 def test_no_verdict_quotes_the_error_object_when_coverage_printed_one():
     """0.5.0's --json prints one error object when a crapkit error escapes."""
-    coverage = {"error": {"exit": 5, "kind": "tool", "message": "every lane failed (1 of 1); the errors are above\n"}, "schema": 1}
+    coverage = {"error": {"exit": 5, "kind": "tool", "message": "lizard is not importable\n"},
+                "schema": 1}
 
     line = _builder().no_verdict_line(coverage, 5)
 
-    assert "(every lane failed (1 of 1); the errors are above)" in line
+    assert "(lizard is not importable)" in line
+
+
+def test_every_lane_failing_points_at_the_job_log_not_above():
+    """The CLI's `the errors are above` means stderr; nothing sits above the line
+    in a pull request comment, and the lane errors are in the job log."""
+    coverage = {"error": {"exit": 5, "kind": "tool",
+                          "message": "every lane failed (1 of 1); the errors are above\n"},
+                "schema": 1}
+
+    line = _builder().no_verdict_line(coverage, 5)
+
+    assert "(every lane failed (1 of 1); the lane errors are in the job log)" in line, line
+    assert "above" not in line, line
+    assert f"`({_builder().coverage_failure(coverage)})`" in " ".join(_readme_section().split()), \
+        "the README quotes the line the builder prints"
 
 
 def test_the_body_renders_no_verdict_in_place_of_the_verify_line_when_coverage_failed():
@@ -1003,3 +1019,42 @@ def test_the_readme_pins_uses_to_the_release_it_documents():
 
     assert pins, "the README no longer shows a uses: pin"
     assert pins == {__version__}, f"README pins {sorted(pins)}, this release is {__version__}"
+
+
+def _run_post_step(tmp_path, head_repo: str, gh_exit: int):
+    """The post step under bash, with a `gh` on PATH that prints an error and
+    exits `gh_exit`, the way a bad token or a missing permission answers."""
+    state = tmp_path / "state"
+    state.mkdir(parents=True)
+    (state / "crapkit-comment.json").write_text("{}", encoding="utf-8")
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    (shim / "gh").write_text(f"#!/bin/sh\necho 'gh: Bad credentials (HTTP 401)' >&2\nexit {gh_exit}\n",
+                             encoding="utf-8", newline="\n")
+    (shim / "gh").chmod(0o755)
+    script = tmp_path / "post-step.sh"
+    script.write_text(_step_named("post the comment")["run"], encoding="utf-8", newline="\n")
+    env = {**os.environ, "PATH": f"{shim}{os.pathsep}{os.environ['PATH']}",
+           "CRAPKIT_STATE": state.as_posix(), "GH_TOKEN": "x", "PR": "7",
+           "REPO": "owner/repo", "HEAD_REPO": head_repo}
+    return subprocess.run([_bash(), "--noprofile", "--norc", "-eo", "pipefail", script.as_posix()],
+                          env=env, capture_output=True, text=True)
+
+
+def test_a_failed_post_blames_the_fork_token_only_on_a_fork(tmp_path):
+    """Every nonzero gh exit read `a fork pull request's token cannot write
+    comments`: bad credentials, a missing gh and a same-repo job without
+    pull-requests: write were all told they came from a fork."""
+    fork = _run_post_step(tmp_path / "fork", "someone/repo", 1)
+    same = _run_post_step(tmp_path / "same", "owner/repo", 1)
+
+    assert "a fork pull request's token cannot write comments" in fork.stdout, fork.stdout
+    assert "fork" not in same.stdout, same.stdout
+    assert "posting the crapkit comment exited 1: gh's own error is above" in same.stdout, \
+        same.stdout
+
+
+def test_the_post_step_reads_the_head_repository_off_the_event():
+    env = _step_named("post the comment")["env"]
+
+    assert env["HEAD_REPO"] == "${{ github.event.pull_request.head.repo.full_name }}"
