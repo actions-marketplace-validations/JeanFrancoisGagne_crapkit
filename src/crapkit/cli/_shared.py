@@ -279,20 +279,17 @@ def _proved_paths(root: Path, proof, marks) -> set:
     """The files whose history the legacy mark proof must cover.
 
     A mark is compared with a row of its own file, so the rows' files come
-    first: check_gate and the commit gate prove the few files they read, and
-    worklist, brief and verify every file their run holds. Two readers compare
-    a mark with a row the proof does not hold. `ratchet prune` moves a mark off
-    a file git renamed, which the working tree no longer has, onto a proved
-    file. And with no rows at all the reader matches marks against another
-    run: explain on a file the newest run dropped. So a marked file the tree
-    lost is proved, and an empty proof proves every marked file. The helper
-    cannot tell that explain from `rescore --gate` on a file with no functions,
-    which compares no mark, so that gate pays the whole proof too, as it did
-    before the proof was narrowed to the rows' files.
+    first: check_gate, the commit gate, explain and brief prove the few files
+    they read, and worklist and verify every file their run holds. One reader
+    compares a mark with a row the proof does not hold: `ratchet prune` moves a
+    mark off a file git renamed, which the working tree no longer has, onto a
+    proved file. So a marked file the tree lost is proved too. explain proves
+    the run it resolved the name in, which holds the file even when the newest
+    run dropped it, so an empty proof names no file the tree still holds.
     """
     paths = {row.path for row in proof}
     marked = {entry.path for entry in marks}
-    return (paths | _lost_files(root, marked - paths)) if paths else marked
+    return paths | _lost_files(root, marked - paths)
 
 
 def _lost_files(root: Path, paths: set) -> set:
@@ -327,33 +324,35 @@ def _identity_history(root: Path, store, paths: set) -> set:
         return set()
     from contextlib import closing
 
-    opened = SnapshotStore(db)
-    with closing(opened._conn):
+    with closing(SnapshotStore(db)) as opened:
         return opened.historical_collision_groups(paths)
 
 
-def _check_ratchet_identity(text: str, root: Path, name: str, rows, store=None) -> int:
-    from ..ratchet import (KEY_VERSION, check_reader_keys, checked_key_version,
-                           read_key_version, read_ratchet)
+def _check_ratchet_identity(text: str, root: Path, name: str, rows, store=None,
+                            entries=None) -> int:
+    """The key version the marks in `text` can be compared under, or a refusal.
+    `entries` is `read_ratchet(text)[0]` when the caller already parsed it, so
+    the proof parses the file only when nobody has."""
+    from ..ratchet import (KEY_VERSION, check_reader_keys, checked_key_version, parsed_marks,
+                           read_key_version)
 
     try:
-        check_reader_keys(text)
-        if read_key_version(text) == KEY_VERSION:
-            return KEY_VERSION
-        marks = read_ratchet(text)[0]
-        if not marks:
+        marks = parsed_marks(text, entries)
+        check_reader_keys(text, marks)
+        if read_key_version(text) == KEY_VERSION or not marks:
             return KEY_VERSION
         proof = rows() if callable(rows) else rows
         paths = _proved_paths(root, proof, marks)
-        return checked_key_version(text, proof, historical=_identity_history(root, store, paths))
+        return checked_key_version(text, proof, historical=_identity_history(root, store, paths),
+                                   entries=marks)
     except ValueError as exc:
         raise ConfigError(f"{name}: {exc}") from exc
 
 
-def _ratchet_key_version(root: Path, cfg, rows, store=None) -> int:
+def _ratchet_key_version(root: Path, cfg, rows, store=None, entries=None) -> int:
     path = root / cfg.ratchet_file
     text = repo_text(path, cfg.ratchet_file) if path.is_file() else ""
-    return _check_ratchet_identity(text, root, cfg.ratchet_file, rows, store)
+    return _check_ratchet_identity(text, root, cfg.ratchet_file, rows, store, entries)
 
 
 def _ratchet_entries(root: Path, cfg, rows=None, store=None) -> list | None:
@@ -376,7 +375,7 @@ def _ratchet_entries(root: Path, cfg, rows=None, store=None) -> list | None:
     text = repo_text(ratchet_path, cfg.ratchet_file)
     entries, complaints = read_ratchet(text)
     if rows is not None:
-        _check_ratchet_identity(text, root, cfg.ratchet_file, rows, store)
+        _check_ratchet_identity(text, root, cfg.ratchet_file, rows, store, entries)
     for complaint in complaints:
         print(f"crapkit: skipped an unreadable mark in {cfg.ratchet_file}: {complaint}",
               file=sys.stderr)

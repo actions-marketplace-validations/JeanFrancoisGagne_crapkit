@@ -19,7 +19,7 @@ import shlex
 
 from .ratchet_report import DAY, mark_age_days
 from .keys import position
-from .score import _remedy
+from .score import remedy, shares_its_def_line
 
 # What the gate actually enforces, said once. A session that reads a ceiling of
 # 6 beside a standing mark of 72 otherwise reads a contradiction and either
@@ -33,8 +33,9 @@ _CLOSERS = ")]}>"
 # `stale` clears when a run lands on the current commit and never before. The
 # packet used to answer its own staleness warning with another `brief`, which
 # re-reads the snapshot that is already stale. `--reuse-unchanged` reruns only
-# the lanes whose scope files moved and parses the rest off the artifacts they
-# already have, so it is the cheapest call that still writes a run.
+# the lanes whose stamp cannot prove their inputs unchanged and parses the rest
+# off the artifacts they already have, so it is the cheapest call that still
+# writes a run.
 #
 # Every command the packet names is spelled as the console script, the
 # resolution the hooks and the plugin manifest already trust (#20, #37). Bare
@@ -216,23 +217,26 @@ def rejudged(row, ceiling: int, rows_of):
     called only for a row whose stored verdict cannot say whether another
     function declares its lines.
     """
-    verdict = _remedy(row.ccn, row.crap, ceiling)
+    verdict = remedy(row.ccn, row.crap, ceiling)
     if verdict == "add-tests" and _shares_span(row, rows_of):
         verdict = "split-lines"
     return row if verdict == row.remedy else row._replace(remedy=verdict)
 
 
 def _shares_span(row, rows_of) -> bool:
-    """Whether another function declares this row's source lines.
+    """Whether another function declares this row's source lines, or a one-line
+    Python def shares its line with its own `def` statement.
 
     The run answered it for every row it judged between its ccn and its CRAP:
     split-lines is yes, add-tests is no. Only a row it judged ok or decompose
-    costs a read of the file's rows.
+    costs a read of the file's rows, and a one-line def answers without one.
     """
     if row.remedy in ("add-tests", "split-lines"):
         return row.remedy == "split-lines"
-    return row.flag not in _UNJOINED and any(_same_span(row, other)
-                                             for other in rows_of(row.path))
+    if row.flag in _UNJOINED:
+        return False
+    return shares_its_def_line(row) or any(_same_span(row, other)
+                                           for other in rows_of(row.path))
 
 
 def _same_span(row, other) -> bool:

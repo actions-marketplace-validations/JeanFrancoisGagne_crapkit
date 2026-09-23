@@ -34,9 +34,10 @@ _NAME_DESCRIPTION = ("the bare identifier (classify, or route for a Rust "
 # its outputSchema does not list is rejected whole by a validating client.
 _REMEDIES = ("decompose", "split-lines", "add-tests", "ok")
 _REMEDY_DESCRIPTION = ("decompose (ccn over ceiling), split-lines (another function shares its "
-                       "source lines, so coverage cannot tell them apart and no test lowers the "
-                       "score until the definitions sit on separate lines), add-tests (coverage "
-                       "short) or ok (nothing left to do)")
+                       "source lines, or a one-line Python def shares its only line with its def "
+                       "statement, so coverage cannot tell them apart and no test lowers the "
+                       "score until they sit on separate lines), add-tests (coverage short) or ok "
+                       "(nothing left to do)")
 _REMEDY = {"type": "string", "description": _REMEDY_DESCRIPTION, "enum": _REMEDIES}
 
 # The partition a large repo needs before `top` means anything: one --scope
@@ -118,9 +119,12 @@ _WORKLIST_ITEM = {'type': 'object',
                                         'inventory-only run',
                          'enum': ('measured', 'untested', 'no-lane', 'cc-only', None)},
                 'remedy': {'type': ('string', 'null'),
-                           'description': 'decompose, split-lines, add-tests or ok; every row '
-                                          'but ok reaches get_next_item when a lane measures it; '
-                                          'null on an inventory-only run',
+                           'description': 'decompose, split-lines, add-tests or ok, as the '
+                                          'ranked run judged it; null on an inventory-only run. '
+                                          'Every row but ok reaches get_next_item when a lane '
+                                          'measures it, unless crapkit.toml changed a ceiling '
+                                          'since that run: get_next_item judges each row against '
+                                          'the ceiling on disk',
                            'enum': (*_REMEDIES, None)},
                 'crap': {'type': ('number', 'null'),
                          'description': 'the score from the ranked run; null on an inventory-only '
@@ -436,9 +440,9 @@ TOOLS: tuple[dict, ...] = (
         "scored row, uncovered lines and the refresh, test, gate and verify command "
         "lines, none of them run. Use it once a function is chosen. Skip it for "
         "picking what to fix, that is get_next_item, and for a score across runs, "
-        "get_function_history. Every call shingles the repo for twins, seconds on a "
-        "large corpus. name must live in path. name takes the long name, a bare "
-        "identifier, a start line or NAME#2, exact match first. A miss lists the "
+        "get_function_history. Twins come from the run's stored index, whose first "
+        "build takes seconds. name must live in path. name takes the long name, a "
+        "bare identifier, a start line or NAME#2, exact match first. A miss lists the "
         "file's functions instead of erroring."),
         "properties": {
             "path": {
@@ -742,8 +746,8 @@ TOOLS: tuple[dict, ...] = (
                         "earlier decomposition did not hold")},
                     "history": {
                         "type": "array",
-                        "description": ("one [run_id, ccn] pair per trusted run that scored the "
-                        "function, oldest first"),
+                        "description": ("one [run_id, ccn] pair for every stored run that "
+                        "scored the function, whatever its kind, oldest first"),
                         "items": {
                             "type": "array",
                             "items": {
@@ -829,14 +833,14 @@ TOOLS: tuple[dict, ...] = (
         "flags": {
             "history": "--history",
             "tests": "--tests"},
-        "description": ("Returns one function's ccn, coverage, crap and flag in every run that "
-        "measured it, oldest first, plus its ratchet mark. Use it to tell improving "
-        "from decaying or regrown, and get_function_brief instead to start an edit. "
-        "history true spawns git log -L capped at 10 commits, and tests true is null "
-        "unless the lane recorded contexts. name matches the long names any run scored "
-        "in path, so a fragment like \"eval\" returns one entry per match. A bare twin "
-        "name picks the worst twin, as get_function_brief does. repo may be any "
-        "directory under the measured checkout."),
+        "description": ("Returns one function's ccn, coverage, crap and flag per run, oldest "
+        "first, plus its ratchet mark. Use it to tell improving from decaying or "
+        "regrown, and get_function_brief to start an edit. history true spawns git log "
+        "-L capped at 10 commits, and tests true is null unless the lane recorded "
+        "contexts. name matches the long names any run scored in path, so a fragment "
+        "returns one entry per match, and a bare twin name picks the worst twin. A "
+        "same-line twin's history skips runs stored before same-line positions. repo "
+        "may be any directory under the checkout."),
         "properties": {
             "path": {
                 "type": "string",
@@ -976,7 +980,8 @@ TOOLS: tuple[dict, ...] = (
         "description": ("Checks that crapkit.toml agrees with the repo: typo keys, empty scopes, "
         "missing lane cwds, runners that fail to start. Run it first when any tool "
         "answers strangely or the ranking misses a file, and list_runs when only the "
-        "history is in question. It needs no run, probes each runner once, runs no "
+        "history is in question. It needs no run, probes each runner once per lane "
+        "directory and environment, runs no "
         "lane, and any problem arrives with isError true. repo can be any directory "
         "under the checkout, and one with no crapkit.toml above it answers a pointer, "
         "never a parent's config."),
@@ -1154,11 +1159,12 @@ TOOLS: tuple[dict, ...] = (
             "similarity": "--similarity"},
         "description": ("Lists near-duplicate function pairs in the newest run, at most 50. Use it "
         "before a refactor so twins are folded together, and get_function_brief for "
-        "one function's twins. It shingles source on every call, seconds on a large "
-        "repo, skips functions under 8 lines and same-file pairs, and an empty list "
-        "means no pair reached similarity. similarity is shared shingles over the "
-        "smaller function: 1.0 admits only a function found whole inside another, 0.8 "
-        "four lines in five, and repo may be any directory under the checkout."),
+        "one function's twins. It reads the run's stored index, whose first build "
+        "takes seconds on a large repo, skips functions under 8 lines and same-file "
+        "pairs, and an empty list means no pair reached similarity. similarity is "
+        "shared shingles over the smaller function: 1.0 admits only a function found "
+        "whole inside another, 0.8 four lines in five, and repo may be any directory "
+        "under the checkout."),
         "properties": {
             "similarity": {
                 "type": "number",

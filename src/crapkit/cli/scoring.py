@@ -20,8 +20,8 @@ from ..store import SnapshotStore
 from ..universe import assign_files, scan_files
 from ..uncovered import DeadLineFold
 from ._shared import (_analysis_tools, _command_root, _emit_findings, _file_sizer, _gate_line,
-                      _latest_scored, _load_repo_config, _print_json, _ratchet_entries,
-                      _repo_out_path, _repo_relative, _stand,
+                      _latest_scored, _load_repo_config, _load_sources, _print_json,
+                      _ratchet_entries, _repo_out_path, _repo_relative, _stand,
                       _write_tsv)
 
 
@@ -95,6 +95,19 @@ def _build_inventory(root: Path, cfg, git=None) -> tuple[str, list, _Corpus, int
     return commit, rows, _Corpus(len(flat), len(universe.oversized)), cache_hits, tool_versions
 
 
+def _record_twin_index(root: Path, store: SnapshotStore, run_id: int) -> None:
+    """Store the run's shingle index beside its rows, so the first brief opens
+    one file and duplication reads its owner lists back.
+
+    Read back from the store, not taken from the rows in hand: brief and
+    duplication build from `read_rows`, and so does this. verify skips it, since
+    it runs on every commit; the first reader of a verify run stores it."""
+    from ..dup import run_index
+
+    rows = store.read_rows(run_id)
+    run_index(store, run_id, rows, lambda: _load_sources(root, {r.path for r in rows}))
+
+
 def cmd_inventory(args: argparse.Namespace) -> int:
     root = _command_root(args.repo)
     cfg = _load_repo_config(root)
@@ -105,6 +118,7 @@ def cmd_inventory(args: argparse.Namespace) -> int:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     store = SnapshotStore(db_path)
     run_id = store.write_run(commit=commit, tool_versions=tool_versions, rows=rows, kind="inventory")
+    _record_twin_index(root, store, run_id)
 
     if args.export:
         _write_tsv(_repo_out_path(root, args.export), tsv_lines(rows))
@@ -127,13 +141,14 @@ def cmd_inventory(args: argparse.Namespace) -> int:
 
 
 def _lane_reuse(root: Path, lane, reuse_artifacts: bool, reuse_unchanged: bool) -> bool:
-    from ..lanes import lane_unchanged
+    from ..lanes import lane_reuse_commit
 
     if reuse_artifacts:
         return True
-    if reuse_unchanged and lane_unchanged(root, lane):
-        print(f"crapkit: lane {lane.name!r}: measurement inputs unchanged; reusing without rerun",
-              file=sys.stderr)
+    commit = lane_reuse_commit(root, lane) if reuse_unchanged else ""
+    if commit:
+        print(f"crapkit: lane {lane.name!r}: measurement inputs unchanged; reusing without rerun "
+              f"(artifact built at {commit[:11]})", file=sys.stderr)
         return True
     return False
 
@@ -549,6 +564,7 @@ def cmd_coverage(args: argparse.Namespace) -> int:
     shape = _run_shape(lanes, cfg, run)
     run_id = store.write_run(commit=run.commit, tool_versions=run.tool_versions, rows=run.scored,
                              lanes=run.provenance, kind=shape.kind)
+    _record_twin_index(root, store, run_id)
     if args.export:
         _export_scored(root, args.export, run.scored)
     _emit_coverage_findings(root, args, run.scored, cfg)
@@ -680,7 +696,8 @@ def _rescore_overlay(store: SnapshotStore, latest: dict, rows: list, flat: list,
     return overlay_stale_coverage(rows, _baseline_rows(store, latest["id"], flat),
                                   lane_scopes=lane_scopes, target=cfg.target,
                                   scope_targets=cfg.scope_targets,
-                                  cc_only_scopes=cfg.coverage_optional_scopes)
+                                  cc_only_scopes=cfg.coverage_optional_scopes,
+                                  baseline_run_id=latest["id"])
 
 
 def _rescore_json(overlay, latest: dict, gate: dict | None = None) -> None:
