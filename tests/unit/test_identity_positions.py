@@ -1,11 +1,14 @@
 """Same-line callbacks retain separate keys, stored marks and selectable history."""
+import json
 from collections import namedtuple
 from contextlib import closing
 
 import pytest
 
-from crapkit import keys, packet
-from crapkit.errors import ToolError
+from crapkit import keys
+from crapkit.cli import main
+from crapkit.cli.reports import _explain_selection
+from crapkit.errors import CrapkitError, ToolError
 from crapkit.score import ScoredRow
 from crapkit.store import SnapshotStore
 from crapkit.worklist import RatchetMarks
@@ -32,7 +35,7 @@ def test_same_line_keys_follow_occurrence_not_score_or_arrival():
 
 def test_handles_distinguish_same_line_and_keep_global_anonymous_order():
     first, second = row(1), row(2, name='(anonymous) ( x )')
-    assert packet.handles([second, first, first._replace(scope='copy')]) == {
+    assert keys.handles([second, first, first._replace(scope='copy')]) == {
         ('app.ts', '(anonymous)', 1, 1): '(anonymous)#1',
         ('app.ts', '(anonymous) ( x )', 1, 2): '(anonymous)#2',
     }
@@ -57,7 +60,8 @@ def test_stored_same_line_callbacks_keep_scores_spans_and_history(tmp_path):
         assert store.read_marks(run).score(second) == (20, 0)
         assert store.function_span(run, 'app.ts', '(anonymous)#2') == (1, 1)
         assert store.function_history('app.ts', '(anonymous)#2')[0]['crap'] == 20
-        assert store.function_key('app.ts', '(anonymous)', '(anonymous)#2') == '(anonymous)#2'
+        assert _explain_selection(store, run, 'app.ts', '(anonymous)#2') == [
+            ('(anonymous)', '(anonymous)#2')]
         ratchet = RatchetMarks({('app.ts', '(anonymous)#2'): 25}, store.twin_key_names(run))
         assert ratchet.of(second) == 25
         assert ratchet.of(first) is None
@@ -80,6 +84,36 @@ def test_legacy_database_keeps_rows_and_refuses_precise_collision_reads(tmp_path
                      lambda: reopened.function_history('app.ts', '(anonymous)')]:
             with pytest.raises(ToolError, match='ambiguous legacy'):
                 read()
+
+
+def test_a_legacy_collision_refuses_only_the_selectors_that_reach_it(tmp_path, capsys):
+    """Two callbacks share line 1 with no recorded position; f opens alone on 5.
+
+    A name reads only its own twins, so the collision elsewhere in the file
+    does not refuse f. The line form reads every position in the file and still
+    refuses."""
+    root = tmp_path / 'repo'
+    (root / 'src').mkdir(parents=True)
+    (root / 'src' / 'app.ts').write_text('//\n' * 20, encoding='utf-8')
+    (root / 'crapkit.toml').write_text(
+        '[crapkit]\ntarget = 6\n\n[[scope]]\nname = "src"\npaths = ["src"]\n'
+        'languages = ["typescript"]\ncoverage_optional = true\n', encoding='utf-8')
+    (root / '.crapkit').mkdir()
+    path = root / '.crapkit' / 'crap.sqlite'
+    store = SnapshotStore(path)
+    in_src = [r._replace(path='src/app.ts', scope='src')
+              for r in (row(0), row(0), row(0, start=5, name='f( )'))]
+    with closing(store._conn):
+        store.write_run(commit='a' * 40, tool_versions={}, rows=in_src)
+        if 'occurrence' in {r[1] for r in store._conn.execute('PRAGMA table_info(functions)')}:
+            store._conn.execute('ALTER TABLE functions DROP COLUMN occurrence')
+            store._conn.commit()
+
+    assert main(['explain', 'src/app.ts', 'f', '--json', '--repo', str(root)]) == 0
+    functions = json.loads(capsys.readouterr().out)['functions']
+    assert [f['long_name'] for f in functions] == ['f( )']
+    assert main(['explain', 'src/app.ts', '5', '--json', '--repo', str(root)]) == ToolError.exit_code
+    assert 'ambiguous legacy function identity' in capsys.readouterr().out
 
 
 def test_collision_group_query_preserves_ordinary_and_scope_copy_rows():
@@ -105,7 +139,7 @@ def test_actual_typescript_callbacks_survive_inventory_scoring_and_store(tmp_pat
         assert store.read_scored(run) == scored
         names = keys.key_names(store.read_scored(run))
         assert [keys.key_of(names, r)[1] for r in scored] == ['(anonymous)', '(anonymous)#2']
-        assert len(packet.handles(store.read_rows(run))) == 2
+        assert len(keys.handles(store.read_rows(run))) == 2
 
 
 def test_historical_groups_do_not_mix_runs_or_scope_copies(tmp_path):
@@ -124,11 +158,14 @@ def test_same_line_numeric_selection_refuses_and_ordinal_claims_stay_separate(tm
     with closing(store._conn):
         rows = [row(1), row(2)]
         run = store.write_run(commit='fixture', tool_versions={'analysis_version': '10'}, rows=rows)
-        with pytest.raises(ToolError, match='multiple functions'):
-            store.find_functions('app.ts', '1')
-        with pytest.raises(ToolError, match='multiple functions'):
-            store.function_key('app.ts', '(anonymous)', '1')
-        names, handles = keys.key_names(rows), packet.handles(rows)
+        # explain refuses the line with brief's words and brief's exit 1: a
+        # selector the caller can fix is not a tool failure.
+        with pytest.raises(CrapkitError) as refused:
+            _explain_selection(store, run, 'app.ts', '1')
+        assert refused.value.exit_code == 1
+        assert str(refused.value) == ('line 1 in app.ts is ambiguous; use a handle: '
+                                      '(anonymous)#1, (anonymous)#2')
+        names, handles = keys.key_names(rows), keys.handles(rows)
         claims = [store.record_claim(path=r.path, long_name=r.long_name, commit='fixture',
                                     handle=handles[keys.lookup(r)], key_name=keys.key_of(names, r)[1],
                                     source_run_id=run)

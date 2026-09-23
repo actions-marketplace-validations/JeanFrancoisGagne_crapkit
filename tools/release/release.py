@@ -23,6 +23,7 @@ import argparse
 import datetime
 import hashlib
 import importlib.util
+import itertools
 import json
 import os
 import re
@@ -30,7 +31,6 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-import sysconfig
 import time
 import urllib.error
 import urllib.parse
@@ -54,9 +54,9 @@ REGISTRY_REPOSITORY = f"https://github.com/{REPO_SLUG}"
 PAGES_LATEST = f"https://api.github.com/repos/{REPO_SLUG}/pages/builds/latest"
 GLAMA_SERVER = f"https://glama.ai/mcp/servers/{REPO_SLUG}"
 GITHUB_API = "https://api.github.com/"
-# The release runs these; a thin venv that resolves them from the base install
-# cannot bridge them into the throwaway venvs three tests build.
-RELEASE_TOOLING = ("pytest", "coverage", "build", "twine")
+# Stage 2b runs these through this interpreter (`python -m build`, `python -m
+# twine`) before the push, so `check` refuses an interpreter that cannot import one.
+RELEASE_TOOLING = ("build", "twine")
 # Seconds between readbacks of a surface that was just written.
 READBACK_PAUSE = 5
 # Reads of a just-written surface before it counts as unconfirmed: 55 seconds.
@@ -177,11 +177,6 @@ def _module_origin(name: str) -> str | None:
     return spec.origin if spec else None
 
 
-def _owns(purelib: Path, origin: str | None) -> bool:
-    """Whether this environment carries its own copy, rather than borrowing one."""
-    return origin is not None and purelib in Path(origin).resolve().parents
-
-
 def _keyring_has(url: str) -> bool:
     """Twine's other credential source. Imported lazily: keyring is not stdlib and
     the rest of this tool must run without it."""
@@ -202,12 +197,13 @@ def _twine_credential():
     return _keyring_has(PYPI_UPLOAD_URL)
 
 
-def _tooling_problems(locate: Callable, purelib: Path) -> list[str]:
-    missing = [name for name in RELEASE_TOOLING if not _owns(purelib, locate(name))]
+def _tooling_problems(locate: Callable) -> list[str]:
+    missing = ", ".join(name for name in RELEASE_TOOLING if locate(name) is None)
     if not missing:
         return []
-    return [f"the release environment does not own {', '.join(missing)}: activate this "
-            "repository's .venv, which the py lane's bare `python` also resolves from PATH"]
+    return [f"the release interpreter cannot import {missing}; stage 2b runs "
+            f"`python -m build` and `python -m twine` before the push, so install {missing} "
+            "into the environment that runs release.py"]
 
 
 def _credential_problems(credential: Callable) -> list[str]:
@@ -217,15 +213,16 @@ def _credential_problems(credential: Callable) -> list[str]:
             "is passed, so set TWINE_USERNAME and TWINE_PASSWORD, or store the token in keyring"]
 
 
-def preflight(*, locate: Callable | None = None, purelib: str | None = None,
+def preflight(*, locate: Callable | None = None,
               credential: Callable | None = None) -> list[str]:
     """What must be true before stage 1 builds or pushes anything.
 
     Every fault of the 0.7.2 release fired after PyPI and the GitHub release were
     already public, because nothing proved the machine first. Both checks here
-    take milliseconds and both cost a published half-release when skipped."""
-    home = Path(purelib or sysconfig.get_paths()["purelib"]).resolve()
-    return (_tooling_problems(locate or _module_origin, home)
+    take milliseconds. A missing credential costs a published half-release when
+    skipped; a missing build or twine stops stage 2b before the push, and check
+    catches it before stage 1."""
+    return (_tooling_problems(locate or _module_origin)
             + _credential_problems(credential or _twine_credential))
 
 
@@ -331,11 +328,34 @@ def _git_tag(root: Path) -> str:
     return _git(root, "describe", "--tags", "--abbrev=0")
 
 
+def _first_line(done: subprocess.CompletedProcess) -> str:
+    lines = done.stderr.strip().splitlines()
+    return lines[0] if lines else f"exit {done.returncode}"
+
+
 def _gh_release(root: Path, version: str) -> str:
-    done = subprocess.run(["gh", "release", "view", f"v{version}", "--repo", GITHUB_REPO,
-                           "--json", "url", "--jq", ".url"],
-                          cwd=root, capture_output=True, text=True)
+    """The release URL, or "" when gh says the release does not exist. Any other
+    failure raises: a logged-out gh exits 4 and knows nothing about the release."""
+    try:
+        done = subprocess.run(["gh", "release", "view", f"v{version}", "--repo", GITHUB_REPO,
+                               "--json", "url", "--jq", ".url"],
+                              cwd=root, capture_output=True, text=True)
+    except OSError as exc:
+        raise ReleaseError(f"cannot run gh: {exc}") from exc
+    if done.returncode and "release not found" not in done.stderr:
+        raise ReleaseError(f"gh failed: {_first_line(done)}")
     return done.stdout.strip()
+
+
+def _github_row(version: str, read: Callable) -> Row:
+    """A shell without gh, or a gh that fails for any reason but a missing
+    release (logged out, say), cannot say whether the release exists, so the row
+    says unconfirmed rather than `none`."""
+    try:
+        url = read()
+    except ReleaseError as exc:
+        return Row("GitHub release", f"v{version}", f"unconfirmed ({exc})", False)
+    return Row("GitHub release", f"v{version}", url or "none", f"v{version}" in url)
 
 
 def _row(surface: str, expected: str, observed: str) -> Row:
@@ -350,6 +370,9 @@ def _pypi_row(version: str, fetch: Callable) -> Row:
         return _row("PyPI", version, info["version"])
     except ReleaseError as exc:
         return Row("PyPI", version, f"unreachable ({exc})", False)
+    except (ValueError, KeyError, TypeError) as exc:
+        # An HTML error page, or JSON without `info`: PyPI answered, but not with the release.
+        return Row("PyPI", version, f"unreachable (not the version JSON: {exc!r})", False)
 
 
 def _registry_pages(fetch: Callable):
@@ -478,9 +501,8 @@ def verify(root: Path, version: str, *, fetch: Callable | None = None,
     fetch = fetch or _urlopen
     tag = _answer(git_tag, lambda: _git_tag(root))
     commit = _answer(tag_commit, lambda: _tag_commit(root, version))
-    url = gh_release(version) if gh_release else _gh_release(root, version)
-    rows = [_row("git tag", f"v{version}", tag),
-            Row("GitHub release", f"v{version}", url or "none", f"v{version}" in url),
+    read_github = (lambda: gh_release(version)) if gh_release else (lambda: _gh_release(root, version))
+    rows = [_row("git tag", f"v{version}", tag), _github_row(version, read_github),
             _pypi_row(version, fetch)]
     rows += _registry_rows(version, fetch)
     carries = contains or (lambda ancestor, built: _contains(root, ancestor, built))
@@ -500,8 +522,8 @@ class Step(NamedTuple):
 
 
 PY = sys.executable
-RELEASE_FILES = tuple(sorted({surface.path for surface in SURFACES}
-                            | {"CHANGELOG.md", "SECURITY.md", "crapkit-ratchet.tsv"}))
+RATCHET_FILE = "crapkit-ratchet.tsv"
+RELEASE_FILES = tuple(sorted({surface.path for surface in SURFACES} | {"CHANGELOG.md", "SECURITY.md"}))
 
 
 def _upload_prefix(surface: str, version: str) -> tuple:
@@ -513,7 +535,8 @@ def plan(version: str) -> list:
     """The chain as a list a person reads before running it. Order is what the
     contracts require: the tag before the contract files (two of them read the
     newest tag), verify before anything leaves the machine, PyPI before the
-    registry (the registry validates the README PyPI serves)."""
+    registry (the registry validates the README PyPI serves). Stage 1 measures
+    nothing: seed and prune run after the verify, against its run."""
     _parse(version)
     tool = (PY, "tools/release/release.py")
     contracts = (PY, "-m", "pytest", "-q", "-n", "0", "-p", "no:randomly", *CONTRACT_FILES)
@@ -523,8 +546,6 @@ def plan(version: str) -> list:
             (PY, "-m", "pip", "install", "-e", ".", "--no-deps", "-q"),
             (PY, "tools/docs/generate.py"),
             (PY, "-m", "pytest", "-q", "-n", "0", "-p", "no:randomly", "tests/unit/test_version_surface.py"),
-            (PY, "-m", "crapkit", "coverage"), (PY, "-m", "crapkit", "ratchet", "seed"),
-            (PY, "-m", "crapkit", "ratchet", "prune"),
             ("git", "add", "--", *RELEASE_FILES), ("git", "commit", "-q", "-m", f"Release {version}")),
             note="guard: clean main includes origin/main; publication waits for the tagged full verify"),
         Step("tag", "stage2a", (("git", "tag", f"v{version}"),)),
@@ -532,6 +553,11 @@ def plan(version: str) -> list:
         Step("verify", "verify", ((PY, "-m", "crapkit", "verify"),), background=True,
              note="run it via `release.py run verify VERSION`: the bare `crapkit verify` stamps no"
                   " watermark and publication then refuses its evidence; a foreground call dies at 600 s"),
+        Step("ratchet", "verify", ((PY, "-m", "crapkit", "ratchet", "seed"),
+                                   (PY, "-m", "crapkit", "ratchet", "prune")),
+             note=f"after a passing verify, against its run: a change verify, seed and prune make "
+                  f"to {RATCHET_FILE} stops the release; the committed file goes back and the "
+                  "computed one is saved under .crapkit/"),
         Step("artifacts", "stage2b", ((PY, "-m", "build", "-q", "--outdir", RELEASE_DIST),
                                       (PY, "-m", "twine", "check", f"{RELEASE_DIST}/*")),
              note="build once, record wheel and sdist digests; retries verify and reuse these bytes"),
@@ -565,12 +591,33 @@ def _git(root: Path, *arguments: str) -> str:
     return done.stdout.strip()
 
 
+def _status_records(root: Path) -> list[str]:
+    output = _git(root, "status", "--porcelain=v2", "--branch", "--untracked-files=all", "-z")
+    return [record for record in output.split("\0") if record]
+
+
+def _repo_state(root: Path) -> tuple[dict, int]:
+    """Branch headers and the count of changed paths, from one git status. Every
+    stage and every publish action checks this, and it used to cost three git
+    processes: branch, status and rev-parse.
+
+    Headers are the leading run only. Porcelain v2 prints every header before any
+    entry, and a rename entry carries its original path as a field of its own,
+    which can start with "# " too."""
+    records = _status_records(root)
+    headers = list(itertools.takewhile(lambda record: record.startswith("# "), records))
+    return dict(header[2:].split(" ", 1) for header in headers), len(records) - len(headers)
+
+
 def _clean_main(root: Path) -> str:
-    if _git(root, "branch", "--show-current") != "main":
+    headers, changed = _repo_state(root)
+    if headers.get("branch.head") != "main":
         raise ReleaseError("release requires the main branch")
-    if _git(root, "status", "--porcelain", "--untracked-files=all"):
+    if headers.get("branch.oid") == "(initial)":
+        raise ReleaseError("release requires a commit on main")
+    if changed:
         raise ReleaseError("release requires a clean tree, including untracked files")
-    return _git(root, "rev-parse", "HEAD")
+    return headers["branch.oid"]
 
 
 def _guard_bump(root: Path, version: str) -> dict:
@@ -1101,17 +1148,81 @@ def _run_or_untag(step: Step, root: Path, version: str, dry_run: bool,
         raise ReleaseError(f"{step.name} failed: {exc}") from exc
 
 
+def _marks(root: Path) -> bytes | None:
+    path = root / RATCHET_FILE
+    return path.read_bytes() if path.is_file() else None
+
+
+def _put_back_marks(root: Path, marks: bytes | None) -> None:
+    path = root / RATCHET_FILE
+    if marks is None:
+        path.unlink(missing_ok=True)
+    else:
+        path.write_bytes(marks)
+
+
+def _save_marks(root: Path, version: str, marks: bytes) -> str:
+    saved = f".crapkit/release-marks-{version}.tsv"
+    (root / saved).write_bytes(marks)
+    return saved
+
+
+def _marks_stop(version: str, run: int, saved: str) -> str:
+    """The refusal, with the commands that carry the computed marks into the
+    release commit. `git add` comes first because `git commit -- PATH` refuses a
+    marks file the release commit does not track yet."""
+    return NL.join((
+        f"verify, seed and prune change {RATCHET_FILE} against verify run {run}, so the release "
+        f"commit lacks marks its own tree earns. The committed file is back in place and the "
+        f"computed one is saved at {saved}. Carry it into the release commit:",
+        f"    $ git tag -d v{version}",
+        f"    $ cp {saved} {RATCHET_FILE}",
+        f"    $ git add -- {RATCHET_FILE}",
+        "    $ git commit --amend --no-edit",
+        f"then rerun `release.py run stage2a {version}` and `release.py run verify {version}`"))
+
+
+def _check_ratchet(step: Step, root: Path, receipt: dict, before: int, committed: bytes | None) -> None:
+    """Stage 1 once ran a full coverage lane only to feed `ratchet seed` and
+    `ratchet prune`, and the verify stage then ran the same lane again. The verify
+    run is that lane at the tagged tree, so seed and prune now work from it.
+
+    `committed` is the marks file as the stage found it, read before the verify:
+    a green verify already tightens and drops marks, so a read taken after it
+    would miss that change. Any change by verify, seed or prune stops the release,
+    because the release commit must carry the marks. The committed bytes go back
+    either way, and the computed ones wait under .crapkit/ for the operator."""
+    try:
+        run = _passing_run(root, receipt["head"], before)
+        _run_or_untag(step, root, receipt["version"], False)
+        computed = _marks(root)
+    finally:
+        _put_back_marks(root, committed)
+    if computed != committed:
+        saved = _save_marks(root, receipt["version"], computed)
+        raise ReleaseError(_marks_stop(receipt["version"], run, saved))
+
+
+def _stage_step(step: Step, root: Path, version: str, receipt: dict, before: int,
+                marks: bytes | None = None) -> None:
+    if step.stage == "stage2b":
+        _publish_step(step, root, receipt)
+    elif step.name == "ratchet":
+        _check_ratchet(step, root, receipt, before, marks)
+    else:
+        _run_or_untag(step, root, version, False, receipt.get("head", ""))
+
+
 def _run_guarded(stage: str, steps: list, version: str, root: Path) -> None:
     receipt = _preflight(stage, root, version)
-    before = _last_run(root) if stage == "verify" else 0
+    before, marks = 0, None
     if stage == "verify":
+        # The guard proved a clean tree, so these are HEAD's committed marks.
+        before, marks = _last_run(root), _marks(root)
         receipt.pop("verify_run", None)
         _write_receipt(root, receipt)
     for step in steps:
-        if stage == "stage2b":
-            _publish_step(step, root, receipt)
-        else:
-            _run_or_untag(step, root, version, False, receipt.get("head", ""))
+        _stage_step(step, root, version, receipt, before, marks)
     _finish_stage(stage, root, version, receipt, before)
 
 

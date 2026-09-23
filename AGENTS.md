@@ -96,7 +96,8 @@ Exact first: a NAME that IS a function's long name or bare identifier resolves t
 function alone, even when other names contain it — `route` is `route`, never
 `route_chain`. A NAME that names no function falls back to a substring search, so a
 half-remembered fragment still finds what holds it. `brief` and `explain` run the same
-rule on the same string.
+rule on the same string, and both read a start line or an `(anonymous)#N` handle off the
+newest trusted run: a failed verify taken after it holds other positions.
 
 A name that two functions answer to exits 1 and lists the candidates. Pass the long
 name or the start line instead:
@@ -116,7 +117,8 @@ the handles the file does hold:
 
 One file can also give one name to several NAMED functions: several dataclasses each
 with a `__post_init__`, both arms of an `#ifdef` fork. A bare name resolves to the worst
-of them, which is the one the queue ranks. `NAME#2` selects the second in file order and
+of them, which is the one the queue ranks, in `brief`, `explain` and
+`get_function_history` alike. `NAME#2` selects the second in file order and
 `NAME#3` the third — the same ordinals the ratchet keys their marks on, so the mark in a
 packet is the mark on the function that packet opened. An ordinal past the last twin
 exits 1:
@@ -664,7 +666,8 @@ Shared rules belong to these modules:
 | `universe.py` | which scope owns a path. `owning_scope` is the only predicate, and the deepest declared `paths` entry wins |
 | `config.py` | what words a lane command holds. `shell_words` and `shell_segments` read it the way the shell that runs it reads it |
 | `config_contract.py` | which configuration shapes, keys and enum values are valid. Runtime admission, doctor and the generated editor schema share this vocabulary |
-| `procs.py` | who owns command descendants. `run_owned` and `run_bounded` stop descendants before returning or releasing leases |
+| `procs.py` | how an owned command starts, is waited on and is bounded. `run_owned` and `run_bounded` stop descendants before returning or releasing leases |
+| `_process_owner.py` | who holds registered command trees. `own_processes` yields the in-process or guardian owner; `prepare` names a command's registration before spawn and `register_then` takes it back unread |
 | `resources.py` | how cold analysis pools share a nonblocking worker budget; cached and small calls skip pool coordination |
 | `logs.py` | how active command output drains into bounded rotating logs without hiding progress |
 | `retention.py` | which completed test runs are eligible for cleanup under their own leases |

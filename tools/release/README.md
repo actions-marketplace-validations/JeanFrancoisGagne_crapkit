@@ -2,7 +2,7 @@
 
 The version is always an explicit argument. Run one stage at a time from the release checkout. Stage 1 requires clean `main` that includes current `origin/main`; local preparation commits may remain unpublished. Stage 2a creates the local tag and runs the contract tests. Publishing requires that tag at the same clean HEAD and a new passing full `verify` row recorded by the verify stage. A zero process exit without that ledger row is refused. Nothing is pushed before that proof passes.
 
-Stage 1 regenerates documentation after reinstalling the bumped version and before measuring coverage. It includes the generated `SECURITY.md` support table in the release commit. Stage 2a checks generated guidance against the tagged version.
+Stage 1 regenerates documentation after reinstalling the bumped version. It includes the generated `SECURITY.md` support table in the release commit. It measures nothing: the verify stage runs the one full py lane a release needs. Stage 2a checks generated guidance against the tagged version.
 
 The verification ledger must record passing tests for the full Python lane, which
 runs both unit and end-to-end suites. Publication requires exit code zero, no test
@@ -28,21 +28,50 @@ stamps a run-id watermark before it starts and publication requires a passing ru
 above that watermark. `python -m crapkit verify` on its own stamps nothing, so a
 run you watched pass is refused later with a message about test evidence.
 
+After a passing verify, the stage runs `ratchet seed` and `ratchet prune` against
+that verify run. A green verify also tightens and drops marks on its own, so the
+stage compares against the marks it read before the verify started. When verify,
+seed and prune change `crapkit-ratchet.tsv`, the release commit lacks marks its own
+tree earns. The stage puts the committed file back, saves the computed one as
+`.crapkit/release-marks-VERSION.tsv`, stops, and publication stays refused. The
+refusal prints the commands that carry the saved file into the release commit:
+
+```
+git tag -d vVERSION
+cp .crapkit/release-marks-VERSION.tsv crapkit-ratchet.tsv
+git add -- crapkit-ratchet.tsv
+git commit --amend --no-edit
+```
+
+Then rerun stage 2a and verify. `git add` comes first because `git commit -- PATH`
+refuses a marks file the release commit does not track yet.
+
 ## Preflight: prove the environment before anything is pushed
 
 Every fault in the 0.7.2 release fired after PyPI and the GitHub release were
 already public, because nothing checked the machine first.
 
-`check VERSION` now refuses the first two rows below, and it is stage 1's first
-command, so the chain stops before it builds or pushes anything. Confirm the other
-two yourself. Each takes seconds; each cost a published half-release when skipped.
+`check VERSION` is stage 1's first command, so the chain stops before it builds or
+pushes anything. Besides the version surfaces and the changelog heading, it reads
+the two rows marked `check` below. Confirm the two rows marked `you` yourself:
+`check` never looks at PATH or at `gh`.
+Each takes seconds. A missing credential or gh login shows up only after the push;
+a wrong PATH python or a missing build or twine stops the release before it.
 
-| Check | Command | Why it bites |
-| --- | --- | --- |
-| The release venv is ACTIVATED | `which python` names this repository's `.venv` | The py lane in `crapkit.toml` runs a bare `python`, taken from PATH, not the interpreter that launched this script. Launching by absolute path is not enough. |
-| That venv owns its dev tools | `python -c "import pytest, coverage, build, twine"` resolves inside the venv | Three tests build a throwaway venv and rely on the dependency-venv bridge to carry the parent's `purelib` into it. A thin venv that resolves pytest from the base install carries nothing, and the child reports `No module named pytest`. |
-| PyPI credentials reach Twine | `TWINE_USERNAME` and `TWINE_PASSWORD` are set, or the token is in keyring | Twine 7 skips the named `.pypirc` entry whenever `--repository-url` is passed, and that flag is a fixed anti-redirect control. A `.pypirc` alone authenticates nothing. |
-| `gh` is authenticated | `gh auth status` | Publishing uses `gh`, and every readback now sends the same credential. GitHub's Pages API answers 404, not 403, to an anonymous reader. |
+| Check | Checked by | Command | Why it bites |
+| --- | --- | --- | --- |
+| The release venv is ACTIVATED | you | `which python` names this repository's `.venv` | The py lane in `crapkit.toml` runs a bare `python`, taken from PATH, not the interpreter that launched this script. Launching by absolute path is not enough. A PATH `python` without the dev extra fails the verify stage: nothing is pushed, and the release waits for a rerun. |
+| The release interpreter imports build and twine | `check` | `python -c "import build, twine"` | Stage 2b runs `python -m build` and `python -m twine` through the interpreter that launched this script, and it builds before the push. |
+| PyPI credentials reach Twine | `check` | `TWINE_USERNAME` and `TWINE_PASSWORD` are set, or the token is in keyring | Twine 7 skips the named `.pypirc` entry whenever `--repository-url` is passed, and that flag is a fixed anti-redirect control. A `.pypirc` alone authenticates nothing. |
+| `gh` is authenticated | you | `gh auth status` | Publishing uses `gh`, and every readback now sends the same credential. GitHub's Pages API answers 404, not 403, to an anonymous reader. |
+
+A failed `check` row prints its line and `check` exits 1. The first line names only
+the tools that are missing:
+
+```
+the release interpreter cannot import build, twine; stage 2b runs `python -m build` and `python -m twine` before the push, so install build, twine into the environment that runs release.py
+no PyPI credential is reachable: twine ignores .pypirc when --repository-url is passed, so set TWINE_USERNAME and TWINE_PASSWORD, or store the token in keyring
+```
 
 Set up the release venv once. `.venv/` is ignored by this repository:
 
