@@ -300,13 +300,13 @@ def _apply_verify_override(store: SnapshotStore, run_id: int, root: Path, cfg, v
     from ..verify import settle_verdict
 
     if not _override_applies(verdict, reason):
-        return verdict, []
+        return verdict
     record_override(store=store, run_id=run_id, root=root, ratchet_file=cfg.ratchet_file,
                     alert_command=cfg.alert_command, violations=verdict.gate_violations,
                     reason=reason, key_version=key_version, identity_rows=identity_rows,
                     ratchet_input=ratchet_input)
     overridden = verdict.gate_violations
-    return settle_verdict(verdict._replace(gate_violations=[])), overridden
+    return settle_verdict(verdict._replace(gate_violations=[], overridden=tuple(overridden)))
 
 
 def _prior_crap(store: SnapshotStore, commit: str, run_id: int) -> dict[tuple[str, str], float]:
@@ -384,7 +384,7 @@ def _write_marks_if_changed(saved, prior: list[RatchetEntry],
     return ratchet_delta(prior, updated)
 
 
-def _settle_verify(store: SnapshotStore, run_id: int, verdict, overridden,
+def _settle_verify(store: SnapshotStore, run_id: int, verdict,
                    saved, ratchet, scored, cfg, *, args,
                    commit: str, key_version: int | None = None) -> RatchetDelta | None:
     """Stamp the verdict; a clean pass (not an override) tightens the ratchet.
@@ -397,7 +397,7 @@ def _settle_verify(store: SnapshotStore, run_id: int, verdict, overridden,
     from ..verify import dirty_counts
 
     changes = None
-    if verdict.ok and not overridden and not args.no_tighten:
+    if verdict.ok and not verdict.overridden and not args.no_tighten:
         hold = _held_marks(store, cfg, commit, run_id, ratchet, scored)
         updated = update_ratchet(ratchet, scored, target=cfg.target,
                                  scope_targets=cfg.scope_targets, hold=hold)
@@ -419,7 +419,7 @@ def _release_claims(store: SnapshotStore, git, cfg, scored) -> None:
                                        scope_targets=cfg.scope_targets, stale_commits=stale))
 
 
-def _print_verify_findings(verdict, overridden) -> None:
+def _print_verify_findings(verdict) -> None:
     dirty_ids = set(verdict.dirty_failures)
     for v in verdict.gate_violations:
         print(_gate_line(v))
@@ -427,7 +427,7 @@ def _print_verify_findings(verdict, overridden) -> None:
         print(f"  RATCHET  {r.path}  {r.long_name}: {r.recorded} -> {r.fresh_crap}{_dirty_tag(r.dirty)}")
     for f in verdict.new_failures:
         print(f"  NEW FAILURE  {f}{_dirty_tag(f in dirty_ids)}")
-    for v in overridden:
+    for v in verdict.overridden:
         print(f"  OVERRIDDEN  {v.path}:{v.start}  {v.long_name}")
 
 
@@ -464,7 +464,22 @@ def _warn_diff_cover_breach(verdict, maximum: int | None) -> None:
 
 
 def _baseline_failures(baseline: dict) -> set:
-    return {f for prov in baseline["lanes"].values() for f in prov.get("failures", ())}
+    """The failures a baseline carries. One that passed its flake retry in a
+    verify run is also named under `retried_passes` and is not carried: that
+    run never counted it, so a later verify must not forgive it."""
+    return {f for prov in baseline["lanes"].values() for f in prov.get("failures", ())
+            if f not in prov.get("retried_passes", ())}
+
+
+def _stored_lanes(provenance: dict, retried: tuple[str, ...]) -> dict:
+    """Lane provenance as a verify run stores it: `failures` stays the lane's
+    own report, and the ones that passed their flake retry are named again."""
+    return {name: _with_retried(prov, retried) for name, prov in provenance.items()}
+
+
+def _with_retried(prov: dict, retried: tuple[str, ...]) -> dict:
+    passed = [f for f in prov.get("failures", ()) if f in retried]
+    return {**prov, "retried_passes": passed} if passed else prov
 
 
 def _verify_attribution(verdict) -> dict:
@@ -475,7 +490,7 @@ def _verify_attribution(verdict) -> dict:
             "dirty_failures": list(verdict.dirty_failures)}
 
 
-def _verify_result(verdict, overridden, run_id: int, baseline: dict, commit: str, ranges,
+def _verify_result(verdict, run_id: int, baseline: dict, commit: str, ranges,
                    uncovered: list, diff_uncovered_max: int | None,
                    unmarked_over_target: int) -> dict:
     """`diff_uncovered_max` travels with the count it judges: a reader of exit 9
@@ -493,7 +508,9 @@ def _verify_result(verdict, overridden, run_id: int, baseline: dict, commit: str
         "gate_violations": [v._asdict() for v in verdict.gate_violations],
         "ratchet_regressions": [r._asdict() for r in verdict.ratchet_regressions],
         "new_failures": verdict.new_failures,
-        "overridden": [v._asdict() for v in overridden],
+        "forgiven_failures": list(verdict.forgiven_failures),
+        "retried_passes": list(verdict.retried_passes),
+        "overridden": [v._asdict() for v in verdict.overridden],
         "diff_uncovered_count": len(uncovered),
         "diff_uncovered": [{"path": p, "line": ln} for p, ln in uncovered[:50]],
         "diff_uncovered_max": diff_uncovered_max,
@@ -558,6 +575,14 @@ def _ratchet_suffix(changes: dict | None, overridden: list, ratchet_file: str) -
     return f" ratchet: {_marks_moved(changes)} -> git add {ratchet_file}"
 
 
+def _counted(ids, noun: str, verb: str) -> str:
+    """` (2 unchanged failures forgiven, first a::b)`, or nothing for no ids."""
+    if not ids:
+        return ""
+    plural = "" if len(ids) == 1 else "s"
+    return f" ({len(ids)} {noun}{plural} {verb}, first {ids[0]})"
+
+
 def _forgiven_suffix(out: dict) -> str:
     """Failures this verdict forgives because the baseline carries them too.
 
@@ -565,23 +590,28 @@ def _forgiven_suffix(out: dict) -> str:
     regression. Saying nothing about it made `verify OK` read as a clean suite
     beside three failing tests, and the release guard downstream, which does not
     forgive them, then refused evidence the operator had just watched pass."""
-    forgiven = out.get("forgiven_failures") or ()
-    if not forgiven:
-        return ""
-    plural = "" if len(forgiven) == 1 else "s"
-    return f" ({len(forgiven)} unchanged failure{plural} forgiven, first {forgiven[0]})"
+    return _counted(out.get("forgiven_failures") or (), "unchanged failure", "forgiven")
 
 
-def _report_verify(as_json: bool, out: dict, verdict, overridden, ratchet_file: str) -> None:
+def _retried_suffix(out: dict) -> str:
+    """New failures that passed their flake retry, in words of their own.
+
+    The baseline never failed them, so calling them unchanged was wrong. The
+    stored run still records the failed first attempt, and the release guard
+    refuses a lane that failed any test, so the OK line has to say one did."""
+    return _counted(out.get("retried_passes") or (), "new failure", "passed on rerun")
+
+
+def _report_verify(as_json: bool, out: dict, verdict, ratchet_file: str) -> None:
     if as_json:
         _print_json(out)
         return
     state = "OK" if verdict.ok else "FAILED"
     print(f"verify {state} @ {out['commit'][:11]} vs baseline {out['baseline_commit'][:11]} "
           f"({out['changed_files']} changed files)"
-          f"{_forgiven_suffix(out)}"
-          f"{_ratchet_suffix(out['ratchet_changes'], overridden, ratchet_file)}")
-    _print_verify_findings(verdict, overridden)
+          f"{_forgiven_suffix(out)}{_retried_suffix(out)}"
+          f"{_ratchet_suffix(out['ratchet_changes'], verdict.overridden, ratchet_file)}")
+    _print_verify_findings(verdict)
     _print_finding_split(verdict)
 
 
@@ -652,41 +682,50 @@ def cmd_verify(args: argparse.Namespace) -> int:
     verdict = with_diff_coverage(verdict, uncovered, cfg.diff_uncovered_max, dirty)
     _warn_diff_cover_breach(verdict, cfg.diff_uncovered_max)
     run_id = store.write_run(commit=commit, tool_versions=tool_versions, rows=scored,
-                             lanes=provenance, kind="verify")
-    verdict, overridden = _apply_verify_override(store, run_id, root, cfg, verdict, args.override,
-                                                 key_version=key_version, identity_rows=scored,
-                                                 ratchet_input=saved)
-    changes = _settle_verify(store, run_id, verdict, overridden, saved, ratchet, scored,
+                             lanes=_stored_lanes(provenance, verdict.retried_passes), kind="verify")
+    verdict = _apply_verify_override(store, run_id, root, cfg, verdict, args.override,
+                                     key_version=key_version, identity_rows=scored,
+                                     ratchet_input=saved)
+    changes = _settle_verify(store, run_id, verdict, saved, ratchet, scored,
                              cfg, args=args, commit=commit, key_version=key_version)
     _release_claims(store, git, cfg, scored)
     _emit_verify_findings(root, args, verdict, uncovered)
 
     _report_verify(args.json,
-                   {**_verify_result(verdict, overridden, run_id, baseline, commit, ranges,
+                   {**_verify_result(verdict, run_id, baseline, commit, ranges,
                                      uncovered, cfg.diff_uncovered_max, len(unmarked)),
-                    **_receipt(tool_versions, saved.sha256, changes),
-                    "forgiven_failures": sorted(set(fresh_failures) - set(verdict.new_failures))},
-                   verdict, overridden, cfg.ratchet_file)
+                    **_receipt(tool_versions, saved.sha256, changes)},
+                   verdict, cfg.ratchet_file)
     _refuse_override(verdict, args.override)
     return _verify_exit_code(verdict)
 
 
 def _flake_retry(root: Path, cfg, provenance: dict, new_failures: set) -> set:
-    """Rerun just the newly-failed ids in lanes that declare retest_command;
-    lanes without one keep their failures untouched."""
-    from ..lanes import retest_lane
-
-    survivors = set(new_failures)
+    """Rerun just the newly-failed ids in lanes that declare retest_command.
+    An id leaves the survivors only when every lane that failed it reran it
+    and the rerun passed: a lane without retest_command keeps its failures,
+    whatever another lane's rerun said about the same id."""
+    passed, kept = set(), set()
     for lane in cfg.lanes:
         lane_new = set(provenance.get(lane.name, {}).get("failures", ())) & new_failures
-        if not lane_new or not lane.retest_command:
-            continue
-        survivors -= retest_lane(root, lane, lane_new)
-    return survivors
+        cleared = _rerun_passes(root, lane, lane_new)
+        passed |= cleared
+        kept |= lane_new - cleared
+    return new_failures - (passed - kept)
+
+
+def _rerun_passes(root: Path, lane, tests: set) -> set:
+    """The ids this lane's rerun passed; none when it failed nothing new or
+    declares no retest_command."""
+    from ..lanes import retest_lane
+
+    if not tests or not lane.retest_command:
+        return set()
+    return retest_lane(root, lane, tests)
 
 
 def _maybe_flake_retry(root: Path, cfg, provenance: dict, verdict):
-    from ..verify import settle_verdict
+    from ..verify import settle_flake_retry
 
     if not verdict.new_failures:
         return verdict
@@ -695,7 +734,7 @@ def _maybe_flake_retry(root: Path, cfg, provenance: dict, verdict):
         return verdict
     print(f"flake retry: {len(verdict.new_failures) - len(survivors)} of "
           f"{len(verdict.new_failures)} new failures passed on rerun", file=sys.stderr)
-    return settle_verdict(verdict._replace(new_failures=sorted(survivors)))
+    return settle_flake_retry(verdict, survivors)
 
 
 def _warn_suite_shrink(baseline: dict, provenance: dict) -> None:
