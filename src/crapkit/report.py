@@ -25,11 +25,10 @@ contract test compares the two.
 from __future__ import annotations
 
 from html import escape
-import os
-import shlex
 
 from .errors import ConfigError
 from .invocation import _self
+from .packet import ENCODED_PREFIX, console_command
 
 # Measured at 46,567 rows / 9.85 MB. A few thousand rows is already a page
 # nobody scrolls; past that it is a page nobody opens.
@@ -226,7 +225,7 @@ def _worklist_row(entry: dict) -> str:
             f'<td class="mono">{_esc(entry["scope"])}</td>'
             f'<td>{_function_cell(entry)}</td>'
             f'<td>{_verdict_cell(entry)}</td>'
-            f'<td><code>{_drill_down(entry)}</code></td></tr>')
+            f'<td class="cmd">{_command_cell(entry)}</td></tr>')
 
 
 def _crap_cell(entry: dict) -> str:
@@ -265,18 +264,30 @@ def _remedy_tone(remedy) -> str:
     return "o" if remedy == "ok" else "a"
 
 
+def _command_cell(entry: dict) -> str:
+    """The drill-down command, and under the encoded Windows form the arguments
+    it carries: base64 hides which function the line opens."""
+    command = _drill_down(entry)
+    if not command.startswith(ENCODED_PREFIX):
+        return f"<code>{command}</code>"
+    carried = _esc(" ".join(_explain_arguments(entry)))
+    return f'<code>{command}</code><div class="loc">encoded form of: {carried}</div>'
+
+
 def _drill_down(entry: dict) -> str:
-    """The command that opens the row: dark lines, history, the committed mark."""
+    """The command that opens the row: dark lines, history, the committed mark.
+
+    Spelled by the brief's own builder, so one line pastes intact into sh, cmd.exe
+    and PowerShell."""
+    return _esc(console_command(_explain_arguments(entry)))
+
+
+def _explain_arguments(entry: dict) -> list[str]:
+    """A path that starts with a hyphen follows `--`, where argparse reads it as
+    the path rather than an option."""
     selector = entry.get("handle") or str(entry["start"])
-    return _esc(f'crapkit explain {_command_arg(entry["path"])} {_command_arg(selector)}')
-
-
-def _command_arg(value: str) -> str:
-    """Quote for PowerShell on Windows and POSIX shells elsewhere."""
-    quoted = shlex.quote(value)
-    if os.name == "nt" and quoted != value:
-        return "'" + value.replace("'", "''") + "'"
-    return quoted
+    marker = ["--"] if entry["path"].startswith("-") else []
+    return ["explain", *marker, entry["path"], selector]
 
 
 # --- the trend series --------------------------------------------------------
@@ -412,6 +423,7 @@ _STYLE = """
   tr:last-child td { border-bottom: none; }
   tbody tr:hover td { background: color-mix(in srgb, var(--accent) 4%, transparent); }
   td.mono { white-space: nowrap; font-size: 13px; }
+  td.cmd code { white-space: normal; overflow-wrap: anywhere; }
   td.empty { color: var(--faint); font-style: italic; }
   .fn { font-size: 13px; word-break: break-word; }
   .loc { font-size: 12px; color: var(--faint); font-family: ui-monospace, Consolas, monospace; }

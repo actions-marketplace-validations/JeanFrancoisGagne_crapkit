@@ -63,6 +63,12 @@ ANALYSIS_VERSION = 11  # A Python def is named by its name token and names each 
 #                       with that logical line, so the lines after it go back to its
 #                       parent and a later def no longer carries its name. A file that
 #                       ends inside a def's signature is refused under either reader.
+#                       The cognitive pass starts a Python body after the colon that
+#                       ends the signature, not at the def's first newline, so a body
+#                       on the colon line counts toward cognitive and nesting and a
+#                       signature's continuation lines no longer do. Measured over
+#                       5,746 stdlib, site-packages and application files: 19 of
+#                       123,320 rows move cognitive, 2 of them nesting too.
 # 10: separate sibling JavaScript/TypeScript expression arrows.
 # 9: a Python row's nesting is the depth the cognitive
 #                          pass measured, not lizard's ND count of structures,
@@ -255,7 +261,11 @@ class _PythonBodies:
     the name token is what creates the function, and the line that ends one
     was charged to its parent by `preprocess`, upstream of here, before the
     token arrived. Sits behind `line_counter`, so no whitespace or newline
-    token reaches it and any token after the body colon is body.
+    token reaches it and any token after the body colon is body. The cognitive
+    pass starts a body at that same token but keeps its own count
+    (lizardcognitive._signature_token): it sits ahead of `preprocess`, whose
+    soft-keyword lookahead hands it the tokens of a `match` line before they
+    reach here.
     """
 
     def __call__(self, tokens, reader):
@@ -532,13 +542,15 @@ def analyze_one(args: tuple[str, str]) -> tuple[str, list[FunctionRecord]]:
         return rel_path, UnanalyzableFile(f"lizard failed on {rel_path}: {exc}")
 
 
-def analyze_source(rel_path: str, code: str) -> list[FunctionRecord]:
+def analyze_source(rel_path: str, code: str, *, note: bool = True) -> list[FunctionRecord]:
     """The records analyze_one would produce for a file holding `code`.
 
     analyze_source_code is what FileAnalyzer.__call__ runs once it has read the
     file, so nothing about the analysis depends on whether the source arrived
     from the disk or from a git blob the caller already holds; rel_path picks
     the language, and with it the extension chain, exactly as the path on disk did.
+    NOTE=False leaves an unreadable file unannounced, for a caller that reads a
+    half-typed edit on purpose.
     """
     try:
         analyzer = lizard.FileAnalyzer(_extensions_for(rel_path))
@@ -547,7 +559,8 @@ def analyze_source(rel_path: str, code: str) -> list[FunctionRecord]:
     except Exception as exc:  # per-file, exactly as in analyze_one; the hook keeps going
         records = UnanalyzableFile(f"lizard failed on {rel_path}: {exc}")
     if isinstance(records, UnanalyzableFile):
-        _note_unanalyzable({rel_path: records})
+        if note:
+            _note_unanalyzable({rel_path: records})
         return records
     _note_twin_keys(rel_path, records)
     return records

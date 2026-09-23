@@ -335,7 +335,7 @@ def _records(root: Path, rel: str) -> list:
     """
     from ..analyze import analyze_source, read_source
 
-    return analyze_source(rel, read_source(str(root / rel)))
+    return analyze_source(rel, read_source(str(root / rel)), note=False)
 
 
 def _changed(root: Path, rel: str, diff_text: str):
@@ -432,11 +432,38 @@ def _marks_for(marks_path: Path, rel: str, records=()) -> set[str]:
 
     if not marks_path.is_file():
         return set()
-    prefix = rel + "\t"
     text = repo_text(marks_path, marks_path.name)
-    selected = "\n".join(line for line in text.splitlines()
-                           if line.startswith(prefix) or line.startswith("#"))
-    return _known_marks(selected, records)
+    return _known_marks(_file_lines(text, rel), records)
+
+
+def _file_lines(text: str, rel: str) -> str:
+    """The format comments and every mark line naming `rel`. A mark whose path
+    starts with `#` or holds a tab or a line break is written as an
+    `@crapkit-record-v1` line, which the raw prefix alone never matches."""
+    from ..records import record_lines
+
+    prefix = rel + "\t"
+    return "\n".join(line for line in record_lines(text) if line.startswith(prefix)
+                     or (line.startswith(("#", "@")) and _carries(line, rel)))
+
+
+def _carries(line: str, rel: str) -> bool:
+    """A comment line, or an `@` line whose decoded path is `rel`. A raw line
+    naming `rel` already matched its prefix, so only these two shapes remain."""
+    from ..ratchet import comment_line
+
+    if line.startswith("#"):
+        return comment_line(line)
+    return _names(line, rel)
+
+
+def _names(line: str, rel: str) -> bool:
+    from ..records import decode_record
+
+    try:
+        return decode_record(line)[:1] == [rel]
+    except ValueError:
+        return False
 
 
 def _known_marks(text: str, records) -> set[str]:

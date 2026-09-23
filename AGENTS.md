@@ -151,7 +151,9 @@ what you are editing, `gate_rule.ceiling` is the number to land under.
 - `remedy: split-lines`: another function shares this one's source lines, so coverage
   cannot tell them apart and the score stays at uncovered whatever you test. Put each
   definition on its own lines, then `crapkit coverage`. The next run says whether tests
-  are still owed.
+  are still owed. A Python def written on one line under a coverage.py lane gets the
+  same remedy: its only line is the `def` statement, which runs at import, so
+  coverage.py cannot see a call. Move its body to the line after the `def`.
 - New file: `rescore --gate` gates it in full (every function, with an `untracked`
   warning on stderr) because git diff cannot scope it. `git add` it so later runs judge
   only your edits; the pre-commit hook only ever sees staged content.
@@ -406,7 +408,7 @@ Act on these fields:
 
 | Field | Use it for |
 |---|---|
-| `remedy` | `decompose` splits the function, `split-lines` moves it off a line it shares, `add-tests` covers it, `ok` needs nothing |
+| `remedy` | `decompose` splits the function, `split-lines` moves it off a line it shares with another function or with its own `def`, `add-tests` covers it, `ok` needs nothing |
 | `est_splits` | pieces a decomposition needs: `0` when `ccn <= target`, else `ceil(ccn / target)` |
 | `est_uncovered_paths` | decision paths no test walks: `round((1 - cov) * ccn)` |
 | `uncovered_lines` | the exact line numbers to cover |
@@ -618,9 +620,11 @@ The dev extra ships `pytest`, `pytest-cov`, `pytest-xdist` and `coverage`. None 
 four is a convenience.
 
 `coverage>=7.10.6` is the floor `[tool.coverage.run] patch = ["subprocess"]` needs, and
-that key is what measures the CLI at all: tests/e2e drives every `cmd_*` through
-`subprocess.run`, pytest-cov 7.0.0 dropped its own subprocess measurement, and without
-the patch every entry point reads 0% with nothing said. An older coverage warns about the
+the key stays although tests/e2e now runs most CLI calls inside the pytest worker, where
+they are measured like any test. The files that bind `cli_runner(spawn=True)`, and every
+Python child crapkit starts, run in processes of their own and are measured only through
+that patch. pytest-cov 7.0.0 dropped its own subprocess measurement, and without the
+patch what only they reach reads 0% with nothing said. An older coverage warns about the
 key and ignores it, so the floor is the half that keeps the warning from being the whole
 story. Measured on `tests/e2e/test_init_doctor_e2e.py`: `cli/admin.py` scores 0/498
 statements without it under pytest-cov 7.1.0, 317/498 with it under 7.1.0 and 6.3.0 alike.
@@ -652,12 +656,38 @@ results. Either suite failing makes the runner fail.
 
 `tests/unit` covers pure seams, and that now includes `cli/verifying.py` and
 `cli/scoring.py`, driven in process rather than through a subprocess. `tests/e2e` drives
-`python -m crapkit` against real git repos in tmp dirs and asserts through the CLI only.
-It spawns that child one way, `run_cli` in `tests/e2e/conftest.py`. Bind your file's
-contract once at the top with `cli_runner(...)` rather than writing another
-`subprocess.run`; before that file there were 42 copies of those four lines, 23 of them
-different, with nothing to say which differences were deliberate. Each e2e command
-injects its own git identity, so no global git config is required.
+the CLI against real git repos in tmp dirs and asserts through the CLI only. Every call
+goes through `run_cli` in `tests/e2e/conftest.py`. Bind your file's contract once at the
+top with `cli_runner(...)` rather than writing another `subprocess.run`; before that file
+there were 42 copies of those four lines, 23 of them different, with nothing to say which
+differences were deliberate. Each e2e command injects its own git identity, so no global
+git config is required.
+
+`run_cli` runs the command inside the pytest worker, which saves an interpreter start per
+call; `tests/e2e/cli_in_process.py` says what of the child it rebuilds and what it puts
+back. A file whose assertions need the process itself binds `cli_runner(spawn=True)`: a
+signal, a killed child, the console script, the child's own stdio decoding, environment
+the interpreter reads only as it starts (PYTHONPATH, PYTHONIOENCODING, PYTHONUTF8 and the
+other PYTHON* variables), calls made at once, a repo big enough for the analysis pool (an
+in-process call that reaches it refuses), or a patch on crapkit's own modules that is
+live while `run_cli` runs. TMPDIR, TEMP and TMP work in process, because the runner
+clears tempfile's cached directory for the call. These files do:
+
+| File | What needs the process |
+|---|---|
+| `test_encoding_e2e.py` | the child's stdio encoding under a legacy code page |
+| `test_mcp_e2e.py`, `test_mcp_no_config.py` | the MCP server as a stdio process; any `mcp` call spawns, since the server reads a real stdin descriptor |
+| `test_claude_hook_e2e.py` | the hook as Claude Code starts it: stdin payload, start time, PYTHONPATH shims |
+| `test_inventory_e2e.py`, `test_hook_prefetch_e2e.py`, `test_init_doctor_e2e.py`, `test_init_scoped_tests_e2e.py`, `test_ratchet_stamp_e2e.py`, `test_advisory_gate_coherence_e2e.py` | PYTHONPATH set through `env_extra` |
+| `test_claim_competition_e2e.py` | sessions racing for claims, three at once |
+| `test_cpp_family_admission_e2e.py`, `test_polyglot_admission_e2e.py` | repos big enough for the analysis pool, which forks its caller on Linux |
+| `test_verify_git_dedupe_e2e.py` | a counter patched onto `gitio` while `run_cli` builds the repo |
+
+A fixture that builds a measured repo builds it once per worker through
+`tests/e2e/repo_templates.py` and hands each test a copy. A test that asserts what a first
+run does gets a fresh build. A copy's lane artifacts still key files by the build's
+staging dir, which is gone, so a test that reads dark lines or reuses artifacts runs
+`coverage` in its copy first, or builds fresh.
 
 ## Where code goes
 
