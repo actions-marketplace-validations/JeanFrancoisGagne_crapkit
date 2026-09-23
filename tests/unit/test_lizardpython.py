@@ -13,8 +13,12 @@ analyze_source and pasted in, never computed in the test. The corrected tables
 were counted by hand and checked against `ast` end lines.
 
 test_stock_reader_still_cuts_the_issue_def_off is the retirement signal: it
-fails on the lizard release that reads these signatures, and
-src/crapkit/lizardpython.py goes then, with its register() call.
+fails on the lizard release that reads these signatures.
+test_stock_reader_still_names_a_generic_def_after_a_bracket is the same signal
+for PEP 695 type parameter lists (tests/unit/test_python_type_parameters.py),
+and test_stock_reader_still_repeats_the_outer_names_three_deep for the name of a
+def nested three deep (tests/unit/test_python_nested_def_names.py).
+src/crapkit/lizardpython.py goes, with its register() call, once all three fail.
 """
 import ast
 
@@ -101,6 +105,30 @@ def test_stock_reader_still_cuts_the_issue_def_off():
         register()
     assert [(f.name, f.start_line, f.end_line, f.cyclomatic_complexity) for f in stock][0] == (
         "annotation_opens_on_the_def_line", 1, 2, 1)
+
+
+def test_stock_reader_still_names_a_generic_def_after_a_bracket():
+    """The PEP 695 half, pinned: `def f[T](a: int):` reads as `]`, not `f`.
+    Fails the day lizard names the def by its name token."""
+    lizard_languages.PythonReader = StockPythonReader
+    try:
+        stock = lizard.analyze_file.analyze_source_code("generic.py", "def f[T](a: int):\n" + BODY)
+    finally:
+        register()
+    assert [(f.name, f.long_name) for f in stock.function_list] == [("]", "]( a : int )")]
+
+
+def test_stock_reader_still_repeats_the_outer_names_three_deep():
+    """The nested-name half, pinned: a def three deep reads `a.a.b.c`, not
+    `a.b.c`. Fails the day lizard names each enclosing def once."""
+    lizard_languages.PythonReader = StockPythonReader
+    try:
+        stock = lizard.analyze_file.analyze_source_code(
+            "nested.py", "def a(x):\n    def b(y):\n        def c(z):\n            return z\n"
+                         "        return c\n    return b\n")
+    finally:
+        register()
+    assert [f.name for f in stock.function_list] == ["a.a.b.c", "a.b", "a"]
 
 
 # --- slice 2: the shapes lizard cut off read their whole span and real ccn ----------

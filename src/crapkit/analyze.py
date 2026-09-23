@@ -58,7 +58,8 @@ _POOL_THRESHOLD = 16
 # Bump whenever analysis semantics change (merge rules, extension set, record
 # extraction): the fingerprint must invalidate cached records produced by older
 # logic even when file content and tool versions are identical.
-ANALYSIS_VERSION = 10  # Separate sibling JavaScript/TypeScript expression arrows.
+ANALYSIS_VERSION = 11  # A Python def is named by its name token and names each enclosing def once.
+# 10: separate sibling JavaScript/TypeScript expression arrows.
 # 9: a Python row's nesting is the depth the cognitive
 #                          pass measured, not lizard's ND count of structures,
 #                          so every cached .py record carries a count under the
@@ -158,7 +159,7 @@ class _CreationOrder:
 # or a line break after a default such as `()`. The def read as two lines at ccn
 # 1 whatever its body held and passed every gate on that reading.
 # crapkit.lizardpython reads those signatures to the body's colon. Measured on
-# 6,866 stdlib, site-packages and openclaw files: all 59 defs lizard cut off read
+# 6,866 stdlib, site-packages and consumer files: all 59 defs lizard cut off read
 # their full span, and of the defs lizard read whole only the 20 nested inside a
 # cut-off def changed, each gaining its parent's name as a prefix (one of them
 # also scores 1 lower on cognitive).
@@ -166,28 +167,58 @@ class _CreationOrder:
 # This check stays as the net under that reader. A def read to its body has a
 # `:` at bracket depth 0 with a token after it; one cut off in its signature has
 # not. A def the reader still cannot finish is refused, never scored at ccn 1.
-_OPENERS = frozenset("([{")
-_CLOSERS = frozenset(")]}")
+#
+# The net counts from the `def` keyword, a token no reader renames, so where it
+# starts does not depend on how the reader names the def. It has to hold under
+# lizard's stock reader too, which is what runs once crapkit.lizardpython
+# retires: that reader names a PEP 695 def after the `]` or `:` before its `(`,
+# so a count started at the function's first token began at depth -1 or on a
+# colon.
+_DEPTH_CHANGE = {"(": 1, "[": 1, "{": 1, ")": -1, "]": -1, "}": -1}
 
 
-def _step_body(fn, token: str) -> None:
-    """Advance one function's signature reading by one of its own tokens.
+class _DefSignatures:
+    """One file's walk from each `def` keyword to its body colon.
 
-    `crapkit_body` is False from the name token on and True from the first
-    token after the body colon. A function some other reader produced never
-    gets the attribute, which is what keeps `_unread_defs` to Python.
+    `depth` is None between signatures and counts the brackets open since the
+    `def` inside one. The function current at the depth-0 colon has reached
+    its body only if it also owns the next token: one the reader cut off has
+    ended by then, and the token belongs to its parent.
+
+    `crapkit_body` turns False on a function first seen inside a signature
+    and True once its body is reached. A function already read to its body
+    keeps True when the rest of a cut-off child's signature is charged to it.
+    A function some other reader produced never gets the attribute, which is
+    what keeps `_unread_defs` to Python.
     """
-    if getattr(fn, "crapkit_colon", False):
-        fn.crapkit_body = True
-        return
-    fn.crapkit_body = False
-    depth = getattr(fn, "crapkit_depth", 0)
-    if token in _OPENERS:
-        fn.crapkit_depth = depth + 1
-    elif token in _CLOSERS:
-        fn.crapkit_depth = depth - 1
-    elif token == ":" and depth == 0:
-        fn.crapkit_colon = True
+
+    def __init__(self, context):
+        self.context = context
+        self.depth = None
+        self.colon_owner = None
+
+    def step(self, token: str) -> None:
+        fn = self.context.current_function
+        if self.colon_owner is not None:
+            self._settle_colon(fn)
+        if self.depth is None:
+            self.depth = 0 if token == "def" else None
+        else:
+            self._signature(fn, token)
+
+    def _settle_colon(self, fn) -> None:
+        if fn is self.colon_owner:
+            fn.crapkit_body = True
+        self.colon_owner = None
+
+    def _signature(self, fn, token: str) -> None:
+        # A parent the stock reader hands the rest of a cut-off signature to
+        # was read to its body already, and keeps that.
+        fn.crapkit_body = getattr(fn, "crapkit_body", False)
+        if token == ":" and self.depth == 0:
+            self.colon_owner, self.depth = fn, None
+        else:
+            self.depth += _DEPTH_CHANGE.get(token, 0)
 
 
 class _PythonBodies:
@@ -204,12 +235,10 @@ class _PythonBodies:
         if not isinstance(reader, _PythonReader):
             yield from tokens
             return
-        context = reader.context
+        signatures = _DefSignatures(reader.context)
         for token in tokens:
             yield token
-            fn = context.current_function
-            if fn is not context.global_pseudo_function:
-                _step_body(fn, token)
+            signatures.step(token)
 
 
 def _chain(cognitive_index: int) -> list:
