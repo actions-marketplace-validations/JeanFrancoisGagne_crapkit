@@ -14,13 +14,21 @@ binds its own contract once, at the top, with `cli_runner`:
                          env_extra={"CRAPKIT_OVERRIDE_REASON": None})
 
 so what that file needs from the child process is one readable line instead of a
-body to diff against 41 others. Nothing here is a policy: the defaults are the
-plainest child (120 s, platform decoding, the inherited environment), and a file
-that needs otherwise says so.
+body to diff against 41 others. The defaults are the plainest child (platform
+decoding, the inherited environment) with one policy: a run that names no timeout
+waits the suite's hang bound (tests/hang_guard.py), and a miss kills the child and
+fails with what it printed. Two files once bound the CLI at 30 s, and a loaded
+machine failed three of their tests on a correct tree. A file may still name a
+longer bound for a run that does real work.
 
 The child inherits the parent's package selection. Development can select the
 working tree with PYTHONPATH; isolated CI selects its verified wheel through
 the environment's interpreter. No default here may replace that choice.
+
+A fixture lane spells a bare `python`, which its shell finds through PATH, so the
+suite's own interpreter directory goes first on the child's PATH. With another
+project's virtualenv first, each nested pytest loaded that environment's
+plugins, and one e2e file spent twice the CPU.
 """
 
 from __future__ import annotations
@@ -31,14 +39,18 @@ import subprocess
 import sys
 from pathlib import Path
 
+import hang_guard
+
 CRAPKIT = [sys.executable, "-m", "crapkit"]
 
 
 def child_env(env_extra: dict | None = None) -> dict:
-    """The parent environment with `env_extra` applied. A None value removes the
-    key, which is how a test drops an inherited grant (CRAPKIT_OVERRIDE_REASON)
-    it must not be judged under."""
+    """The parent environment with the suite's interpreter directory first on
+    PATH, then `env_extra` applied. A None value removes the key, which is how a
+    test drops an inherited grant (CRAPKIT_OVERRIDE_REASON) it must not be
+    judged under."""
     env = dict(os.environ)
+    env["PATH"] = os.pathsep.join(filter(None, (str(Path(sys.executable).parent), env.get("PATH"))))
     for key, value in (env_extra or {}).items():
         if value is None:
             env.pop(key, None)
@@ -47,17 +59,19 @@ def child_env(env_extra: dict | None = None) -> dict:
     return env
 
 
-def run_cli(repo: Path, *args: str, timeout: int = 120, env_extra: dict | None = None,
+def run_cli(repo: Path, *args: str, timeout: float | None = None, env_extra: dict | None = None,
             encoding: str | None = None, errors: str | None = None,
             stdin: str | None = None) -> subprocess.CompletedProcess:
-    """`python -m crapkit <args>` in `repo`, captured as text."""
+    """`python -m crapkit <args>` in `repo`, captured as text, under the hang
+    bound unless `timeout` names another."""
     if args and args[0] == 'mcp' and stdin is not None:
         from mcp_stdio import run
+        bound = hang_guard.HANG_SECONDS if timeout is None else timeout
         return run([*CRAPKIT, *args], cwd=repo, frames=stdin, env=child_env(env_extra),
-                   timeout=timeout, encoding=encoding, errors=errors)
-    return subprocess.run([*CRAPKIT, *args], cwd=repo, input=stdin,
-                          capture_output=True, text=True, encoding=encoding,
-                          errors=errors, timeout=timeout, env=child_env(env_extra))
+                   timeout=bound, encoding=encoding, errors=errors)
+    return hang_guard.run([*CRAPKIT, *args], cwd=repo, input=stdin, text=True,
+                          encoding=encoding, errors=errors, timeout=timeout,
+                          env=child_env(env_extra))
 
 
 def cli_runner(**contract):

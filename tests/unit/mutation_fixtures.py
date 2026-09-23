@@ -1,48 +1,54 @@
 """Private CLI callers and suite handshakes for mutation lifecycle tests."""
 from contextlib import contextmanager
 import os
+import re
 import shlex
 from pathlib import Path
 import signal
 import subprocess
 import sys
-import time
 
-
-def wait_for(path):
-    deadline = time.monotonic() + 30
-    while not path.exists():
-        if time.monotonic() >= deadline:
-            raise AssertionError(f'caller did not reach {path}')
-        time.sleep(.02)
+from hang_guard import CHILD_HOLD, HOLD_SECONDS, exited, wait_for
 
 
 def holding_suite(root, events, phase='mutant'):
-    script = (root / 'suite.py').read_text()
+    """The suite holds its writer lock until the test releases it. The fixture's
+    mutation deadline rises to the hold, so the product cannot end a hold the
+    test is still counting on."""
+    script = (root / 'suite.py').read_text(encoding='utf-8')
     script = script.replace('time.sleep(.1)',
         f'if phase == {phase!r}:\n'
         '    from crapkit.locks import exclusive_lock\n'
         '    with exclusive_lock(events / "writer.lock", label="suite writer"):\n'
         '        (events / "started").with_suffix(".part").write_text(str(Path.cwd()))\n'
         '        (events / "started").with_suffix(".part").replace(events / "started")\n'
-        '        deadline = time.monotonic() + 45\n'
+        f'        deadline = time.monotonic() + {CHILD_HOLD}\n'
         '        while not (events / "release").exists() and time.monotonic() < deadline:\n'
         '            time.sleep(.02)\n'
         '        (events / "finished").touch()\n')
     (root / 'suite.py').write_text(script, encoding='utf-8')
+    _raise_deadline_to_the_hold(root / 'crapkit.toml')
+
+
+def _raise_deadline_to_the_hold(config):
+    held, count = re.subn(r'mutation_timeout_seconds\s*=\s*\d+',
+                          f'mutation_timeout_seconds={HOLD_SECONDS}',
+                          config.read_text(encoding='utf-8'))
+    assert count == 1, f'{config} spells no single mutation_timeout_seconds to raise to the hold'
+    config.write_text(held, encoding='utf-8')
 
 
 def holding_checkout_hook(root, events):
     hooks = events / 'hooks'
     hooks.mkdir()
     writer = events / 'checkout.py'
-    writer.write_text('from pathlib import Path\nimport time\n'
+    writer.write_text('from pathlib import Path\nimport os, time\n'
                       'from crapkit.locks import exclusive_lock\n'
                       f'events = Path({str(events)!r})\n'
                       'with exclusive_lock(events / "writer.lock", label="Git hook"):\n'
                       '    (events / "started").with_suffix(".part").write_text(str(Path.cwd()))\n'
                       '    (events / "started").with_suffix(".part").replace(events / "started")\n'
-                      '    deadline = time.monotonic() + 45\n'
+                      '    deadline = time.monotonic() + ' + CHILD_HOLD + '\n'
                       '    while not (events / "release").exists() and time.monotonic() < deadline:\n'
                       '        time.sleep(.02)\n'
                       '    (events / "finished").touch()\n', encoding='utf-8')
@@ -76,13 +82,14 @@ def stop_caller(caller, events, how=signal.SIGTERM):
 @contextmanager
 def running_mutation(root, events):
     script = caller_script(root, events)
-    with (events / 'caller.log').open('w') as log:
-        caller = subprocess.Popen([sys.executable, '-B', str(script)], stdout=log, stderr=log)
+    log = events / 'caller.log'
+    with log.open('w') as stream:
+        caller = subprocess.Popen([sys.executable, '-B', str(script)], stdout=stream, stderr=stream)
         try:
-            wait_for(events / 'started')
+            wait_for(events / 'started', caller, log=log)
             yield caller
         finally:
             (events / 'release').touch()
             if caller.poll() is None:
                 stop_caller(caller, events)
-            caller.wait(timeout=30)
+            exited(caller, log=log)

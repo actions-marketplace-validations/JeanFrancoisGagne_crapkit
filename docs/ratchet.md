@@ -207,14 +207,15 @@ run 3 the fresh `coverage` somebody ran to move on. Both actions walk back to ru
 
 ```
 $ crapkit ratchet seed
-crapkit-ratchet.tsv: added 0, tightened 0 - 2 mark(s) vs run 1 (964eaf2ad80), skipped failed verify run 2
+crapkit-ratchet.tsv: added 0, tightened 0 - 2 mark(s) vs run 1 (964eaf2ad80), skipped failed verify run 2 and the newer run 3 (pass `--baseline 3` to read it)
 
 $ crapkit ratchet prune
-crapkit-ratchet.tsv: pruned 0, followed 0 rename(s) - 2 mark(s) vs run 1 (964eaf2ad80), skipped failed verify run 2
+crapkit-ratchet.tsv: pruned 0, followed 0 rename(s) - 2 mark(s) vs run 1 (964eaf2ad80), skipped failed verify run 2 and the newer run 3 (pass `--baseline 3` to read it)
 ```
 
-The clause names the failed verifies only, so the ordinary line is unchanged when nothing was
-skipped. `crapkit verify` on that store lands on run 1 too, and says so on stderr:
+The clause names the failed verifies and the newest run they stand in front of, with the flag
+that reads it. The ordinary line is unchanged when nothing was skipped. `crapkit verify` on
+that store lands on run 1 too, and says so on stderr:
 
 ```
 $ crapkit verify
@@ -236,6 +237,38 @@ EXIT=1
 The line says why a fresh `coverage` is not the escape: the new run would be refused by the
 same rule. Fix the findings, or accept a newer run by name with `crapkit verify --baseline
 ID` and let that verify pass.
+
+### Naming the run to seed from
+
+`crapkit ratchet seed --baseline ID` and `crapkit ratchet prune --baseline ID` read run ID
+instead of the run verify would pick. It is the same audited act as `crapkit verify
+--baseline ID`, admitted by the same rule, so a failed verify, a hook run, a partial run or an
+inventory run is refused in the same words:
+
+```
+$ crapkit ratchet seed --baseline 2
+crapkit: run 2 is a failed verify and cannot serve as a baseline; trusted runs: 1, 3; pass `--baseline 3` for the newest
+EXIT=1
+```
+
+A named run skips nothing, so its line carries no clause. The other ratchet actions read no
+run and refuse the flag.
+
+Naming matters most when the pinned run cannot be read at all. A run stored before crapkit
+recorded where same-line functions sit holds twins no key can tell apart, and seed and prune
+refuse it. The refusal names that run, the failed verify that pins it, and the command that
+leaves it:
+
+```
+$ crapkit ratchet seed
+crapkit: ambiguous legacy function identity in src/a.ts: (anonymous) in run 1; seed reads run 1 because verify run 2 FAILED after it and no verify has passed since, so a fresh `crapkit coverage` alone changes nothing; pass `--baseline 3` to read run 3
+EXIT=5
+```
+
+On the newest run, which a fresh `coverage` run does replace, the refusal keeps its old
+advice: `refresh analysis before selecting or comparing these functions`. When the marks also
+carry an older metric stamp, the way out is the same name; see
+[the metric stamp](#the-metric-stamp).
 
 ---
 
@@ -297,6 +330,26 @@ $ crapkit ratchet seed
 crapkit: ratchet seed: run 3 recorded no metric (analysis version and lizard), so the marks it measured cannot be stamped; run `crapkit coverage` and seed again
 EXIT=3
 ```
+
+A failed verify can leave that remedy with nothing to work on. Seed reads the run verify would
+pick, and after a failed verify that is the run before the failure until a verify passes
+([seed and prune pick the run verify picks](#seed-and-prune-pick-the-run-verify-picks)). A
+fresh `coverage` run sits behind the failure too, so seed reads the old run again and keeps
+its old stamp. Name the newer run instead. On such a store the refusal names it: a plain
+`crapkit verify` names the run its taint warning names, and `crapkit verify --baseline ID`
+names run ID, since verify reads `--baseline` before it checks the stamp:
+
+```
+$ crapkit verify --baseline 12
+crapkit: ratchet marks were recorded under [crapkit-analysis=9 lizard=1.24.0] but this run measures [crapkit-analysis=10 lizard=1.24.0] — CRAP scores are not comparable across metric versions; re-baseline from run 12 with `crapkit ratchet seed --baseline 12`
+EXIT=3
+```
+
+`crapkit ratchet seed --baseline 12` stamps run 12's metric, and the next verify runs. When
+the named run was measured under another metric too, the refusal asks for a `coverage` run
+first and a seed from the run it writes. A plain seed on the pinned run says the same at the
+end of its line: it names the newer run this crapkit measured to pass to `--baseline`, or asks
+for a `coverage` run and its id, instead of a fresh `coverage` and another seed.
 
 Reseeding from a fresh run can update compatible marks; changed function membership needs
 the identity review below first.

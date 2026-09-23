@@ -55,52 +55,12 @@ def _taint_note(pick) -> str:
             f"pass `--baseline {pick.skipped['id']}` to accept the newer run deliberately.")
 
 
-# The kinds `trusted_runs` refuses, worded for the operator who named one. A
-# table rather than a chain of ifs keeps the helper under the ccn 6 gate with
-# room to spare, so one untested branch cannot lift its CRAP past the target.
-_UNTRUSTED_KINDS = {"hook": "a hook run",
-                    "partial": "a partial run (a lane subset, or a lane that failed)",
-                    "inventory": "an inventory run (no coverage was measured)"}
-
-
-def _untrusted_reason(run: dict) -> str:
-    """Why a run that exists cannot be measured against, in the store's own terms."""
-    kind = run["kind"]
-    if kind == "verify":
-        return "a failed verify" if run["verdict_ok"] is False else "a verify with no verdict"
-    if kind in _UNTRUSTED_KINDS:
-        return _UNTRUSTED_KINDS[kind]
-    return f"a {kind or 'legacy'} run that measured no lanes"
-
-
-def _wrong_baseline(store: SnapshotStore, requested: int, trusted: list[dict]) -> str:
-    """A named run that cannot serve, beside the runs that can.
-
-    The refusal is right; the line has to be about the run that was named. The
-    trusted ids are listed oldest first, so the last one is the newest and the
-    `--baseline` hint names it: that is the escape an operator reaching for
-    `--baseline` was after, and a fresh `coverage` run is the expensive wrong one.
-    """
-    ids = ", ".join(str(r["id"]) for r in trusted)
-    named = next((r for r in store.list_runs() if r["id"] == requested), None)
-    if named is None:
-        return (f"no run {requested} in the store (`{_self()} runs` lists them); "
-                f"trusted runs: {ids}")
-    return (f"run {requested} is {_untrusted_reason(named)} and cannot serve as a baseline; "
-            f"trusted runs: {ids}; pass `--baseline {trusted[-1]['id']}` for the newest")
-
-
 def _named_baseline(store: SnapshotStore, root: Path, requested: int) -> dict:
-    """`--baseline ID` bypasses the taint rule: naming a run is the deliberate act."""
-    from ..store import trusted_runs
+    """`--baseline ID` bypasses the taint rule: naming a run is the deliberate act.
+    `ratchet seed` and `ratchet prune` admit a named run by the same rule."""
+    from ..store import admit_baseline
 
-    trusted = trusted_runs(store)
-    baseline = next((r for r in trusted if r["id"] == requested), None)
-    if baseline is not None:
-        return baseline
-    if not trusted:
-        raise CrapkitError(_no_baseline(root))
-    raise CrapkitError(_wrong_baseline(store, requested, trusted))
+    return admit_baseline(store.list_runs(), requested, none_trusted=_no_baseline(root))
 
 
 def _verify_baseline(root: Path, store: SnapshotStore, requested: int | None) -> dict:
@@ -177,6 +137,23 @@ def _pick_baseline(root: Path, store: SnapshotStore, args, basis: str | None, gi
     return _verify_baseline(root, store, args.baseline)
 
 
+def _seed_source(store: SnapshotStore, args, baseline: dict) -> dict | None:
+    """The run a stamp refusal says to seed from; None keeps coverage-then-seed.
+
+    `--baseline ID` names it. Otherwise the refusal is about the run a plain
+    `ratchet seed` reads, which is verify's rule's pick whatever this verify
+    measures against. Behind a failed verify that pick is pinned: the seed signs
+    its old stamp again, a fresh coverage run lands behind the failure too, and
+    the stock remedy led back to this refusal (#75). The newer run the rule
+    passed over, which the taint warning names, is the one to seed from.
+    """
+    from ..store import pick_baseline
+
+    if args.baseline is not None:
+        return baseline
+    return pick_baseline(store.list_runs()).skipped
+
+
 def _verify_basis(root: Path, store: SnapshotStore, args, git) -> tuple[dict, str]:
     """(the baseline record, the commit the diff is measured from).
 
@@ -218,11 +195,14 @@ def _verify_store(root: Path, tsv_baseline: str | None) -> SnapshotStore:
     return SnapshotStore(db_path)
 
 
-def _guard_ratchet_stamp(saved, name: str) -> None:
+def _guard_ratchet_stamp(saved, name: str, named: dict | None = None) -> None:
     """Refuse to weigh fresh scores against marks another metric produced.
 
     Runs before the lanes do: a metric bump that silently kept 40k old marks is
     what this exists to stop, and finding out after a 40-minute run is too late.
+    It runs after the baseline is read, so `named`, the run `--baseline ID`
+    names or the one a failed verify kept verify's rule from, can be the run
+    the refusal says to seed from.
     """
     from ..ratchet import coverage_then_seed, metric_version
 
@@ -234,7 +214,38 @@ def _guard_ratchet_stamp(saved, name: str) -> None:
         return
     conflict = saved.stamp_conflict(metric_version())
     if conflict:
-        raise ConfigError(conflict)
+        raise ConfigError(_stamp_refusal(conflict, named))
+
+
+def _stamp_refusal(conflict: str, named: dict | None) -> str:
+    """The stamp refusal, naming the seed that clears it when there is a run to name.
+
+    The stock remedy's `ratchet seed` reads the run verify would pick. A failed
+    verify can pin that to a run an older crapkit measured, or one written
+    before same-line positions, and seed then keeps the old stamp or refuses
+    outright, so the remedy led back to this refusal (#75). `named` is the run
+    to seed from instead.
+    """
+    from ..ratchet import coverage_then_seed
+
+    if named is None:
+        return conflict
+    return conflict.removesuffix(coverage_then_seed()) + _named_seed(named)
+
+
+def _named_seed(named: dict) -> str:
+    """The seed that re-baselines the marks from the run verify was handed.
+
+    Seed stamps the metric of the run it reads, so a run another metric measured
+    needs a coverage run first, and that run is the one to name.
+    """
+    from ..ratchet import metric_version, run_stamp
+
+    run_id = named["id"]
+    if run_stamp(named["tool_versions"]) == metric_version():
+        return f"re-baseline from run {run_id} with `{_self()} ratchet seed --baseline {run_id}`"
+    return (f"run {run_id} was measured under another metric too, so run `{_self()} coverage`, "
+            f"then re-baseline from the run it writes with `{_self()} ratchet seed --baseline ID`")
 
 
 def _override_applies(verdict, reason: str | None) -> bool:
@@ -642,7 +653,6 @@ def cmd_verify(args: argparse.Namespace) -> int:
     _refuse_lane_less_verify(cfg)
     store = _verify_store(root, args.baseline_tsv)
     saved = RatchetFile.read(root / cfg.ratchet_file)
-    _guard_ratchet_stamp(saved, cfg.ratchet_file)
     # One context for the whole command: the ancestry checks, the lane runner and
     # this attribution all used to spawn their own git. Asking here also FIXES the
     # dirty set before any lane command runs, so a lane writing into a tracked file
@@ -650,6 +660,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     git = GitFacts(root)
     dirty = set(git.status_names())
     baseline, basis = _verify_basis(root, store, args, git)
+    _guard_ratchet_stamp(saved, cfg.ratchet_file, _seed_source(store, args, baseline))
     _emit_baseline(root, store, baseline, args.emit_baseline)
 
     # Corpus and cache_hits are coverage's report line, not verdict inputs.
