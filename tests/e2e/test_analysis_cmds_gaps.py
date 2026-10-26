@@ -15,7 +15,7 @@ from crapkit.invocation import _self
 from crapkit.store import SnapshotStore
 from crapkit.watch import snapshot_mtimes
 
-from conftest import cli_runner
+from conftest import child_env, cli_runner
 
 SRC_TOML = (
     '[crapkit]\ntarget = 6\n\n'
@@ -275,7 +275,7 @@ def test_duplication_says_when_no_function_is_long_enough(clone_repo: Path):
     assert res.stdout.strip() == "no near-duplicate functions found"
 
 
-def test_duplication_refuses_a_store_holding_only_hook_runs(tmp_path: Path):
+def test_duplication_refuses_a_store_holding_only_hook_runs(tmp_path: Path, monkeypatch):
     repo = tmp_path / "hooked"
     write(repo / "crapkit.toml", SRC_TOML)
     (repo / ".crapkit").mkdir()
@@ -283,7 +283,9 @@ def test_duplication_refuses_a_store_holding_only_hook_runs(tmp_path: Path):
     store.write_run(commit="0" * 40, tool_versions={}, rows=[], kind="hook")
     res = run_cli(repo, "duplication")
     assert res.returncode == 1
-    # The suite spawns `python -m crapkit`, so the refusal names that form.
+    # The child names `crapkit` when its PATH finds this interpreter's console
+    # script, so the expected spelling is read under the child's PATH.
+    monkeypatch.setenv("PATH", child_env()["PATH"])
     assert f"run `{_self()} inventory` first" in res.stderr
 
 
@@ -372,6 +374,7 @@ def test_mutate_json_stays_well_formed_with_zero_mutants(diff_repo: Path):
     res = run_cli(diff_repo, "mutate", "--files", "src/noop.py", "--json")
     assert res.returncode == 0, res.stdout + res.stderr
     assert json.loads(res.stdout) == {"mutants": 0, "killed": 0, "survived": 0,
+                                      "timed_out": 0, "no_verdict": 0,
                                       "survivors": [], "outside_corpus": [], "schema": 1}
 
 

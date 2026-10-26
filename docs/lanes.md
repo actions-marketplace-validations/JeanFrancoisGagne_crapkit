@@ -19,13 +19,14 @@ parser = "coveragepy"
 scopes = ["calc"]
 ```
 
-Four required parts and one rule each, plus `results_artifact`, which is optional and on
-every lane on this page.
+Five required keys, `name` plus the four below, and one rule each, plus `results_artifact`,
+which is optional and on every lane on this page.
 
 | Part | Rule |
 |---|---|
+| `name` | The lane's id. It names the lane's log, `.crapkit/lane-<name>.log`, and what `coverage --lane` takes. A name Windows cannot use as a file name, or two names that differ only in case, is refused at load with exit 3. |
 | `command` | Runs through the shell at the repo root (or `cwd`). Its **exit code is recorded, not enforced**. A brownfield suite with 98 known failures still writes a valid artifact, and demanding green here would make such a repo unmeasurable. |
-| `artifact` | The coverage file the command writes, repo-relative. Its absence after the command and all its retries is the failure. Two lanes may not declare the same artifact path: reused paths cross-attribute coverage under `--reuse-artifacts`. |
+| `artifact` | The coverage file the command writes, repo-relative. Its absence after the command and all its retries is the failure. Two lanes may not declare the same artifact path: reused paths cross-attribute coverage under `--reuse-artifacts`. It names one file. An empty value or one that names the root (`.`, `cov/..`) is refused at load with exit 3, and so is a `results_artifact` that names the root. `doctor` FAILs an `artifact` or `results_artifact` that names a directory, such as vitest's `coverage` report directory: point it at the report file inside. |
 | `parser` | `istanbul` or `coveragepy`. Nothing else exists. |
 | `scopes` | Which scopes this lane's numbers speak for. A scope no lane names can only score `no-lane`, and `doctor` fails on it. |
 | `results_artifact` | The JUnit report the same command writes. Two checks read it and neither runs without it: the [crashed-worker trust check](#a-junit-that-says-the-run-did-not-finish), which refuses a run the runner did not finish, and no-new-failures, which is `verify`'s exit 8. |
@@ -43,9 +44,9 @@ ok   scope 'calc': 1 file
 ok   every tracked source file belongs to a scope
 ok   1 lane(s) declared
 WARN lane 'py' declares no results_artifact: the crashed-worker check and the no-new-failures check (exit 8) cannot run for it; add --junitxml=.crapkit/cov/junit-py.xml to the command and results_artifact = ".crapkit/cov/junit-py.xml" to the lane
-ok   lane 'py': python -> /home/you/ledger/.venv/bin/python (pytest 8.3.3, pytest-cov 7.1.0)
+ok   lane 'py': python -> /home/you/ledger/.venv/bin/python (pytest 8.3.3, pytest-cov 7.1.0, coverage 7.13.1)
 ok   lizard 1.24.0
-doctor: no problems found
+doctor: no problems found, 1 warning above
 ```
 
 A WARN, never a FAIL: the lane still scores. `crapkit init` writes both halves on the lanes
@@ -66,20 +67,41 @@ on POSIX, cmd.exe on Windows. One reading feeds two readers. The lane guard uses
 decide whether a token narrows the run, and `doctor` uses it to decide which word is the
 runner and which words are files the repo owes.
 
+On Windows the line is read twice, as it is when it runs. cmd.exe reads it first, for
+its commands, blocks, carets and redirections, and hands each program the rest. The
+program then splits its line into arguments with the C runtime's rules, which python
+and node share. The two passes disagree about carets, backslashes and cmd.exe's
+delimiters (`;`, `,`, `=` and a non-breaking space as well as the blanks), and the guard
+reads both.
+
 | What you write | How it reads |
 |---|---|
 | `-m "not live and not perf"` | One argument. Double quotes are the portable spelling: both shells drop them and hand the runner one token. |
 | `-m 'not live and not perf'` | Five arguments on Windows. cmd.exe has no single-quote rule, so pytest gets `'not`, `live`, `and`, `not`, `perf'` and the lane is refused with a hint. |
 | `-k ^"not slow^"` | One argument. Outside a quoted run cmd.exe drops the caret and hands on the character behind it, so the runner gets `-k "not slow"`. Inside a quoted run the caret stays: `-k "a^b"` reaches the runner with its caret. |
+| `-k ^"x & pytest pylib/unit^"` | Two commands on Windows. The caret hands the quote to the runner but opens no quoted run for cmd.exe, so the `&` starts a second pytest, and that one runs only `pylib/unit`. The lane is refused. |
+| `-k "a\" tests \"b"` | One argument, `a" tests "b`. Inside double quotes `\"` writes a quote. On Windows it is the runner that reads it so; cmd.exe sees the quote close the run, so an `&` between the two `\"` still ends the command. |
 | `--cov-report=json:"cov/py 1.json"` | One argument. A quote opens a quoted run wherever it sits, mid-token included. |
 | `-k "" tests` | Three arguments. An empty pair of quotes writes an empty argument, so `tests` stays the positional it is. Dropping it would slide `tests` onto `-k` and the narrowing lane would load clean. |
-| `pytest --cov && coverage json` | Two commands. `&&`, `\|\|`, `&` and `\|` each start a new one, and every segment that runs the runner is checked on its own. |
-| `pytest --cov > lane.log 2>&1` | The redirections are the shell's; the runner never sees them. A quoted `">"` is an argument and stays. |
-| `pytest --cov; echo done` | On sh the `;` ends the command. To cmd.exe it is an ordinary character, so `echo` and `done` land in pytest's argv and the lane is refused. |
-| a non-breaking space in a value | Not a word break. Words break on space, tab and line endings, the way both shells break them, so a value pasted out of rendered docs stays one token. |
+| `pytest --cov && coverage json` | Two commands. `&&`, `\|\|`, `&` and `\|` each start a new one, blank beside them or not (`py.json&& coverage json` is two commands too), and every segment that runs the runner is checked on its own. |
+| `pytest --cov > lane.log 2>&1` | The redirections are the shell's; the runner never sees them, or their targets, quoted or not (`>"lane log.txt"`). A redirection touching a word leaves that word: `tests>lane.log` hands pytest `tests`. A quoted `">"` is an argument and stays. |
+| `a2>x`, `>lane.log;2>&1` | On sh a number names the stream only when it is the whole word, so `a2>x` hands on `a2`. cmd.exe takes the digit when a delimiter, a quote, `&`, `\|` or a parenthesis stands in front of it, caret or not: `a2>x` hands on `a2`, and `a^\|2>x` hands on `a\|`. cmd.exe also drops the delimiters between two redirections, so `>lane.log;2>&1` hands pytest nothing, while `>lane.log ;b` hands it `;b`. |
+| `(pytest --cov) > lane.log` | pytest gets `--cov` on both shells. sh runs the parentheses as a subshell. On cmd.exe a `(` where a command starts opens a block, an unquoted `)` inside it ends the command, and a block still open at the end of the line runs nothing on that line. Anywhere else, as in `-k (a)`, both are text. |
+| `pytest --cov; echo done` | On sh the `;` ends the command, and so does `;echo done`. To cmd.exe it is an ordinary character, so `echo` and `done` land in pytest's argv and the lane is refused. It does end the program's name: `python;-m pytest` starts python with `;-m` and `pytest`. |
+| `bash -c 'pytest --cov tests'` | The payload is sh text on both OSes. Under cmd.exe, bash.exe splits the line it is handed with sh's quote rules, so `'` quotes there and `tests` is one positional. The guard judges each command inside the payload, and `doctor` WARNs when sh cannot split it (a quote that never closes), since then no check looked inside. |
+| a line break | On sh a line break ends the command the way `;` does, and a backslash at the end of a line joins it to the next. cmd.exe runs the first line only. |
+| `--cov # the whole suite` | On sh a `#` that starts a word comments out the rest of the line. To cmd.exe it is text. |
+| a non-breaking space in a value | Not a word break. Both shells break words on space and tab only, so a value pasted out of rendered docs stays one token. cmd.exe does count it among its delimiters, so after `>` it ends the file name. |
 
-A command the shell itself would refuse (a quote that never closes) falls back to a
-whitespace split. A rough lint beats a crash at config load.
+A quote that never closes: sh refuses the line, and crapkit reads that quote as an
+ordinary character, because a rough lint beats a crash at config load. cmd.exe runs the
+line, the quoted run takes the rest of it, and crapkit reads it the same way.
+
+One cmd.exe rule crapkit leaves out: a block on either side of a `|` runs in a second
+cmd.exe, which reads the block's text again, so its carets work twice. In
+`(pytest -k a ^& echo b) | more` the second read starts `echo`. crapkit reads the block
+once, so there it counts more arguments than pytest gets and may refuse a lane that
+runs. Take the carets out of the block, or take the block out of the pipe.
 
 ### The refusals, as they print
 
@@ -94,9 +116,10 @@ EXIT=3
 
 The same command in double quotes loads, and so does the caret spelling
 (`-k ^"not slow^"`), the mid-token quote
-(`--cov-report=json:".crapkit/cov/py report.json"`) and the redirected form
-(`... --cov-report=json:.crapkit/cov/py.json > lane.log 2>&1`). All four come back
-`doctor: no problems found`, exit 0.
+(`--cov-report=json:".crapkit/cov/py report.json"`), the redirected form
+(`... --cov-report=json:.crapkit/cov/py.json > lane.log 2>&1`) and the same form with
+the operators touching their words (`...py.json>"lane.log" 2>&1&& python -m coverage
+json`). All five come back `doctor: no problems found`, exit 0.
 
 A second run after `&&` narrows as much as the first, so the segment it sits in is checked
 too:
@@ -128,7 +151,15 @@ interpreter path (`"C:/Program Files/Python/python.exe" -m pytest ...`) is one w
 two; a dead runner after `&&` is still a dead runner; and a path inside a quoted
 `-k "tests/gone.py or x"` is a marker expression, not a file the repo owes.
 
-It also starts each distinct first word once, with `--version`, and FAILs the lane when the
+The pytest-cov probe asks the python inside a `bash -c` or `sh -c` payload, the one that
+runs pytest there, and the coverage data-file check reads a `--data-file` there too. A
+payload sh cannot split gets its own WARN, for example:
+
+```
+WARN lane 'py': sh cannot split the script in `bash -c "python -m pytest 'tests"`, since a quote or an escape in it never closes, so crapkit reads nothing inside it: the full-suite guard, the pytest-cov probe and the coverage data-file check all pass it unjudged; fix its quoting
+```
+
+`doctor` also starts each distinct first word once, with `--version`, and FAILs the lane when the
 shell cannot run it. A stock Windows PATH carries a `python.exe` stub with no Store app
 behind it: it resolves, it exits 9009, and before 0.4.5 `doctor` called that repo clean
 while `coverage` exited 5 on the same command. Reproduced here with a `python3` on PATH
@@ -140,7 +171,7 @@ resources: up to 8 analysis worker(s) per pool, 8 shared slot(s); lane log limit
 ok   config keys all recognized
 ok   scope 'calc': 1 file
 ok   every tracked source file belongs to a scope
-FAIL lane 'py': cmd.exe cannot run 'python3' (exit 9009) — the lane cannot start, so its scopes can only ever score no-lane
+FAIL lane 'py': cmd.exe cannot run 'python3' (exit 9009) - the lane cannot start, so its scopes can only ever score no-lane
 ok   lizard 1.24.0
 doctor: 1 problem(s)
 ```
@@ -203,7 +234,7 @@ argument error. A repo naming neither or both keeps its runner's default directo
 `doctor` says so:
 
 ```
-WARN lane 'js' writes coverage/coverage-final.json at the repo root — point it under .crapkit/ (for example .crapkit/cov/js/) to keep the tree clean
+WARN lane 'js' writes coverage/coverage-final.json at the repo root - point it under .crapkit/ (for example .crapkit/cov/js/) to keep the tree clean
 ```
 
 That warning is never a `FAIL`. A lane writing at the root measures exactly what it always
@@ -211,30 +242,92 @@ did, so breaking an existing gate over tree hygiene would cost more than the lit
 that writes inside a scope's own tree (`web/coverage/` beside the `web/src` it measures) is
 that package's business and is not warned about.
 
+`init` reads those two fields the way npm reads them. A `scripts` value that is not an object,
+null included, is no scripts, and so is a script whose command is not a string. A
+`devDependencies` list names the strings in it; null or any other value that is not an object
+names no package. A root `package.json` that does not parse, parses to something other than an
+object, or is not UTF-8 stops `init` at exit 3 before it writes any file, naming the file and
+where the parse stopped, as in `init wrote no file: package.json is not valid JSON (Expecting
+value at line 1 column 1); fix that line`. A nested one is skipped with one warning line naming
+it, and `init` writes what it writes when that file is not there.
+
 ### What the istanbul parser reads
 
 Your runner writes `coverage-final.json` and you never open it. Read this section only if
 you are building one by hand, converting another format into it, or staring at a lane that
 scores nothing.
 
+Both coverage readers take the artifact as UTF-8 JSON and read past a UTF-8 byte-order
+mark, which a copy saved with PowerShell's `Out-File -Encoding utf8` carries. An artifact
+in UTF-16, what PowerShell 5.1's `>` and `Out-File` write, or one holding a byte that is
+not UTF-8, fails its lane naming the bytes and saying to save it as UTF-8. An artifact
+with no JSON in it fails saying it is empty, so rerun the lane.
+
 Both coverage readers reject invalid numeric counts before scoring. Counts must
 be nonnegative integers, including integral JSON numbers such as `1.0`; strings,
 booleans, fractions and non-finite values are refused. A coverage.py summary also
-cannot report more covered lines or branches than its declared total. A bad
+cannot report more covered lines or branches than its declared total. A field the
+format writes as an object or a list that holds something else, such as an istanbul `s`
+of `null`, is refused naming the file, the field and the type it holds. A bad
 artifact fails its lane with the input named in the error.
+
+A count that is missing is refused the same way, never read as a zero. In istanbul every
+`fnMap`, `statementMap` and `branchMap` id needs its counter in `f`, `s` and `b`: a
+dropped counter read as a function never called, a statement that never ran or a branch
+pair that did not exist, and the score moved with nothing said. A `b` array also needs one
+hit count per location its `branchMap` entry lists, since crapkit counts a branch's paths
+by its hit counts: an if/else cut to `[1]` scored 1 of 1, and `[]` fell back to the
+statements. An entry with no `locations` list is counted by its hit counts. The refusal
+names the file and the first id:
+
+```
+crapkit: lane 'ui' FAILED: unparseable istanbul artifact coverage/ui.json: src/hot.ts: statement '3' has no hit count in `s`, so crapkit cannot tell whether it ran (1 such in this file); regenerate the artifact with the coverage tool, or merge shards with one that keeps every counter
+```
+
+```
+crapkit: lane 'ui' FAILED: unparseable istanbul artifact coverage/ui.json: src/hot.ts: branch '0' has 1 hit count(s) in `b` for its 2 location(s), so crapkit cannot tell which of its paths ran (1 such in this file); regenerate the artifact with the coverage tool, or merge shards with one that keeps every counter
+```
+
+A coverage.py function needs its `summary`, and each kind of count in it as a pair:
+`num_statements` with `covered_lines`, `num_branches` with `covered_branches`. A summary
+with neither kind, one count without its partner, or no statement counts beside 0 of 0
+branches is refused: each read as 0 of 0 where that count decides, and a function that ran
+scored cov 0. A kind with neither count and nothing to decide is one the report did not
+measure: branches in a report run without `--cov-branch`, or statements beside branches,
+which decide on their own.
 
 crapkit scores functions, so `fnMap` is the part that decides everything. Per file in the
 artifact:
 
 | Key | What crapkit does with it |
 |---|---|
-| `fnMap` | The function list. Every entry needs `decl.start.line`. `loc.end.line` closes the span and falls back to the start line. A missing `name` reads as `(anonymous)`. |
+| `fnMap` | The function list. Every entry needs `decl.start.line`, and `loc.end.line` to close the span. A function's span runs from `decl.start` to `loc.end`. Its body starts at `loc.start`, which falls back to `decl.start`. A missing `name` reads as `(anonymous)`. |
 | `f` | Call counts per `fnMap` id. |
-| `branchMap` and `b` | Branch coverage. Each branch counts against the innermost function whose span holds its `loc.start.line`. This is the function's coverage whenever it has one branch. |
-| `statementMap` and `s` | The fallback for a function with no branch in its span, and the only source of the uncovered lines `verify` measures a diff against. |
+| `branchMap` and `b` | Branch coverage. Each branch counts against the innermost function whose span holds its `loc.start`, or the `line` beside it when `loc` is missing. A branch with neither refuses the artifact. A default parameter's arm sits between the name and the body, so it is the function's; a ternary that opens ahead of an arrow on the same line counts for the code around the arrow. This is the function's coverage whenever it has one branch. |
+| `statementMap` and `s` | The fallback for a function with no branch in its span. Each statement counts against the innermost function whose body holds its `start`. For `const f = (x) => x * 2` istanbul writes one statement for the declaration, which starts ahead of the arrow's body and runs when the declaration does, and one for the body. The first counts for the code around the arrow, so an arrow no test calls reads 0. Statements are also the only source of the uncovered lines `verify` measures a diff against. |
 
 A function with neither a branch nor a statement in its span scores on `f` alone: 1.0 when
 it was called, 0.0 when it was not.
+
+`/* istanbul ignore next */` and `/* v8 ignore next */` drop the function after them from
+`fnMap`, with its branches and statements. A function the source holds and `fnMap` leaves
+out, in a file whose `fnMap` lists others beside a `statementMap`, reads `excluded`:
+`crap = ccn`, remedy `ok` or `decompose`, because no test can move its number. Through
+0.8.0 it read `untested` with `add-tests` advice no test could follow. The statements are
+the proof that an instrumenter wrote the entry: a hand-built entry with `fnMap` alone
+cannot say what it left out, so a function missing from it stays `untested`. A nested
+function a hint drops sits inside its encloser's span and reads the encloser's number, not
+`excluded`: jest's `v8` provider and c8 also leave out a nested callback V8 never compiled,
+so a missing nested function cannot be told from an uncalled one.
+
+Line numbers are placed on crapkit's own lines, which end at LF, CRLF and a lone CR.
+Producers number by their own rule: `@vitest/coverage-v8` ends a JavaScript line at LF
+only, and Babel (jest, nyc, `@vitest/coverage-istanbul`) and TypeScript source maps also
+end one at U+2028 and U+2029. Only a file that holds a lone CR, U+2028 or U+2029 can read
+differently, and for one crapkit reads the source and takes the rule under which each
+named function's name sits on the line its `decl.start` gives, with `column` placing a
+position inside a line V8 counted whole. A file with no named function keeps its numbers
+as written.
 
 The outer object is keyed by path. crapkit strips the crapkit root off an absolute key and
 takes any other key as it stands, so root-relative keys work too. `path_prefix` is
@@ -257,10 +350,27 @@ Both exit 0. That is the [wrong `path_prefix`](#running-from-a-subdirectory) fai
 other side: the lane ran, the artifact parsed, and the score is wrong. `0 measured` on a lane
 that ran is the number to read.
 
-One shape does fail loudly. An `fnMap` entry with no `decl` exits 5:
+Three shapes do fail loudly. An `fnMap` entry with no `decl.start.line` exits 5 naming the
+file and the entry, as istanbul 0.x wrote no `decl`. Before 0.8.1 the line held only
+`'decl'`:
 
 ```
-crapkit: lane 'js' FAILED: unparseable istanbul artifact /repo/.crapkit/cov/js/coverage-final.json: 'decl'
+crapkit: lane 'js' FAILED: unparseable istanbul artifact /repo/.crapkit/cov/js/coverage-final.json: src/a.ts: fnMap['0'] has no decl.start.line (every istanbul reporter writes one; regenerate the artifact with the runner's reporter)
+```
+
+So does an entry with no `loc.end.line`. Read as the declaration line, as it was before
+0.8.1, the span shrank to one line, the body's branches attached to nothing, and a function
+that was called scored as covered:
+
+```
+crapkit: lane 'js' FAILED: unparseable istanbul artifact /repo/.crapkit/cov/js/coverage-final.json: src/app.ts: fnMap['0'] has no loc.end.line (every istanbul reporter writes one; regenerate the artifact with the runner's reporter)
+```
+
+So does a `branchMap` entry with neither `loc.start.line` nor the `line` beside it. Before
+0.8.1 it was left out, and the function it sat in scored without those arms:
+
+```
+crapkit: lane 'js' FAILED: unparseable istanbul artifact /repo/.crapkit/cov/js/coverage-final.json: src/app.ts: branchMap['1'] has no loc.start.line and no line (every istanbul reporter writes one; regenerate the artifact with the runner's reporter)
 ```
 
 ### What else lives in .crapkit/
@@ -278,15 +388,16 @@ $ ls .crapkit .crapkit/cov
 .crapkit:
 artifacts.json
 cache.json
-churn-cache-v2.json
+churn-cache-v3.json
 churn-commits-v1.json
-churn-log-v2.json
-churn-log-v2.z
-coupling-cache-v1.json
+churn-log-v3.json
+churn-log-v3.z
+coupling-cache-v2.json
 cov
 crap.sqlite
 lane-py.log
 measurement.lock
+owner.log
 
 .crapkit/cov:
 junit-py.xml
@@ -298,16 +409,20 @@ py.json
 | `crap.sqlite` | The store: run history, every scored function, the override audit trail, and the per-run rollups `trend` and `report` read. Durable, not a cache. The ratchet marks are not here; they live in the committed `crapkit-ratchet.tsv`. | |
 | `cov/` | Where `init` points every lane's `artifact` and `results_artifact`. | |
 | `lane-<name>.log` | One lane's streamed output, an `--- attempt N ---` header per retry. Current and `.log.1` files each have a 16 MiB default bound; see [log policies](resources.md#logs-and-retained-evidence). | |
-| `artifacts.json` | Per artifact: the commit it was built at, the lane that built it, how long that took, the reuse `proof` with the digests it was taken over (`proof_parts`), and, for an artifact the lane's last attempt failed to write, the modification time of the file it left (`refused_mtime_ns`). Drives `--reuse-unchanged`, `doctor --tune` and the [reuse refusal](#the-artifact-a-failed-attempt-left-behind-is-refused). | |
+| `artifacts.json` | Per artifact: the commit it was built at, the lane that built it, how long that took, the reuse `proof` with the named parts it hashes (`proof_parts`) or, when it did not hold, why (`unproved`), the git blob id of each file under the lane's scopes as the run left it (`blobs`), the untracked files the run itself wrote (`byproducts`), and, for an artifact the lane's last attempt failed to write, the sha256 of the file it left (`refused_sha256`, which `crap.sqlite` keeps a copy of). Written through a temporary file that replaces it in one step. Drives `--reuse-unchanged`, the dark-line notes, `doctor --tune` and the [reuse refusal](#the-artifact-a-failed-attempt-left-behind-is-refused). | |
+| `aside/` | A lane's declared artifact and results file while its attempt runs: they move here before the command starts, so a file at the declared path afterwards is one the attempt wrote. Each goes back when the attempt wrote nothing in its place, and the directory is removed when the lane ends. A kill or a CI timeout runs no cleanup, so the next crapkit command that measures or reuses the lane puts each file back first and says so: `crapkit: lane 'unit': coverage/coverage-final.json is back at its path; an attempt that did not finish (a kill or a timeout) had set it aside under .crapkit/aside/`. Where a file was written at the path since, it stays, and the line names the copy's path so you can move it back. | |
 | `cache.json` | Analysis records per file, so an unchanged file is not re-analyzed. | The file's content hash, under a fingerprint of the lizard pin and the analysis version. |
 | `measurement.lock` | The lock a lane run holds on this checkout's lane logs and artifact stamps while its commands run, so two crapkit processes never measure one checkout at once. It stays behind between runs and holds nothing. | |
-| `stat-stamps.json` | What the last run saw for each file (mtime, size, hash), so unchanged files are not re-hashed. A file enters it once it has held still for two seconds, so a run right after the files were written, like the listing above, leaves no `stat-stamps.json` yet. | |
-| `churn-cache-v2.json` | Per-file churn for the window: commits, authors, weight. | HEAD sha, window months, today's UTC date, path format. |
-| `churn-commits-v1.json` | The window's commits: each one's author, author date and commit date, and each path's commits. Read only when the churn map misses; a HEAD that grew from it walks only the new commits. Not kept in a shallow clone. | HEAD sha, window months, path format and the --since cutoff its commits were cut at, plus the body's size and CRC. |
-| `churn-log-v2.z` | The window's `git log --name-only` output, deflated, with its key in `churn-log-v2.json` beside it. | Same four fields. The key also records the --since cutoff the log was cut at; a refresh below it walks the window again. |
-| `coupling-cache-v1.json` | Ranked co-change pairs at the default thresholds, ordered and uncut. | The churn map's key plus a digest of the tracked set. |
+| `<ratchet_file name>.lock` | The lock each marks-file write holds: seed, prune, move, merge, verify's tighten and overrides. It stays behind, holds nothing between writes and is safe to delete. It lives in a `.crapkit/` beside the marks file, so `ratchet_file = "gates/r.tsv"` puts it at `gates/.crapkit/r.tsv.lock`. | |
+| `owner.log` | What the measurement owner wrote to stderr: nothing on a run that ends normally, and a dated line and a traceback when it [stops early](#when-the-measurement-owner-stops). Every owner on this checkout appends to it. | |
+| `stat-stamps.json` | What the last run saw for each file (mtime, size, hash), so unchanged files are not re-hashed. A file enters it once it has held still for two seconds, so a run right after the files were written, like the listing above, leaves no `stat-stamps.json` yet. A same-length rewrite put back under its old mtime (`cp -p`, `touch -r`) keeps the old hash until the file's next real write; `crapkit watch` misses that rewrite the same way. | |
+| `churn-cache-v3.json` | Per-file churn for the window: commits, authors, weight. | HEAD sha, window months, today's UTC date, path format, history depth. The date never moves the window. |
+| `churn-commits-v1.json` | The window's commits: each one's author, author date and commit date, and each path's commits. Read only when the churn map misses; a HEAD that grew from it walks only the new commits. Not kept in a shallow clone. | HEAD sha, window months, path format and the window cutoff its commits were cut at, plus the body's size and CRC. |
+| `churn-log-v3.z` | The window's `git log --name-only` output, deflated, with its key in `churn-log-v3.json` beside it. | Same five fields. The key also records the window cutoff the log was cut at; a refresh below it walks the window again. |
+| `coupling-cache-v2.json` | Ranked co-change pairs at the default thresholds, ordered and uncut. | The churn map's key plus a digest of the tracked set. |
 | `mutate-pool/` | Kept worktrees for every mutation worker, including one. See [mutation worktrees](configuration.md#mutation-worktrees). | |
 | `mutate-tmp/` | Recognized concurrent mutation runs, removed after completion or recovered under an exclusive lease. | |
+| `mutate-pool.lock` | The lease on `mutate-pool/`, held while a mutation run uses the kept worktrees. | |
 | `test-runs/` | Marked default test evidence from crapkit's own development runner, `tools/testing/run.py`, which prunes it by age and count (`--retention-days`, `--retention-count`) before each default run. `clean` leaves it alone. Explicit output and active leases are preserved. | |
 | `report.html` | Where `crapkit report` writes by default. | |
 
@@ -316,11 +431,15 @@ answers in 0.04 s warm on a corpus where it used to rescan 4.3 M rows. It means 
 `report` write to `crap.sqlite` on a cold rollup, best effort: they read as before on a
 checkout they cannot write to, just without the speedup.
 
-The date is in the churn key because `--since=12 months ago` is measured against the wall
-clock, so yesterday's map describes a window one day wider than today's. The tracked set is
+The window ends at HEAD's commit date: its cutoff is `churn_window_months` calendar months
+earlier, in UTC, so one HEAD names one window on any day and any machine. The tracked set is
 in the coupling key because ranking drops any pair naming a file `git ls-files` no longer
 lists, and the index moves without HEAD: `git rm --cached src/util.py` leaves the sha alone
-and still has to retire every pair naming that file.
+and still has to retire every pair naming that file. The history depth is in all three keys
+because deepening a shallow clone adds commits under an unmoved HEAD: it is git's shallow
+boundary (the `shallow` file in the git directory), so after `git fetch --unshallow` or
+`--deepen` the next `worklist`, `brief` or `coupling` reads the whole history it now holds.
+Before 0.8.1 they served the shallow counts until the UTC date changed.
 
 Two thresholds bypass the coupling cache. What is stored is the ranking at
 `--min-support 5` and `--min-confidence 0.5`, so `--top` reads it and either threshold off
@@ -329,8 +448,8 @@ the wider thresholds exist to surface.
 
 The version marker is in the file name on purpose. 0.4.3 and 0.4.5 sharing one working tree
 each read the other's cache as cold and rewrote it, so every run of both rebuilt the map.
-Different formats, different files, both warm. A warm 0.4.4 cache is adopted once and its
-file removed rather than left behind.
+Different formats, different files, both warm. This version never reads the files 0.4.5 to
+0.8.0 wrote and leaves them to an older crapkit on the tree; 0.4.4's are deleted.
 
 ---
 
@@ -365,11 +484,13 @@ Both were run against the same repo through the same crapkit lane and produced t
 scores (`4 measured, 0 over ceiling 6, CRAP load 12.0, grade A+`). Pick on your
 project's grounds, not on crapkit's.
 
-The provider version must match your vitest **major**, or npm refuses the install
-(`peer vitest@"4.x" from @vitest/coverage-v8@4.x`). On vitest 2:
+The provider version must match your vitest **major**, or npm refuses the install with
+`ERESOLVE unable to resolve dependency tree`, naming the vitest peer the provider wants.
+Read your vitest major with `npm ls vitest`, then install the provider at that major. On
+vitest 5, the major `npm i -D vitest` installs today:
 
 ```
-npm i -D "@vitest/coverage-v8@2"
+npm i -D "@vitest/coverage-v8@5"
 ```
 
 ### The json reporter
@@ -437,7 +558,9 @@ scopes = ["web"]
 vitest ships the junit reporter, so those three flags need no package. Name `default`
 alongside it: `--reporter=junit` on its own replaces the console output you watch the run
 through. That is the lane `crapkit init` writes for a repo whose `devDependencies` name
-vitest.
+vitest and whose package.json has a `test` script. When the test script has another name
+that starts with `test`, the command runs that script. With no such script it writes
+`npx vitest run --coverage ...` with the same flags.
 
 Never put a file filter in a `--coverage` command. vitest silently narrows the coverage
 include set to the filtered files, so everything else reads as uncovered. crapkit refuses
@@ -490,8 +613,8 @@ run 1 @ 70ac5e065df: 1 functions scored: 1 measured, 1 over ceiling 6, CRAP load
 ```
 
 The junit half is a separate package: `npm i -D jest-junit` first, or jest exits on a
-reporter it cannot resolve. It reads no path off the command line either — package.json,
-the jest config or those two variables are the whole list — so without the `env` block it
+reporter it cannot resolve. It reads no path off the command line either: package.json,
+the jest config or those two variables are the whole list, so without the `env` block it
 drops `junit.xml` at the repo root. Without `jest-junit` at all, drop the reporter flags,
 the `results_artifact` and the `env`, and take the `doctor` WARN: the lane still measures
 coverage, with the crashed-worker check and no-new-failures off.
@@ -517,6 +640,14 @@ note: lane 'py' names `python`, which resolves here to /home/dev/venvbare/bin/py
 A machine has more than one python, and the note used to say only "this python". Where the
 one it names is not the one the suite should run in, installing the package is the wrong
 move: repoint the lane instead.
+
+A lane that names its python by path, such as the `.venv\Scripts\python.exe` init writes
+for a repo's venv on Windows, gets an install command that names the file the path
+resolves to, `C:/work/app/.venv/Scripts/python.exe -m pip install pytest-cov`. The word as
+the lane spells it runs only from the lane's directory, and Git Bash reads its
+backslashes as escapes. Forward slashes run in cmd.exe, PowerShell and Git Bash, and a
+directory name that needs quoting is quoted on its own, as in a next step
+([ADR 0003](adr/0003-a-pasted-command-never-opens-with-a-quote.md)).
 
 A lane that reaches `crapkit coverage` with the plugin still missing gets the same fact from
 the refusal: the package has to land in the environment the SUITE runs in, not in the shell's
@@ -553,12 +684,22 @@ that scores from statements with the downgrade said out loud rather than failing
 
 ```
 $ crapkit coverage
-crapkit: lane 'py': coverage.py report carries no branch data, so the coverage term is statement-based for this artifact — add --cov-branch to the lane command to measure branches
+crapkit: lane 'py': coverage.py report carries no branch data, so the coverage term is statement-based for this artifact - add --cov-branch to the lane command to measure branches
+```
+
+The report measures branches when its `meta.branch_coverage` says so, or when any of its
+functions carries branch counts, so a report with no `meta` is judged by what it holds.
+In a report that measures branches, coverage.py writes `num_branches: 0` for a function
+with none, so a function with no branch counts at all was rewritten by something else.
+Read from its statements, its coverage moved with nothing said; the report is refused:
+
+```
+crapkit: lane 'py' FAILED: coverage.py report measures branches, but 1 function(s) carry no branch counts (api/views.py: render), so crapkit cannot tell how many of their branches ran; regenerate the report with `coverage json`
 ```
 
 Every function in the model already falls back to statement coverage when it holds no
 branches, so refusing the report blocked arithmetic crapkit performs on every run, and
-`pytest --cov --cov-report=json` is the shape most existing CI artifacts have — which is
+`pytest --cov --cov-report=json` is the shape most existing CI artifacts have, which is
 what `--reuse-artifacts` is for. Add the flag anyway: statement coverage overstates a
 branchy function, and the CRAP number is cubed in `(1 - cov)`.
 
@@ -567,7 +708,7 @@ would come out fully covered:
 
 ```
 $ crapkit coverage
-crapkit: lane 'py' FAILED: coverage.py report lacks branch data — run the lane with branch coverage on
+crapkit: lane 'py' FAILED: coverage.py report lacks branch data - run the lane with branch coverage on
 crapkit: every lane failed (1 of 1); the errors are above
 ```
 
@@ -576,25 +717,64 @@ Exit 5.
 ### A file the report carries no regions for
 
 coverage.py writes the per-file `functions` key once per code-region kind that file's own
-reporter declares, so a file measured by a plugin reporter declaring none — django or jinja
-template coverage — loses the key while every `.py` file in the same report keeps it. That
+reporter declares, so a file measured by a plugin reporter declaring none (django or jinja
+template coverage) loses the key while every `.py` file in the same report keeps it. That
 one entry used to fail the lane and throw away every other file in the report, including
 the ones that were fine. Those files are now skipped and named, and the rest is scored:
 
 ```
-crapkit: lane 'py': coverage.py report has no function regions for 1 of 40 file(s) (tpl/page.html) — those files are skipped and the rest of the report is scored
+crapkit: lane 'py': coverage.py report has no function regions for 1 of 40 file(s) (tpl/page.html) - those files are skipped and the rest of the report is scored
 ```
 
 A report where NO file carries regions is still exit 5, which is the "coverage is too old"
 case the message was written for: `coverage.py report has no function regions for any of
-its 40 file(s) — needs coverage >= 7.6`. That verdict is read before the branch-data one, so
+its 40 file(s) - needs coverage>=7.13.1`. That verdict is read before the branch-data one, so
 a report missing both is told its coverage is too old rather than sent to add `--cov-branch`,
 which a coverage that old would not fix.
+
+### A report from coverage 7.6 to 7.13.0
+
+coverage.py writes each function region's `def` line as `start_line` from 7.13.1, and a
+function's span starts there. An older report carries none, and no line inside the region
+is the `def` line: the body starts below it, and a nested function's `def` statement sits in
+its encloser's region. Read from the body, a nested function that never ran joined its
+encloser's region and scored as half covered. A report with a region whose `start_line` is
+missing or null is refused at exit 5, naming the artifact, the file and the first such
+function:
+
+```
+crapkit: lane 'py' FAILED: unparseable coverage.py report /repo/.crapkit/cov/py.json: pkg/mod.py: outer: no start_line; coverage.py writes it on every function from 7.13.1, so install coverage>=7.13.1 and rerun the lane
+```
+
+Install coverage.py 7.13.1 or newer where the lane runs (`pip install "crapkit[py]"` pulls
+it when crapkit shares the suite's venv), then rerun `crapkit coverage`. A repo that measured
+on an older coverage can see a nested function's mark exceeded once; the
+[upgrade guide](upgrading.md#081-on-coverage-76-to-7130) says what to do.
+
+Every region in the report needs its `summary` object; coverage.py writes one on each. A
+region without one exits 5, where it used to score the function as never run:
+
+```
+crapkit: lane 'py' FAILED: unparseable coverage.py report /repo/.crapkit/cov/py.json: pkg/mod.py: guarded: no summary object, so crapkit cannot tell how much of it ran; regenerate the report with `coverage json`
+```
+
+### A function coverage.py excludes
+
+`# pragma: no cover` on a def line, or an `exclude_lines` or `exclude_also` pattern that
+takes every statement in a function, leaves coverage.py a region with no statements and
+its lines under `excluded_lines`. From coverage.py 7.10.1 the default patterns also exclude
+a stub whose body is `...`, such as a `Protocol` method. That function reads `excluded`:
+`crap = ccn`, remedy `ok` or `decompose`.
+A pattern that takes some statements and leaves others, such as a `raise
+NotImplementedError` line, excludes those lines and the function is measured on the rest.
+Through 0.8.0 an excluded function read cov 0, `crap = ccn^2 + ccn`, with `add-tests`
+advice no test could follow.
+
 ### `--continue-on-collection-errors`
 
 This is pytest's `reportOnFailure`, and it is the flag people leave out. pytest raises
 `Interrupted` at the **end of collection** when any test module fails to import, so
-pytest-cov's session finish never runs and **no coverage report is written at all** — even
+pytest-cov's session finish never runs and **no coverage report is written at all**, even
 though every other test file collected fine and would have run. One renamed module, one
 missing optional extra or one stale editable install takes the whole lane down and drops
 every scope it measures to no-lane. Same repo, same command, only that flag toggled:
@@ -619,13 +799,13 @@ collect. Nothing is hidden: the uncollected file's tests are still errors in the
 ### The interpreter a lane binds to
 
 `python -m pytest` is not one command. `python` resolves through the shell's `PATH`, so
-the lane runs under whichever virtualenv the shell happened to have active — which is
+the lane runs under whichever virtualenv the shell happened to have active, which is
 almost always right, and silently wrong in the one case that matters.
 
 Two git worktrees of one repo. Checkout B's venv is active, and it holds an editable
 install pointing at B's `src`. Run `crapkit coverage` in checkout A and the lane's pytest
 imports **B's** sources. When the two checkouts' APIs have diverged, collection dies and
-you get exit 5. When they have not — the ordinary case for two worktrees of one branch —
+you get exit 5. When they have not (the ordinary case for two worktrees of one branch),
 the suite passes, coverage.py measures B's files, the join against A's scoped files finds
 nothing, and crapkit prints a confident `N untested … grade F` that is entirely an
 artifact of the wrong venv.
@@ -640,8 +820,8 @@ along with everything else:
 | `poetry.lock` | `poetry run python -m pytest …` |
 | `pdm.lock` | `pdm run python -m pytest …` |
 | `Pipfile.lock` | `pipenv run python -m pytest …` |
-| none, and a venv in the tree | `.venv/bin/python -m pytest …` (`.venv\\Scripts\\python.exe` on Windows) |
-| none at all | `python -m pytest …` (or `python3`, or `py` on Windows: the first that resolves) |
+| none, and a venv in the tree | `{python:.venv} -m pytest …`, which runs `.venv/bin/python` on Linux and macOS and `.venv\Scripts\python.exe` on Windows |
+| none at all | `{python} -m pytest …`, which runs `python3` on Linux and macOS and `python` on Windows; where that name does not resolve, the first of `python`, `python3` and `py` that does |
 
 The first match in that order wins, so a repo mid-migration between two managers gets the
 same config every time.
@@ -650,14 +830,20 @@ With no lockfile, `init` looks for the environment the repo carries: `.venv`, `v
 one `.venv` inside each scope it just sniffed. A directory counts only when it holds
 `pyvenv.cfg` and its interpreter imports `pytest`, so an empty environment, or a `venv/`
 package of somebody's sources, leaves the bare name alone. The path is repo-relative
-because an absolute one does not survive the repo reaching anyone else, and the Windows
-spelling is the file's, not the shell's: crapkit.toml is TOML, where `\` opens a string
-escape, so the committed line reads `command = ".venv\\Scripts\\python.exe -m pytest …"`
-and the loader hands the lane the single-backslash path. Forward slashes are not an
-option there: cmd.exe reads an unquoted `/` as the end of the command name and answers
-`'.venv' is not recognized`. That spelling is also the one gap in the row: a config
-written on Windows names `Scripts\python.exe`, which no Unix collaborator has, the same
-way `py` does not travel.
+because an absolute one does not survive the repo reaching anyone else.
+
+crapkit.toml is committed, so a Windows author's lane runs on a Linux collaborator's
+checkout and the other way round, each with a venv of its own. No one spelling of the
+launcher runs on both. cmd.exe reads an unquoted `/` as the end of the command name, so
+`.venv/bin/python` answers `'.venv' is not recognized`, and sh reads
+`.venv\Scripts\python.exe` as `.venvScriptspython.exe`. A bare `python` fails on an
+Ubuntu without python-is-python3. So `init` writes a
+[launcher token](configuration.md#the-launcher-token), and the loader replaces it with
+the launcher of the OS reading the file before anything reads the command. The one gap
+left is a machine where only another name resolves: `init` writes `py` on a Windows PATH
+that carries only the launcher, and a committed `py -m pytest` fails every Unix
+collaborator's doctor. Install a Python that puts `python` on that PATH, then write
+`{python}` in place of `py`.
 
 Every python line `init` writes carries the same prefix, and there are two in any one
 file: the `[crapkit.scoped_tests]` entry, plus either the live `[[lane]]` command or,
@@ -670,10 +856,17 @@ uncomment later.
 `init` does not probe a managed lane for `pytest-cov`. `uv run` and its siblings create or
 sync the project environment before running anything, and `init` has no business
 provisioning one to ask a question about it. If the plugin is missing, the lane says so on
-its first run — with the log path. `doctor` holds to the same rule and says so: where a
-python-headed lane gets `ok   lane 'py': python -> <path> (pytest X, pytest-cov Y)`, a
-managed one gets a `note` that its interpreter and pytest-cov were not probed, so a lane
-doctor did not ask never reads as one it found healthy.
+its first run, with the log path. `doctor` holds to the same rule and says so: where a
+python-headed lane gets `ok   lane 'py': python -> <path> (pytest X, pytest-cov Y, coverage Z)`,
+a managed one gets a `note` that its interpreter and pytest-cov were not probed, so a lane
+doctor did not ask never reads as one it found healthy. A probed lane whose coverage.py is
+older than 7.13.1 FAILs, because coverage.py writes each function's start line, which
+crapkit scores from, only since 7.13.1 and `crapkit coverage` refuses that lane's report
+with exit 5:
+
+```
+FAIL lane 'py' runs coverage 7.4.4 (/home/you/ledger/.venv/bin/python), which writes no function start lines, so `crapkit coverage` refuses its report with exit 5 (needs coverage >= 7.13.1); install 7.13.1 or later there with `/home/you/ledger/.venv/bin/python -m pip install "coverage>=7.13.1"` and raise any pin that holds it lower
+```
 
 It does check that the manager itself is installed here, because the lockfile is the
 repo's property and the PATH is the machine's. A `uv.lock` a teammate committed on a
@@ -682,11 +875,14 @@ right command for the repo and cannot start on this checkout, so `init` says so 
 than pointing at a `crapkit coverage` that exits 5:
 
 ```
-note: lane 'py' runs through `uv`, which this machine's PATH does not carry — install uv, or point the lane's command in crapkit.toml at an interpreter that resolves here, then `crapkit coverage`
+note: lane 'py' runs through `uv`, which this machine's PATH does not carry - install uv, or point the lane's command in crapkit.toml at an interpreter that resolves here, then `crapkit coverage`
 ```
 
 Writing the prefix by hand is the fix for a repo that adopted crapkit earlier, or one that
-pins its environment some other way: `command` is a shell string and takes anything.
+pins its environment some other way: `command` is a shell string and takes anything. A
+config `init` wrote before 0.8.1 names one OS's venv launcher: swap `.venv/bin/python`,
+or `.venv\\Scripts\\python.exe` as the TOML string spells it, for `{python:.venv}` so
+checkouts on the other OS run it too.
 
 ### A suite that spawns subprocesses
 
@@ -705,8 +901,10 @@ Without it, on pytest-cov 7 and later, a suite that drives its CLI through
 `subprocess.run` measures the parent only: every entry point reads 0% and every function
 behind one is scored as untested. Nothing warns. crapkit's own e2e suite is exactly that
 shape, and the key is in crapkit's pyproject.toml for exactly that reason. Note that
-coverage 7.9 and earlier answer the key with a warning and ignore it, so pin
-`coverage>=7.10.6` beside `pytest-cov` wherever the lane's environment is declared.
+coverage 7.9 and earlier answer the key with a warning and ignore it. Pin
+`coverage>=7.13.1` beside `pytest-cov` wherever the lane's environment is declared: it
+takes the key, and it writes the `start_line` crapkit
+[needs](#a-report-from-coverage-76-to-7130).
 
 **Prefer `--cov=<module>` over `--cov=<path>`.** The source has to resolve from the
 **child's** cwd, and a suite that runs its CLI in a tmp directory is not in the repo any
@@ -784,7 +982,7 @@ shell's, and [How a lane command is read](#how-a-lane-command-is-read) has the w
 `-m "not live and not perf"` is one marker expression, not four positionals. In
 `crapkit.toml`, a single-quoted TOML string keeps the double quotes unescaped:
 `command = 'python -m pytest -m "not live and not perf" --cov=pylib ...'`. After a flag it
-does not know, a bare word is that flag's value too — only a path or a node id
+does not know, a bare word is that flag's value too; only a path or a node id
 (`pylib/unit`, `tests/test_x.py::test_slow`) outranks the guess and is refused:
 
 ```
@@ -812,7 +1010,7 @@ lane without a positional reads none of those files.
 contexts. Without them it says so rather than guessing:
 
 ```
-tests: no context data — run the py lane with dynamic_context = test_function and a --show-contexts JSON report
+tests: no context data - run the py lane with dynamic_context = test_function and a --show-contexts JSON report
 ```
 
 Two pieces. Add `--cov-context=test` to the lane command, and turn contexts on in
@@ -854,7 +1052,7 @@ parser = "coveragepy"
 scopes = ["api"]
 ```
 
-Getting `path_prefix` wrong is silent and expensive. The same tree, same suite, only the key
+Getting `path_prefix` wrong is quiet and expensive. The same tree, same suite, only the key
 removed:
 
 ```
@@ -863,7 +1061,25 @@ without path_prefix: 1 functions scored: 1 untested, ..., CRAP load 20.0
 ```
 
 The lane ran and passed both times. Without the prefix, no artifact path matched any scoped
-file, so every function fell to `untested` and scored as if nothing tested it.
+file, so every function fell to `untested` and scored as if nothing tested it. The run
+still exits 0. The one sign is a stderr line that opens
+`crapkit: lane 'py' measured 1 file(s), none of them under the paths its scopes declare`.
+A lane with no prefix is told the runner may report paths it needs `path_prefix` to
+rebase. A lane whose prefix names the wrong directory is told which prefix crapkit read,
+and which prefix would key a file the runner named that is on disk and in the lane's
+scopes:
+`or path_prefix 'web', which crapkit.toml sets for this lane, does not rebase the
+runner's paths onto those scopes; path_prefix = 'api' would key the runner's src/calc.py
+as api/src/calc.py, a file those scopes claim`. When the runner's paths need no prefix,
+the line says to drop `path_prefix` from the lane. When no declared path holds a file the
+runner named, it says to set `path_prefix` to the directory the runner's paths are
+relative to.
+
+Any spelling of the right directory works, because `path_prefix` is read the way a scope
+path is: `api\`, `./api/`, `.\api\` and `/api/` all read `api/`, and on a disk that ignores
+case `API/` takes the case the directory lists. Before 0.8.1 each of those glued its own
+text onto every key, so a Windows-written `api\` scored the whole scope untested on every
+OS, with the same stderr line as the only sign.
 
 ---
 
@@ -881,6 +1097,8 @@ run 1 @ 387e938f537: 1 functions scored: 1 measured, 1 over ceiling 6, CRAP load
 $ crapkit worklist --repo packages/api
 worklist @ 387e938f537 (run 1, floor ccn>=5, churn 12mo) - 1 of 1 active (worklist_top 50), 0 dormant
   risk     10.5  ccn   7  crap    13.1  cov  50%    6c/1a  calc/grade.py:1  classify( score , attempts , late , bonus )
+no crapkit-ratchet.tsv yet: seed marks each function over its ceiling at today's score, and from then on a mark may only fall
+-> next: crapkit ratchet seed
 ```
 
 `--repo` names the crapkit root, never the git top, and every subcommand you invoke by hand
@@ -912,7 +1130,7 @@ week. If you see that, check the version before you check your config. The churn
 moved to new file names, so a map laid down with top-relative paths is ignored rather than
 reused, and a 0.4.3 sharing the repo keeps its own.
 
-### The gate gates below the top since 0.4.5
+### The gate reads paths from the crapkit root
 
 0.4.4 fixed churn and left the pre-commit gate reading `git diff --cached`, which answers
 from the git top whatever the root is. Those paths matched no scope under a nested root, so
@@ -940,7 +1158,14 @@ decompose before committing (coverage cannot save a function above the target).
 
 Exit 6, and the path in the row is root-relative like every other crapkit row. A staged file
 that sits **above** the crapkit root is outside the diff by design, and is no longer named
-in that warning.
+in that warning. The hook git runs needs no `cd`: git starts it at the top, and with no
+`crapkit.toml` there the gate runs in `packages/api` itself and prints the same row from the
+top, `packages/api/calc/grade.py:17`.
+
+A command other than the hook that runs at the git top, such as Route 4's `crapkit verify`
+in a CI step, finds no `crapkit.toml` there and exits 3, and the refusal says which flag to
+add: `no crapkit.toml at /repo - nothing to analyze; crapkit.toml sits below it in packages/api:
+pass --repo packages/api`.
 
 ---
 
@@ -953,7 +1178,13 @@ crapkit: lane 'py' FAILED: lane 'py' runs the python suite, which is host-only (
 ```
 
 Two triggers, either one is enough: the file `/.dockerenv` exists, or
-`CRAPKIT_INSIDE_CONTAINER=1` is set in the environment. The guard exists because a python
+`CRAPKIT_INSIDE_CONTAINER=1` is set in the environment. Docker writes `/.dockerenv` into
+every container it starts, so these all count as containers: a devcontainer, a GitHub
+Codespace, a CI job that runs in a `container:` image or on a Docker executor, and an agent
+that works in a cloud container, such as a Codex cloud task. `crapkit doctor` names each
+coverage.py lane the guard will refuse with a WARN, before the first `crapkit coverage`
+does. Podman writes `/run/.containerenv` instead, which the guard does not read; set
+`CRAPKIT_INSIDE_CONTAINER=1` there if the container caps memory. The guard exists because a python
 suite under coverage is memory-hungry and a container memory cap turns that into an OOM kill
 that looks like a flaky lane. It fires on the path that launches the suite and nowhere else,
 so `--reuse-artifacts` reads a host-built report inside a container without hitting it: that
@@ -966,6 +1197,19 @@ container_ok = true
 
 `istanbul` lanes are never refused.
 
+`crapkit doctor` reads the same two triggers, so a devcontainer, a Codespace, a Codex cloud
+task or a CI job in a container hears about the guard before the first `coverage` run
+refuses. It prints one WARN per `coveragepy` lane that has no `container_ok`, naming the
+trigger it found:
+
+```
+WARN lane 'py' runs a coverage.py suite and this is a container (/.dockerenv exists): `crapkit coverage` refuses it with exit 5; if the container is sized for the suite, set container_ok = true on the lane (docs/lanes.md#containers)
+doctor: no problems found, 1 warning above
+```
+
+doctor exits 0 here, because the config is right and the machine is the question. The closing
+line counts the warnings, so a reader who reads only the last line still learns there is one.
+
 ---
 
 ## Reusing artifacts
@@ -974,19 +1218,37 @@ Rerunning a suite crapkit already read is the slowest thing it does. Two flags s
 
 Every artifact crapkit reads is stamped in `.crapkit/artifacts.json` with the commit it was
 built at, the lane that built it, and how long the lane took. A lane that ran and left its
-artifact unwritten stamps the file's modification time instead, under `refused_mtime_ns`,
+artifact unwritten stamps the sha256 of the file it left instead, under `refused_sha256`,
 which is what [refuses that file on reuse](#the-artifact-a-failed-attempt-left-behind-is-refused).
 
 | Flag | Behavior |
 |---|---|
-| `--reuse-artifacts` | Skip every lane command, parse whatever is on disk, except the artifact a lane's last attempt failed to write: that one is refused (exit 5) until something rewrites it. Warns per lane when files under that lane's scopes changed since the stamp. |
-| `--reuse-unchanged` | Reuse a lane only when its stamp proves nothing it reads changed; otherwise run it again. A lane without `inputs` needs the same clean HEAD, unchanged lane settings, `crapkit.toml` bytes, inherited environment and coverage/JUnit bytes. A lane with `inputs` needs its artifact's commit still behind HEAD, no change under those paths, its own lane table and `env` unchanged, and the same coverage/JUnit bytes. A failed attempt that wrote no artifact always reruns. Each lane prints one line saying which it did, and a rerun names the first condition that failed. |
+| `--reuse-artifacts` | Skip every lane command, parse whatever is on disk, except the artifact a lane's last attempt failed to write: that one is refused (exit 5) while it holds the same bytes, so a touch, a copy that drops times or a same-bytes rewrite keeps it refused and a file with new bytes is read. Warns per lane when files under that lane's scopes changed since the stamp, or when git could not tell. A declared junit it cannot read is a warning under `coverage` and [exit 5 under `verify`](#under---reuse-artifacts-it-is-a-warning). |
+| `--reuse-unchanged` | Reuse a lane only when its stamp proves nothing it reads changed; otherwise run it again. A lane without `inputs` needs the same clean HEAD, unchanged lane settings, `crapkit.toml` bytes, inherited environment, crapkit version and coverage/JUnit bytes. A lane with `inputs` needs its artifact's commit in this clone, no change under those paths between that commit's tree and the working tree, its own lane table and `env` unchanged, the same crapkit version, and the same coverage/JUnit bytes. A failed attempt's leftover always reruns, whatever its modification time says. Each lane prints one line saying which it did: a rerun names the first condition that failed, and a reuse names what its proof leaves out. |
 
 Without `inputs`, automatic reuse covers the whole tracked tree, including tests and
 shared helpers: any tracked or untracked change, or a new commit, reruns the lane.
+A change means new bytes, as `git status` reads them: a `touch`, a file saved with the
+same bytes or a fresh copy of the checkout is no change, whatever `diff.autoRefreshIndex`
+the repo sets, and crapkit's reads leave `.git/index` as they found it.
 With [`inputs`](configuration.md#lane) it covers exactly those paths, literal paths
 from the root with no globs, so a docs commit or an untracked draft elsewhere reruns
-nothing, and a file the command reads that the list leaves out is never checked.
+nothing, and a file the command reads that the list leaves out is never checked. The
+inputs proof compares trees, not history: a message-only amend, a rebase onto a commit
+that touched nothing under the inputs, or a switch to a sibling branch with the same
+inputs reuses the lane. A clone that does not hold the stamp's commit, such as a
+shallow CI checkout with `.crapkit/` restored, reruns it and says so.
+
+git's own diff skips three kinds of edit, and reuse does not: a file flagged
+`--skip-worktree` or `--assume-unchanged` whose bytes differ from the index, and an
+edit inside a submodule whose `.gitmodules` entry says `ignore = dirty`. A same-size
+edit whose old modification time was put back (`cp -p`, `tar -x`, `rsync -t`) passes
+git's stat check, and reuse trusts that check: it is a named limit until the cost of
+hashing every file on every run is measured. The limit holds on Windows, where the change
+time is the creation time, and under `core.trustctime=false`. On Linux and macOS git's
+default stat check also compares the change time, which no copy puts back, so git sees
+the edit once the change time moves a second past the one it recorded. Run `crapkit
+coverage` after such a copy.
 An entry that matches no tracked file, and no untracked file outside `.gitignore`,
 hides every change behind it, so `doctor` fails on it and names the entry.
 Measurements made while their proof did not hold (a dirty tree, or dirty inputs)
@@ -994,13 +1256,22 @@ and older stamps without this proof cannot be reused automatically.
 
 The declared `artifact` and `results_artifact` of every lane in `crapkit.toml` are not
 changes to the tree or to a lane's inputs, whether git ignores them or not: every run
-rewrites them, and each stamp proves its own by their digests. Any other file a lane
-writes that git does not ignore is a change, and the rerun line names it; ignore it.
+rewrites them, and each stamp proves its own by their digests. Neither is an untracked
+file a lane's own run wrote, such as `.coverage` at the root from pytest-cov or
+`__pycache__` under the scopes: the stamp lists it under `byproducts`, and no lane's
+proof counts it while it stays untracked. `crapkit init` ignores only `.crapkit/`, so
+without this the first run's own output voided its proof and the lane never reused.
+Any other file that git does not ignore is a change, and the rerun line names it.
 
 The environment half of the proof leaves out what a shell or terminal keeps for its
-own bookkeeping: `OLDPWD`, `PWD`, `SHLVL`, `_` and terminal session ids such as
-`WT_SESSION`, `TERM_SESSION_ID` and `SSH_CONNECTION`, so a `cd` between two runs reruns
-nothing. Every other inherited variable counts. The stamp keeps a
+own bookkeeping: `OLDPWD`, `PWD`, `SHLVL`, `_`, terminal session ids such as
+`WT_SESSION`, `TERM_SESSION_ID` and `SSH_CONNECTION`, the agent and IPC sockets a
+login, tmux or an editor terminal opens, such as `SSH_AUTH_SOCK`, `SSH_AGENT_PID`,
+`TMUX` and `VSCODE_GIT_IPC_HANDLE`, and PowerShell's own `PSModulePath`, so a `cd`, a
+new terminal or a switch between PowerShell and Git Bash between two runs reruns
+nothing. Names are compared in upper case, the way Windows spells them. Every other
+inherited variable counts, `PATHEXT` included: it decides what cmd.exe starts for a
+lane's first word. The stamp keeps a
 16-hex digest of each value under `proof_parts`, never the value, so a rerun can
 name the variable that changed.
 
@@ -1008,22 +1279,31 @@ Each lane says what `--reuse-unchanged` decided, before any lane starts:
 
 ```
 $ crapkit coverage --reuse-unchanged
-crapkit: lane 'py': measurement inputs unchanged; reusing without rerun (artifact built at 525a3276065)
+crapkit: lane 'py': measurement inputs unchanged; reusing without rerun (artifact built at 525a3276065); its proof leaves out gitignored files and anything outside the repository
 crapkit: lane 'web': rerunning: the working tree has 1 uncommitted change(s): web/src/app.ts
 ```
 
 A rerun names the first condition that failed: `no artifact at PATH`, a last attempt
-that wrote none, `its stamp holds no proof` (measured with uncommitted changes, or by a
-crapkit that recorded none), uncommitted changes, `HEAD is X and its artifact was built
-at Y`, `crapkit.toml changed`, `its lane table changed`, `N environment variable(s)
-changed: NAME`, changes under a lane's `inputs` since its commit, or artifact bytes that
-differ from the stamp. `coverage --json` carries the same sentence per lane as
-`rerun_reason`, `""` for a lane it reused.
+that wrote none, `its stamp holds no proof` and why (the uncommitted changes it was
+measured with, a git read that failed while it was measured, or a crapkit that recorded
+none), uncommitted changes, `HEAD is X and its artifact was built at Y`,
+`crapkit.toml changed`, `its lane table changed`, `the crapkit version changed`,
+`N environment variable(s) changed: NAME`, changes under a lane's `inputs` since its
+commit, `nothing proves its inputs unchanged` and what git said when a read of them
+failed, a stamp commit this clone does not hold, or a declared file that no longer
+matches its stamp: `PATH: missing`, `PATH: unreadable (why)` or
+`PATH: bytes differ from its stamp`. `crapkit.toml` is compared with CRLF read as LF, so a
+checkout under `core.autocrlf=true` is the file it was. `coverage --json` carries the
+same sentence per lane as `rerun_reason`, `""` for a lane it reused.
 
-Ignored inputs other than `crapkit.toml`, files outside the repository, installed
-dependencies and services are outside that proof. Run fresh coverage when those
-inputs change. `--reuse-artifacts` remains an explicit request to read saved
-artifacts and keeps its warning about stale source coverage.
+Some inputs are outside the proof, and the line that reuses a lane names them. For a
+lane without `inputs`: gitignored files other than `crapkit.toml`, and anything outside
+the repository (installed dependencies, tools, services). For a lane with `inputs`:
+gitignored files, files outside its inputs and inherited environment variables, since
+a variable its command reads belongs in its `env`. An edit there reuses the old
+artifact by design; run fresh coverage when those inputs change. `--reuse-artifacts`
+remains an explicit request to read saved artifacts and keeps its warning about stale
+source coverage.
 
 Commands running as the same user on the same host cannot own the same
 measurement outputs. Ownership covers
@@ -1032,7 +1312,9 @@ paths shared by different checkouts. A conflicting command refuses before it
 runs. Independent output paths can run in parallel. Coordination files live under
 `~/.cache/crapkit/measurements/<host-id>`, outside report directories that runners
 may delete and recreate. The key uses the full resolved artifact path. `TEMP`,
-`TMP` and `CRAPKIT_RESOURCE_DIR` do not select another measurement domain.
+`TMP` and `CRAPKIT_RESOURCE_DIR` do not select another measurement domain. A process
+started without `USERPROFILE` (Windows) or `HOME` (POSIX) still finds the same `~`
+through the operating system; [resources.md](resources.md#analysis-workers) says how.
 If the CLI dies, its helper stops registered test processes before releasing
 ownership. Small stable lease files remain as coordination state; do not delete
 them as idle evidence.
@@ -1049,7 +1331,7 @@ never prints. Live, on a tree with an edited source file:
 
 ```
 $ crapkit coverage --reuse-artifacts --reuse-unchanged
-crapkit: lane 'py' artifact was built at 525a3276065; 2 file(s) in its scopes changed since (their coverage is stale)
+crapkit: lane 'py' reuses .crapkit/cov/py.json; 2 file(s) in its scopes changed since it measured them (calc/grade.py, calc/hot.py), so its coverage may be stale; rerun the lane (`crapkit coverage --lane py`) to measure the tree as it is
 run 9 @ 525a3276065: 5 functions scored: 4 measured / 1 untested, ...
 
 $ crapkit coverage --reuse-unchanged
@@ -1059,9 +1341,35 @@ run 10 @ 525a3276065: 5 functions scored: 5 measured, ...
 The new function reads `untested` in the first run and `measured` in the second, because
 only the second actually ran the suite.
 
-A stale artifact also silences the dark-line fields. `next-item` and `brief` then emit
-`uncovered_lines: null` with a note naming the lane to rerun, rather than an empty list a
-caller would read as "nothing left to cover".
+A stale artifact also silences the dark-line fields of the files that moved. `next-item`
+and `brief` then emit `uncovered_lines: null` for such a file, with a note naming it and
+the lane to rerun, rather than an empty list a caller would read as "nothing left to
+cover". Every other file keeps its lines.
+
+"Moved" is about content, not history. Each run's stamp in `.crapkit/artifacts.json`
+holds the git blob id of every file under the lane's scopes as the run left them
+(`blobs`): the id `git add` would store, through the repo's filters. A submodule is
+recorded by the commit its checkout holds. The note and the warning above compare those
+ids with the files on disk, so a `touch`, a mode bit, a CRLF checkout under
+`core.autocrlf=true`, an expanded `$Id$`, a message-only amend, a rebase, a detached HEAD
+and a shallow CI clone with `.crapkit/` restored are not moves, whatever
+`diff.autoRefreshIndex` says. An edit is, and so is a new or deleted file under the
+scopes, a CRLF rewrite under `core.autocrlf=false`, an uncommitted `.gitattributes` that
+renormalizes a file, an edit inside a submodule, and an edit reverted after the lane
+measured it. A file the lane itself writes under its scopes while it runs, such as
+`src/__pycache__`, is recorded as the run left it and is not a move.
+
+git's index is the fast path: a tracked file `git status` calls unchanged holds the
+id the index records, and only the rest is hashed. So a same-size edit whose old
+modification time was put back keeps the index's id and is not seen: the same named
+limit as reuse, on the same OSes and settings, until hashing every file is measured.
+
+A stamp written by crapkit 0.8.0 or older holds no `blobs`. It is judged the old way
+until the next `crapkit coverage` replaces it: git's diff since the stamp's commit,
+uncommitted edits included, which needs that commit behind HEAD. While that says stale,
+every file's dark lines are null. When git cannot answer, or the clone does not hold
+the stamp's commit, the note and the warning say so and give git's error rather than
+claim a file changed.
 
 ### The artifact a failed attempt left behind is refused
 
@@ -1069,23 +1377,42 @@ caller would read as "nothing left to cover".
 be the one this run wrote](#the-artifact-has-to-be-the-one-this-run-wrote)). Until 0.5.0
 that refusal ended with the run: the file stayed on disk, the next `coverage
 --reuse-artifacts` parsed it, and `verify --reuse-artifacts` passed over it and wrote
-itself in as the trusted baseline. The failed attempt now records the file's modification
-time in the stamp, and reuse refuses the file while that time still matches:
+itself in as the trusted baseline. The failed attempt now records the sha256 of the file it
+left in the stamp, and reuse refuses the file while it holds those bytes:
 
 ```
 $ crapkit coverage --reuse-artifacts
-crapkit: lane 'py' FAILED: lane 'py' wrote no artifact on its last attempt — the .crapkit/cov/py.json on disk predates it and is the previous run's, which --reuse-artifacts will not score; lane log: /repo/.crapkit/lane-py.log; last output: ...
+crapkit: lane 'py' FAILED: lane 'py' wrote no artifact on its last attempt - the .crapkit/cov/py.json on disk predates it and is the previous run's, which --reuse-artifacts will not score; lane log: /repo/.crapkit/lane-py.log; last output: ...
 crapkit: every lane failed (1 of 1); the errors are above
 EXIT=5
 ```
 
 Same exit 5 as the run that failed, same log path. With other lanes measured the run is
-`partial` and `verify` refuses to conclude, exactly as for any failed lane. Two things
-clear it: a real run that writes the artifact, or a rewrite of the file by hand. A
-coverage JSON combined from a killed run's shards is newer than the refused one, so the
+`partial` and `verify` refuses to conclude, exactly as for any failed lane. New bytes
+clear it: a real run that writes the artifact, or a file combined by hand. A coverage
+JSON combined from a killed run's shards holds other bytes than the refused one, so the
 [shard recipe](#a-killed-run-leaves-its-coverage-shards-behind) still ends in a
-`--reuse-artifacts` run that scores. A file that is gone is the missing-artifact refusal,
-as before.
+`--reuse-artifacts` run that scores. A touch, a copy of the checkout that drops times, a
+backup restore or a sync client that rewrites the same bytes does not: the refusal was
+keyed on the modification time until 0.8.1, and each of those handed the dead lane's
+numbers back as a trusted run. A file that is gone is the missing-artifact refusal, as
+before.
+
+The refusal is written to `.crapkit/artifacts.json` through a temporary file that
+replaces it in one step, and `crap.sqlite` keeps a copy, so deleting
+`.crapkit/artifacts.json` does not lift it. A stamp file that cannot be read (cut short,
+a top level that is not an object, or an entry for the lane's artifact that is not an
+object) may have held a refusal the store does not, so reuse refuses that lane too. Before
+0.8.1 each of those read as no stamp at all, and reuse scored a dead lane's leftover as a
+trusted run:
+
+```
+$ crapkit coverage --reuse-artifacts
+crapkit: lane 'py' FAILED: lane 'py': .crapkit/artifacts.json cannot be read (it does not parse as JSON), so crapkit cannot tell whether the .crapkit/cov/py.json on disk is the file a failed attempt left; rerun the lane (`crapkit coverage --lane py`), or delete .crapkit/artifacts.json to reuse the file as it stands
+```
+
+A refusal crapkit 0.8.0 recorded holds a modification time (`refused_mtime_ns`) and no
+digest, and is judged by that time until the lane's next run records a digest.
 
 The refusal is keyed on the attempt, not on the failure. A lane refused before it ran, such
 as the python lane under the [container guard](#containers), records nothing, and
@@ -1093,8 +1420,17 @@ as the python lane under the [container guard](#containers), records nothing, an
 its artifact (a junit that says the run did not finish, an artifact from another tree)
 records nothing either: that file is this run's, and reuse judges it on its own terms.
 
-`--reuse-unchanged` reads the same refusal stamp, so a lane whose last attempt wrote
-nothing reruns even when every other input still matches.
+`--reuse-unchanged` reads the same refusal, so a lane whose last attempt wrote nothing
+reruns even when every other input still matches, and a touch of the leftover does not
+change that.
+
+`doctor` WARNs about the same file. crapkit writes it through a temporary file that
+replaces the old one in one step, so a crash mid-write no longer leaves it cut short. A
+missing file is not an unreadable one: a repo that only ever reuses artifacts another
+command wrote never stamps any. That is also why deleting `.crapkit/artifacts.json` drops
+every refusal it held, and why a store a crapkit older than 0.5.0 left behind holds none:
+reuse then scores whatever file is on disk. Delete it only when you mean to trust every
+artifact there.
 
 ---
 
@@ -1131,7 +1467,7 @@ $ python -c "import subprocess,sys; subprocess.run([sys.executable, 'tick.py'])"
 ### The kill takes the whole process tree
 
 `command` runs under a shell, so stopping the shell alone can leave the suite running.
-Crapkit registers the command before it runs any code: Windows starts it suspended and
+crapkit registers the command before it runs any code: Windows starts it suspended and
 resumes it once its Job holds it, and POSIX holds a launcher at a start gate that execs
 the command after registration. A separate owner keeps resource locks until command
 cleanup finishes, even if the caller dies.
@@ -1231,11 +1567,20 @@ Rules that keep this from hiding real failures:
   A test that several lanes failed drops out only when each of those lanes reran it and
   it passed.
 - A test only drops out of `new_failures` when the rerun's own results artifact says it
-  passed. No artifact, a crash, or a timeout during the retest keeps everything failed.
+  passed. The lane's report moves aside while the retest runs, so a report at the path
+  afterwards is the retest's, even one written inside the old report's time tick. No
+  artifact (the lane's report goes back), a crash, or a timeout during the retest keeps
+  everything failed.
 - The retest never touches the gate or the ratchet. It only shrinks the new-failure set.
 - A test that passed its rerun is stored under the lane's `retried_passes`, and the lane's
   `failures` keeps the first attempt. A later verify that measures against this run never
   forgives that test.
+- A verify run stored by crapkit 0.7.x has no `retried_passes`: a test that passed its
+  rerun sits in its `failures` beside the real ones. A later verify reads that run's
+  failures from the newest trusted run behind it that a baseline can forgive from, and says
+  so (`baseline run 4 was written by crapkit 0.7.6, which kept a failure that passed its
+  flake retry in its failure list`). Reading that list as it stood forgave a real failure of
+  the test that once passed its rerun.
 
 ---
 
@@ -1253,7 +1598,9 @@ Lanes are subprocesses, so this is a thread pool: it moves wall time only. Above
 starts the lane that took longest last time first (its duration rides along in the artifact
 stamp), prints `lane 'x' started` and `finished` to stderr, and folds results back in
 **declaration** order regardless of who finished. The run scores byte-identically to a
-serial one.
+serial one. A lane with no recorded run, because its artifact was reused or `.crapkit/` was
+cleaned, is placed by the time its `results_artifact` JUnit report claims, the figure
+`doctor --tune` costs it by. A lane with neither starts after the measured ones.
 
 Every reuse decision is taken up front on one thread, before any lane starts, because a lane
 command writes to the working tree and deciding lane by lane would let one lane's output
@@ -1286,8 +1633,8 @@ max_parallel_lanes = 1
 # held at 1: lanes 'py-conform', 'py-impl' write coverage.py data files that one of them deletes and combines, and two of them at once can fail one lane; give each lane its own COVERAGE_FILE, for example env = { COVERAGE_FILE = ".coverage.py-conform" } in lane 'py-conform' and env = { COVERAGE_FILE = ".coverage.py-impl" } in lane 'py-impl', then rerun doctor --tune
 ```
 
-`[crapkit] analysis_workers` (default `0` = one process per core) caps the lizard pool
-separately. Set it when the analysis pass runs beside parallel lanes so the two are not both
+`[crapkit] analysis_workers` (default `0`, automatic sizing within the CPU limit; see
+[configuration.md](configuration.md#crapkit)) caps the lizard pool separately. Set it when the analysis pass runs beside parallel lanes so the two are not both
 claiming every core.
 
 ---
@@ -1340,24 +1687,39 @@ salvage is newer than that file by construction.)
 
 ```
 $ crapkit coverage --reuse-artifacts
-crapkit: lane 'py' reused .crapkit/cov/junit-py.xml and cannot check it: junit report contains zero testcases — the suite crashed before collecting, not a pass; the crashed-worker and no-new-failures checks cannot run for this lane
+crapkit: lane 'py' reused .crapkit/cov/junit-py.xml and cannot check it: junit report contains zero testcases - the suite crashed before collecting, not a pass; the crashed-worker and no-new-failures checks cannot run for this lane
 run 11 @ 525a3276065: 5 functions scored: 5 measured, ...
 ```
 
 The lane records no test counts, which is the same no-counts path a lane with no
-`results_artifact` takes, and `verify` says so against its baseline. The alternative was
-deleting `results_artifact` from the config, which gives up both checks on every future
-run to get past one.
+`results_artifact` takes. The alternative was deleting `results_artifact` from the config,
+which gives up both checks on every future run to get past one.
+
+`verify --reuse-artifacts` does not pass over that warning. Its verdict is the
+no-new-failures check, and a lane whose declared junit it could not read checked no test.
+So it exits 5 before it stores the run, as a real run over the same file does:
+
+```
+$ crapkit verify --reuse-artifacts
+crapkit: lane 'py' reused .crapkit/cov/junit-py.xml and cannot check it: results_artifact .crapkit/cov/junit-py.xml is missing; the crashed-worker and no-new-failures checks cannot run for this lane
+crapkit: lane 'py' declares results_artifact .crapkit/cov/junit-py.xml, which this verify reused and could not read, so no test in it was checked for a new failure; run verify without --reuse-artifacts so the lane writes it again
+EXIT=5
+```
+
+That verify used to pass: exit 0, `"ok": true` under `--json`, and the run stored as the
+next trusted baseline. The Action never reached it, since its `coverage` step refuses the
+same junit first. A lane that declares no `results_artifact` had no report to read, so
+verify still passes it and lists it under `lanes_without_results`.
 
 ### The test count is the second check
 
-A runner killed from outside — an OOM, a signal — writes no crash into its report at all, and
+A runner killed from outside (an OOM, a signal) writes no crash into its report at all, and
 then the count is the only signature left. `coverage` compares each lane's junit total
 against the last trusted run's and warns past a **10%** drop:
 
 ```
 $ crapkit coverage
-crapkit: lane 'py' ran 12 tests, 8 fewer than the last trusted run's 20 — check the runner's log for a worker that died without reporting it
+crapkit: lane 'py' ran 12 tests, 8 fewer than the last trusted run's 20 - check the runner's log for a worker that died without reporting it
 run 2 @ df858be0149: 1 functions scored: 1 measured, 0 over ceiling 6, CRAP load 2.0, grade A+
 -> next: crapkit worklist
 ```
@@ -1366,9 +1728,9 @@ A warning, never a failure: deleting a test file is a legitimate way to get ther
 reports **any** shrink against its own baseline, which is the strict half of the same check.
 
 Both counts are optional and neither absence is an error. A baseline recorded before the
-lane declared a `results_artifact` carries no count and compares nothing. A lane that wrote
-no junit this run gets one line naming the gap. Here the baseline had a junit and the lane
-that ran under `verify` had lost it:
+lane declared a `results_artifact` carries no count and compares nothing. A lane that
+declares no junit this run gets one line naming the gap. Here the baseline had a junit and
+the lane has since stopped declaring one:
 
 ```
 $ crapkit verify
@@ -1378,6 +1740,47 @@ verify OK @ 437a254ba09 vs baseline 437a254ba09 (2 changed files)
 
 Reading that absent count as zero is what used to turn such a run into a KeyError, after
 the lane had already run.
+
+`coverage` reads both absences the same way. A lane with no count this run compares
+nothing and prints no drop: a lane with no `results_artifact` has nothing to count, and
+under `--reuse-artifacts` the reuse warning above already names the missing junit. A
+trusted run that counted nothing for a lane is passed over, so a drop is measured from the
+newest count a trusted run recorded, even when an older run holds it. The line then names
+that run and why:
+
+```
+crapkit: lane 'py' ran 12 tests, 8 fewer than run 1's 20 (the last trusted run, run 2, recorded no test count for it) - check the runner's log for a worker that died without reporting it
+```
+
+`verify` reaches past its baseline the same way, for the count and for the failure list.
+When the baseline recorded neither for a lane, it compares with the newest trusted run at
+or behind the baseline's commit that did, and says which:
+
+```
+$ crapkit verify
+warning: lane 'py': baseline run 2 recorded no test results, so its failures are compared with run 1's
+warning: lane 'py' runs 8 fewer tests than run 1 (baseline run 2 recorded no test count for it)
+verify OK @ 0e8073a7421 vs baseline 0e8073a7421 (0 changed files) (1 unchanged failure forgiven, first t::c0)
+```
+
+Before, that run compared nothing: a suite that fell from 20 tests to 2 passed without a
+word, and a test failing at the baseline's own commit came back as a `NEW FAILURE`, exit 8.
+When no run recorded a failure list for the lane, its failures still count as new, since a
+gate fails closed, and the line says they may predate the change:
+
+```
+warning: lane 'py': no trusted run at or behind the baseline recorded which of its tests failed, so its 1 new failure may predate this change; a baseline measured with results_artifact declared tells them apart
+```
+
+That is the pull request that adds `results_artifact` to a lane whose suite already fails a
+test. `verify --json` lists such lanes under `lanes_without_baseline_results`, and every
+lane that declares no `results_artifact` under `lanes_without_results`. A lane with no
+`results_artifact` whose command exited nonzero gets its own line, since its exit code is
+recorded and not enforced and nothing else says a test failed:
+
+```
+warning: lane 'py' exited 1 and declares no results_artifact, so verify cannot see which of its tests failed; declare results_artifact (the lane's junit report) to check them
+```
 
 ---
 
@@ -1398,7 +1801,8 @@ Exit 5. The summary opens by saying the run is partial, counts `over` and the gr
 the measured scopes only (the failed lane's function is `scripts`' debt under
 `by_scope`, not this run's grade), and ends with the lanes to rerun. On a tree with
 uncommitted changes that last line adds ``(the working tree has uncommitted changes, so
-every lane that lists no `inputs` reruns)``. Four consequences:
+every lane that lists no `inputs` reruns)``, and when git cannot say whether the tree is
+clean it adds that instead, with git's error. Four consequences:
 
 1. **The failed lane's scopes fall back to `no-lane`, not `untested`.** The distinction is
    the point: `untested` means a working lane had nothing to say about this function,
@@ -1417,12 +1821,16 @@ the successful lanes' provenance under `lanes`.
 
 ### The artifact has to be the one this run wrote
 
-A lane passes when its command finishes AND every file the lane declares that was already
-on disk has a different modification time after the attempt. A file that was never there is
-not part of that check: it is the missing-artifact refusal crapkit already had, and a
-`results_artifact` that never appeared gets its own sentence from the provenance reader.
-Existence used to be the whole test, so a lane failed loud exactly once — on the first run,
-against an empty `.crapkit/` — and scored the previous run's file on every run after that. A
+A lane passes when its command finishes AND writes every file the lane declares that was
+already on disk. crapkit moves those files aside under `.crapkit/aside/` before each
+attempt, so a file at the declared path afterwards is one the attempt wrote, whatever its
+modification time or bytes. When the attempt writes nothing there, the file goes back and
+the lane is refused. A command that reads its previous report finds no file at that path
+while it runs. A file that was never there is not part of that check: it is the
+missing-artifact refusal crapkit already had, and a `results_artifact` that never
+appeared gets its own sentence from the provenance reader.
+Existence used to be the whole test, so a lane failed loud exactly once (on the first run,
+against an empty `.crapkit/`) and scored the previous run's file on every run after that. A
 vitest lane without `reportOnFailure` and a pytest run that dies in collection both land
 there, and what came out was a confident grade off a measurement nothing took, stamped with
 the current commit so `--reuse-unchanged` went on trusting it.
@@ -1433,19 +1841,22 @@ The lane below declares its junit file too, as every lane `init` writes does, so
 names both files the run left:
 
 ```
-crapkit: lane 'py' FAILED: lane 'py' wrote no artifact this run — the .crapkit/cov/py.json and .crapkit/cov/junit-py.xml on disk predate it and are the previous run's (command exit 2); lane log: /repo/.crapkit/lane-py.log; last output: ...
+crapkit: lane 'py' FAILED: lane 'py' wrote no artifact this run - the .crapkit/cov/py.json and .crapkit/cov/junit-py.xml on disk predate it and are the previous run's (command exit 2); lane log: /repo/.crapkit/lane-py.log; last output: ...
 ```
 
 When the artifact is not on disk at all and the leftover is some other declared file, the
 artifact path leads and the leftover follows it: `produced no artifact at
 .crapkit/cov/py.json, and the .crapkit/cov/junit.xml on disk is the previous run's`.
 
-The check is the modification time, not the bytes: a runner that rewrites a byte-identical
-report still bumps it, so an unchanged rerun stays green. `results_artifact` is held to the
-same rule, so a killed suite's junit cannot feed the test-count and no-new-failures checks
-last run's numbers. `--reuse-artifacts` reads the same refusal back: the failed attempt
-stamps the modification time of the file it left, and [reuse refuses that
-file](#the-artifact-a-failed-attempt-left-behind-is-refused) until something rewrites it.
+A runner that rewrites a byte-identical report wrote it, so an unchanged rerun stays
+green. A command that only touches the old report writes nothing: it finds no file there
+to touch, and the lane is refused. Until 0.8.1 the check was the modification time, so
+such a command passed and the previous run's coverage was scored and stamped with the new
+commit. `results_artifact` is held to the same rule, so a killed suite's junit cannot feed
+the test-count and no-new-failures checks last run's numbers. `--reuse-artifacts` reads
+the same refusal back: the failed attempt stamps the sha256 of the file it left, and
+[reuse refuses that file](#the-artifact-a-failed-attempt-left-behind-is-refused) while it
+holds those bytes.
 Until 0.5.0 reuse was untouched by this rule, and a dead lane's old artifact was one
 `--reuse-artifacts` away from being scored.
 
@@ -1454,8 +1865,8 @@ Until 0.5.0 reuse was untouched by this rule, and a dead lane's old artifact was
 Every lane refusal carries `lane log: <path>` before the tail it quotes. The tail is 500
 characters cut on line boundaries. The current log and optional `.1` backup retain the
 newest output within `log_max_bytes` per file. When the end of the log is a
-summary block — pytest closes on `ERROR path` lines that say which files broke and never
-why — the message pulls the last few lines that DO name a cause up in front of it, with an
+summary block (pytest closes on `ERROR path` lines that say which files broke and never
+why), the message pulls the last few lines that DO name a cause up in front of it, with an
 ellipsis marking the output skipped between them:
 
 ```
@@ -1474,6 +1885,53 @@ each half came from. The banner counts only as a whole line, so log output quoti
 words mid-line starts no attempt, and attempt 1 writes no banner at all, which makes a
 bannerless log one attempt.
 
+The refusal quotes the log with its escape codes removed, and the log file keeps them. A
+lane runs with crapkit's environment, so a job that sets `FORCE_COLOR` (any value, `0`
+included) or `PY_COLORS=1` gets a coloured pytest log, and on Python 3.14 `PYTHON_COLORS=1`
+colours pytest's usage error as well. The cause lines are found and pulled up front
+whatever colour pytest wrote, the pytest-cov hint still fires, and the refusal on stderr,
+`lane_failures` under `--json`, the Action's pull-request comment and its base-run reason
+carry no escape byte. A junit report's error text gets the same treatment: pytest writes
+ESC there as the text `#x1B`, and the collection refusal an xdist lane draws drops those
+sequences too. Tail the file, or open it in a CI viewer that renders colour, to see the
+original.
+
+### A Python child writes its log in UTF-8
+
+crapkit reads `.crapkit/lane-<name>.log` as UTF-8 and quotes its tail in the refusal. A
+Python child below 3.15 writes a pipe in the ANSI code page on Windows (cp1252) and in the
+locale's encoding on POSIX, and an inherited `PYTHONIOENCODING` overrides both. So crapkit
+sets `PYTHONIOENCODING=utf-8` for every lane child, its flake retest and every `mutate`
+suite run, unless the lane's `env` sets `PYTHONIOENCODING` itself: then the lane's value
+stands. Before 0.8.1 a refusal quoted `No module named 'caf�'` where the child printed
+`café`, a test that printed an emoji under `pytest -s` raised `UnicodeEncodeError`
+under crapkit alone while the lane still exited 0 and the CRAP load moved, and `mutate`
+refused the same suite as failing on the unmutated tree.
+
+The variable sets stdio only. A test that opens a file with no `encoding` still gets the
+locale's, and a child that is not Python ignores it.
+
+### When the measurement owner stops
+
+A lane run holds its locks through a helper process, the measurement owner, which also
+stops each command's process tree. When that helper stops early the command exits 5 with
+one of three lines, `before confirming ownership`, `during command registration` or
+`before publication`, and each names the file the helper's stderr went to:
+
+```
+crapkit: measurement owner stopped before confirming ownership; its error is at the end of /repo/.crapkit/owner.log
+```
+
+The file is `owner.log` in the `.crapkit/` of the checkout whose locks the owner holds,
+which is where `coverage`, `verify` and `mutate` write. An owner that holds no lock there,
+such as the one behind `test-scoped` or the MCP server, writes `owner.log` beside the
+measurement locks in `~/.cache/crapkit/`. Owners append, and each error starts with a
+dated line and the owner's process id, so the last entry is this run's. `it wrote nothing
+to` in place of `its error is at the end of` means no Python error ended the owner: a
+signal did, such as the one the OOM killer sends. When the file cannot be opened, the
+line ends at the reason. Before 0.8.1 the owner's stderr went nowhere, so one process on a
+Linux host whose name was not UTF-8 stopped every lane run with this line and no cause.
+
 ### A killed run leaves its coverage shards behind
 
 `coverage run --parallel-mode`, which pytest-xdist turns on for you, writes one
@@ -1483,7 +1941,7 @@ above the artifact path the refusal names. So the refusal counts the shards and 
 they are:
 
 ```
-crapkit: lane 'py' FAILED: lane 'py' produced no artifact at .crapkit/cov/coverage.json (command exit 1); lane log: /repo/.crapkit/lane-py.log; last output: ...; 8 coverage shards (.coverage.box.pid5.aaaa, ...) sit in /repo, which is what a killed parallel run leaves behind: `coverage combine && coverage json -o .crapkit/cov/coverage.json` there, then a re-run with --reuse-artifacts, scores what that suite did measure
+crapkit: lane 'py' FAILED: lane 'py' produced no artifact at .crapkit/cov/coverage.json (command exit 1); lane log: /repo/.crapkit/lane-py.log; last output: ...; 8 coverage shards (.coverage.box.pid5.aaaa, ...) sit in /repo, which is what a killed parallel run leaves behind: `coverage combine` followed by `coverage json -o .crapkit/cov/coverage.json` there, then a re-run with --reuse-artifacts, scores what that suite did measure
 ```
 
 The `-o` target is written relative to the shard directory, because that is where the
@@ -1491,12 +1949,23 @@ message tells you to stand: on a lane with a `cwd` it reads `../.crapkit/cov/cov
 rather than the repo-relative `artifact` key, which would have put the JSON one directory
 below the path the next run opens. Only a `coveragepy` lane gets the recipe. `coverage
 combine` is coverage.py's command, so a jest or vitest lane rooted beside a python one is
-never told to run it over the python lane's leftovers.
+never told to run it over the python lane's leftovers. The two commands are named one
+after the other rather than chained with `&&`, which Windows PowerShell 5.1 cannot parse.
 
 crapkit does not run the combine for you. Shards from an interrupted suite merge into a
 report that looks exactly like a whole run, and taking that for a full measurement is what
 the crashed-worker check above refuses. Whether a half-run is worth scoring is your call,
 and `--reuse-artifacts` is where you make it.
+
+Shards left under a directory whose name is not UTF-8, or named for a host whose name is
+not, come from a run that was not killed: coverage.py stores every measured path as UTF-8
+text, so its own combine failed with a `UnicodeEncodeError`, and a `coverage combine` by
+hand fails the same way. The refusal names the directory or the host name, with each byte
+that is not UTF-8 as `\xNN`, instead of the recipe:
+
+```
+crapkit: lane 'py' FAILED: lane 'py' produced no artifact at .crapkit/cov/coverage.json (command exit 1); lane log: /home/ren\xe9/repo/.crapkit/lane-py.log; last output: ...; coverage.py cannot combine the shards it left in /home/ren\xe9/repo: the directory /home/ren\xe9/repo holds bytes that are not UTF-8, and coverage.py stores every path as UTF-8. Rename it to UTF-8 and run the lane again
+```
 
 ---
 
@@ -1517,7 +1986,7 @@ lane:
 
 ```
 $ crapkit coverage
-crapkit: lane 'py' FAILED: lane 'py' measured 3 file(s), none of them under the paths its scopes declare (src), and 3 of them outside this checkout entirely — .crapkit/cov/py.json describes a different tree, so joining it would score every function in those scopes untested; it reports paths like /other/checkout/src/faro/core.py, /other/checkout/src/faro/util.py, /other/checkout/src/faro/widgets.py. Point the lane at this checkout's own environment (a bare `python -m pytest` binds to whichever venv the shell has active — run it through the project's manager, `uv run python -m pytest ...`), or set path_prefix when the runner reports paths relative to a subdirectory
+crapkit: lane 'py' FAILED: lane 'py' measured 3 file(s), none of them under the paths its scopes declare (src), and 3 of them outside this checkout entirely - .crapkit/cov/py.json describes a different tree, so joining it would score every function in those scopes untested; it reports paths like /other/checkout/src/faro/core.py, /other/checkout/src/faro/util.py, /other/checkout/src/faro/widgets.py. Point the lane at this checkout's own environment (a bare `python -m pytest` binds to whichever venv the shell has active - run it through the project's manager, `uv run python -m pytest ...`), or rerun the lane here rather than reusing a report copied from another checkout; path_prefix only prepends, so it cannot rebase these paths
 ```
 
 Coverage joins on path and nothing else, so such an artifact contributes exactly nothing
@@ -1541,22 +2010,25 @@ outside it was written somewhere else.
 
 An absolute path that resolves **under** this root is this checkout, measured by a runner
 that was told to report absolute paths. The join is root-relative, so it matches nothing
-either and the lane fails the same way — but the environment is right, and `path_prefix`
+either and the lane fails the same way, but the environment is right, and `path_prefix`
 only ever prepends, so neither sentence above is the fix. This refusal names the runner's
 own switch instead:
 
 ```
 $ crapkit coverage
-crapkit: lane 'py' FAILED: lane 'py' measured 2 file(s), none of them under the paths its scopes declare (src), and 2 of them written as absolute paths that DO sit under this checkout — .crapkit/cov/py.json measured this tree and spelled it absolutely, and the join is on root-relative paths, so it still matches nothing and every function in those scopes would score untested; it reports paths like /repo/src/faro/core.py, /repo/src/faro/util.py. Make the runner write relative paths: `relative_files = true` under `[tool.coverage.run]` in pyproject.toml, or `[run] relative_files = true` in .coveragerc, then rerun the lane
+crapkit: lane 'py' FAILED: lane 'py' measured 2 file(s), none of them under the paths its scopes declare (src), and 2 of them written as absolute paths that DO sit under this checkout - .crapkit/cov/py.json measured this tree and spelled it absolutely, and the join is on root-relative paths, so it still matches nothing and every function in those scopes would score untested; it reports paths like /repo/src/faro/core.py, /repo/src/faro/util.py. Make the runner write relative paths: `relative_files = true` under `[tool.coverage.run]` in pyproject.toml, or `[run] relative_files = true` in .coveragerc, then rerun the lane
 ```
 
-For an istanbul lane the switch is the reporter's `cwd`/`root` option instead: that reader
-strips this checkout's root off every path literally, so a path arriving absolute was
-written against a root spelled some other way.
+An istanbul lane does not reach this refusal. Its reporter writes every path absolute, and
+its reader rebases each one that resolves under this checkout, whatever spelling it
+arrives in: a lower-case drive letter from a shell that stood in `c:\...`, another letter
+case, a junction or symlink to the checkout, or the `\\?\` prefix. Before 0.8.1 the reader
+stripped the root as literal text, so each of those failed the lane with advice to point
+the reporter at the checkout it had already measured.
 
-crapkit does not rebase these itself. The join contract stays root-relative, and a runner
-spelling every path absolutely is one setting to fix once, not a shape to re-derive on
-every run.
+For a coveragepy lane crapkit does not rebase these itself. The join contract stays
+root-relative, and a runner spelling every path absolutely is one setting to fix once, not
+a shape to re-derive on every run.
 
 Both sides of that comparison are resolved the same way, symlinks followed and the case
 folded where the filesystem folds it, so a checkout reached through a symlink or spelled
@@ -1574,7 +2046,7 @@ Relative paths that reach none of the declared scopes warn instead, and the run
 scores on:
 
 ```
-crapkit: lane 'py' measured 1 file(s), none of them under the paths its scopes declare (src), so every function in those scopes will score untested; it measured tests/test_core.py — either nothing in them is exercised yet, or the runner reports paths this lane needs path_prefix to rebase
+crapkit: lane 'py' measured 1 file(s), none of them under the paths its scopes declare (src), so every function in those scopes will score untested; it measured tests/test_core.py - either nothing in them is exercised yet, or the runner reports paths this lane needs path_prefix to rebase
 ```
 
 That is the greenfield shape as well: a suite importing none of the scoped source yet,
@@ -1588,10 +2060,13 @@ tuning per repo; zero has no reading under which the join was going to work.
 The two tests run on different spellings of the path, which is what keeps
 [`path_prefix`](#running-from-a-subdirectory) out of the other two verdicts. The reach test
 runs after the prefix is applied, so a prefix that already fixes the join is never
-mentioned at all. The escape test runs on the path the runner wrote, with the prefix taken
-back off: gluing `backend/` onto `/other/checkout/a.py` would otherwise make another tree's
-path read as an in-tree one. `path_prefix` is a coveragepy key, and the istanbul reader
-never reads it.
+mentioned at all, and it asks only the keys the runner wrote relative to this checkout.
+The escape test runs on the path the runner wrote, with the prefix taken back off. Gluing
+`backend/` onto `/other/checkout/a.py` gives `backend//other/checkout/a.py`, a path under
+a `backend` scope, and a root scope (`.`) claims any key. Before 0.8.1 the reach test asked
+such keys, so a lane with `path_prefix`, or scoped to the root, scored every function
+untested with exit 0 on another tree's report; it now gets the refusal above.
+`path_prefix` is a coveragepy key, and the istanbul reader never reads it.
 
 The reach test is `universe.owning_scope` over the lane's own scopes, the same predicate
 that assigns files to scopes, so a scope declaring individual files rather than

@@ -13,12 +13,13 @@ Three independent checks, all must hold:
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from typing import NamedTuple
 
 from .keys import key_names, key_of
 from .ratchet import RatchetEntry
-from .score import ScoredRow, parse_scored_tsv, scored_tsv_lines
+from .repopath import file_separators
+from .score import CRAP_PLACES, ScoredRow, over_ceiling, parse_scored_tsv, scored_tsv_lines
 
 
 def diff_uncovered(changed_ranges: dict, missing: dict,
@@ -62,18 +63,49 @@ class PortableBaseline(NamedTuple):
     commit: str
     kind: str
     rows: list[ScoredRow]
+    # Each lane's test results, as the run recorded them; {} for a file written
+    # before the stamp carried them, which forgives no failure.
+    lanes: dict = {}
 
 
-def baseline_tsv_lines(commit: str, kind: str, rows: list[ScoredRow]) -> Iterator[str]:
+# JSON punctuation stays readable on the stamp line; a space, `=`, `%` or any
+# other character a test id can hold is percent-encoded, so the stamp stays one
+# line of space-separated fields an older reader still splits correctly.
+_RESULTS_SAFE = '":,{}[]/'
+
+
+def baseline_tsv_lines(commit: str, kind: str, rows: list[ScoredRow],
+                       results: dict | None = None) -> Iterator[str]:
     """A baseline run as a file the repo can carry: a commit stamp, then the
     run's scored export. The store lives in a gitignored .crapkit/, so a fresh
-    clone has nothing else to name what it is being measured against."""
-    yield f"# commit={commit} run_kind={kind}\n"
+    clone has nothing else to name what it is being measured against.
+
+    `results` is each lane's test results. They ride on the stamp line because
+    a reader older than the field reads the stamp's fields by name and ignores
+    the rest, where a line of its own would read as a malformed row."""
+    yield f"# commit={commit} run_kind={kind}{_results_field(results)}\n"
     yield from scored_tsv_lines(rows)
+
+
+def _results_field(results: dict | None) -> str:
+    from urllib.parse import quote
+    import json
+
+    if not results:
+        return ""
+    text = json.dumps(results, sort_keys=True, separators=(",", ":"))
+    return f" results={quote(text, safe=_RESULTS_SAFE)}"
 
 
 def _stamp_fields(stamp: str) -> dict[str, str]:
     return dict(part.split("=", 1) for part in stamp.removeprefix("# ").split() if "=" in part)
+
+
+def _results_of(fields: dict[str, str]) -> dict:
+    from urllib.parse import unquote
+    import json
+
+    return json.loads(unquote(fields["results"])) if "results" in fields else {}
 
 
 def parse_baseline_tsv(text: str) -> PortableBaseline:
@@ -82,7 +114,8 @@ def parse_baseline_tsv(text: str) -> PortableBaseline:
     if "commit" not in fields or "run_kind" not in fields:
         raise ValueError(
             f"a baseline file starts with `# commit=<sha> run_kind=<kind>`, got {stamp!r}")
-    return PortableBaseline(fields["commit"], fields["run_kind"], parse_scored_tsv(body))
+    return PortableBaseline(fields["commit"], fields["run_kind"], parse_scored_tsv(body),
+                            _results_of(fields))
 
 
 class GateViolation(NamedTuple):
@@ -114,6 +147,14 @@ class UncoveredViolation(NamedTuple):
     dirty: bool = False
 
 
+class UnreadFile(NamedTuple):
+    """A changed file no reader could read. The run scores it as zero
+    functions; the gate judged none of them, so it refuses the file."""
+    path: str
+    reason: str
+    dirty: bool = False
+
+
 class Verdict(NamedTuple):
     ok: bool
     gate_violations: list[GateViolation]
@@ -127,10 +168,11 @@ class Verdict(NamedTuple):
     forgiven_failures: tuple[str, ...] = ()
     retried_passes: tuple[str, ...] = ()
     overridden: tuple[GateViolation, ...] = ()
+    unread_files: tuple[UnreadFile, ...] = ()
 
 
 def _any_finding(verdict: Verdict) -> bool:
-    return bool(verdict.gate_violations or verdict.ratchet_regressions
+    return bool(verdict.gate_violations or verdict.unread_files or verdict.ratchet_regressions
                 or verdict.new_failures or verdict.uncovered_violations)
 
 
@@ -160,27 +202,63 @@ def with_diff_coverage(verdict: Verdict, uncovered: list[tuple[str, int]],
     return settle_verdict(verdict._replace(uncovered_violations=findings))
 
 
+def with_unread(verdict: Verdict, unread: dict[str, str], changed: set[str],
+                dirty_paths: set[str]) -> Verdict:
+    """Fail the gate on every changed file no reader could read: its zero
+    records are not zero functions over the ceiling. An unread file the
+    change never touched holds no changed function, so it is left alone."""
+    found = tuple(UnreadFile(path, why, path in dirty_paths)
+                  for path, why in sorted(unread.items()) if path in changed)
+    return settle_verdict(verdict._replace(unread_files=found)) if found else verdict
+
+
 def _id_forms(path: str) -> tuple[str, str]:
-    """The two shapes a junit classname takes for one file: the repo-relative
-    path (vitest, and pytest's `file` fallback) and pytest's dotted module."""
+    """The two shapes a junit id's file part takes for one file once it is read
+    as a path: the repo-relative path (vitest, and pytest's `file` fallback) and
+    pytest's dotted module. `path` is git's, so `/` is its only separator."""
     stem = path[:-3] if path.endswith(".py") else path
     return path, stem.replace("/", ".")
 
 
-def dirty_failure_ids(new_failures: list[str], dirty_paths: set[str]) -> list[str]:
-    """New failures whose test id names a file with uncommitted edits."""
+def file_part(test_id: str) -> str:
+    """The file part of a junit id, as the runner wrote it."""
+    return test_id.split("::")[0]
+
+
+def _id_file(test_id: str, test_files: Mapping[str, str] | None) -> str:
+    """The file part of a junit id, spelled the way git spells the file.
+
+    A runner names the test file however it was started: bun on Windows writes
+    `src\\deep\\keep.test.ts`, a runner handed `./web/...` keeps the dot, and
+    jest-junit's `{filepath}` is absolute. Compared as text with git's path,
+    each one read a failure in the file under edit as committed. `test_files`
+    holds the file part as the disk placed it (repopath.Reported); a part it
+    lacks is read as text."""
+    part = file_part(test_id)
+    placed = test_files.get(part) if test_files else None
+    return placed or file_separators(part).removeprefix("./")
+
+
+def dirty_failure_ids(new_failures: list[str], dirty_paths: set[str],
+                      test_files: Mapping[str, str] | None = None) -> list[str]:
+    """New failures whose test id names a file with uncommitted edits.
+    `test_files` maps an id's file part to git's path for it, so an absolute
+    part or one in another letter case can match; the ids stay as written."""
     forms = {form for path in dirty_paths for form in _id_forms(path)}
-    return [f for f in new_failures if f.split("::")[0] in forms]
+    return [f for f in new_failures if _id_file(f, test_files) in forms]
+
+
+# The finding kinds that carry their own `dirty` flag; new_failures carries ids.
+_FLAGGED_FINDINGS = ("gate_violations", "unread_files", "ratchet_regressions",
+                     "uncovered_violations")
 
 
 def dirty_counts(verdict: Verdict) -> tuple[int, int]:
     """(committed, dirty) over every finding kind, so one line says how much of
     a verdict belongs to the tree as committed and how much to somebody's edits."""
     dirty_ids = set(verdict.dirty_failures)
-    flags = ([v.dirty for v in verdict.gate_violations]
-             + [r.dirty for r in verdict.ratchet_regressions]
-             + [f in dirty_ids for f in verdict.new_failures]
-             + [v.dirty for v in verdict.uncovered_violations])
+    flags = ([f.dirty for kind in _FLAGGED_FINDINGS for f in getattr(verdict, kind)]
+             + [f in dirty_ids for f in verdict.new_failures])
     dirty = sum(flags)
     return len(flags) - dirty, dirty
 
@@ -248,11 +326,19 @@ def _gate_violations(fresh, changed_ranges, target, scope_targets, dirty,
         GateViolation(r.path, r.long_name, r.start, r.ccn, r.cov, r.crap, r.remedy,
                       r.path in dirty, key_of(names, r)[1])
         for r in fresh
-        if r.crap > _ceiling(r, target, scope_targets) and _touched(r, changed_ranges)
+        if over_ceiling(r.crap, _ceiling(r, target, scope_targets)) and _touched(r, changed_ranges)
         and not _within_mark(r, key_of(names, r), marks)
     ]
-    gate.sort(key=lambda v: (-v.crap, v.path, v.start))
+    gate.sort(key=_worst_first)
     return gate
+
+
+def _worst_first(row: ScoredRow | GateViolation) -> tuple:
+    """Highest CRAP first, compared at the 4 places a mark holds, then path and
+    start line. ccn 25 at 80% coverage and ccn 5 at none both score 30, which
+    the floats read as 29.999999999999996 and 30.0: compared unrounded, the
+    second listed first whatever the paths said."""
+    return -round(row.crap, CRAP_PLACES), row.path, row.start
 
 
 def _ratchet_regressions(fresh, ratchet, dirty) -> list[RatchetRegression]:
@@ -266,8 +352,16 @@ def _ratchet_regressions(fresh, ratchet, dirty) -> list[RatchetRegression]:
         if row is not None and round(row.crap, 4) > entry.crap:
             regressions.append(RatchetRegression(entry.path, entry.long_name, entry.crap,
                                                  round(row.crap, 4), entry.path in dirty))
-    regressions.sort(key=lambda r: (-(r.fresh_crap - r.recorded), r.path))
+    regressions.sort(key=_largest_rise_first)
     return regressions
+
+
+def _largest_rise_first(r: RatchetRegression) -> tuple:
+    """The rise is rounded to the 4 places both scores hold, so equal rises tie
+    and list by path. In binary floating point 10.3 - 10.1 is 0.20000000000000107
+    and 20.3 - 20.1 is 0.1999999999999993: two marks that rose by 0.2 listed by
+    that noise, and the refusal line names whichever came first."""
+    return -round(r.fresh_crap - r.recorded, CRAP_PLACES), r.path
 
 
 def unmarked_over_ceiling(fresh: list[ScoredRow], ratchet: list[RatchetEntry], target: int,
@@ -282,8 +376,8 @@ def unmarked_over_ceiling(fresh: list[ScoredRow], ratchet: list[RatchetEntry], t
     """
     marks = _marks_of(ratchet)
     rows = [row for key, row in rows_by_key(fresh).items()
-            if row.crap > _ceiling(row, target, scope_targets) and key not in marks]
-    rows.sort(key=lambda r: (-r.crap, r.path, r.start))
+            if over_ceiling(row.crap, _ceiling(row, target, scope_targets)) and key not in marks]
+    rows.sort(key=_worst_first)
     return rows
 
 
@@ -297,6 +391,7 @@ def evaluate(
     target: int,
     scope_targets: dict[str, int] | None = None,
     dirty_paths: set[str] | None = None,
+    test_files: Mapping[str, str] | None = None,
 ) -> Verdict:
     dirty = dirty_paths or set()
     gate = _gate_violations(fresh, changed_ranges, target, scope_targets, dirty, ratchet)
@@ -308,6 +403,6 @@ def evaluate(
         gate_violations=gate,
         ratchet_regressions=regressions,
         new_failures=new_failures,
-        dirty_failures=dirty_failure_ids(new_failures, dirty),
+        dirty_failures=dirty_failure_ids(new_failures, dirty, test_files),
         forgiven_failures=tuple(sorted(fresh_failures & baseline_failures)),
     )

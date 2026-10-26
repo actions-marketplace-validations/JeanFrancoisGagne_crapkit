@@ -1,6 +1,5 @@
 """Owned commands stop writers before cancellation returns."""
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 import subprocess
 import os
 import sys
@@ -11,6 +10,7 @@ from crapkit import procs
 from crapkit.errors import ToolError
 from crapkit.locks import exclusive_lock
 from hang_guard import CHILD_HOLD, HANG_SECONDS, wait_for
+from legacy_locale import latin1_env
 
 
 def test_cancel_stops_live_commands_and_retains_the_lease(tmp_path):
@@ -60,9 +60,16 @@ def test_owned_command_keeps_shell_operators_and_an_explicit_deadline(tmp_path):
 
 
 def test_owned_argv_preserves_real_launch_errors(tmp_path):
+    """The POSIX launcher execs the command itself, and os.execv's error names
+    no file, where subprocess names the command it could not start."""
     missing = str(tmp_path / 'missing-command')
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(FileNotFoundError) as native:
+        subprocess.run([missing])
+    with pytest.raises(FileNotFoundError) as owned:
         procs.run_owned([missing], capture_output=True)
+    fields = ('errno', 'strerror', 'filename', 'filename2', 'winerror')
+    assert [getattr(owned.value, name, None) for name in fields] == [
+        getattr(native.value, name, None) for name in fields]
 
 
 @pytest.mark.skipif(not hasattr(os, 'fork'), reason='fork inheritance is POSIX-only')
@@ -121,3 +128,52 @@ def test_outer_cancellation_waits_for_a_nested_owners_writer(tmp_path):
                     pass
     finally:
         (tmp_path / 'release').touch()
+
+
+# crapkit's own helpers, the POSIX start gate and the measurement owner, are
+# Python processes that take the command and the lease paths as text and hand
+# them to the OS themselves. Started under a Latin-1 locale while crapkit runs
+# in UTF-8 mode (the restart cli.main makes), each spelled `café` as b"caf\xe9":
+# the command got an argument naming no file, which is how the MCP server's
+# brief on pkg/café.py answered "no function", and the owner locked a file
+# beside the one crapkit meant, so the lease guarded nothing.
+HELPER = '''import os, sys
+from pathlib import Path
+from crapkit import procs
+from crapkit.errors import ToolError
+from crapkit.locks import exclusive_lock
+
+where = Path(sys.argv[1])
+lease = where / "caf\u00e9" / "lease"
+probe = "import os, sys; sys.stdout.write(os.fsencode(sys.argv[1]).hex())"
+with procs.own_processes([lease]) as owner:
+    passed = procs.run_owned([sys.executable, "-c", probe, "caf\u00e9"], owner=owner,
+                             capture_output=True).stdout
+    try:
+        with exclusive_lock(lease, label="lease"):
+            held = False
+    except ToolError:
+        held = True
+print(passed, os.fsencode("caf\u00e9").hex(), held, sorted(os.listdir(os.fsencode(where))))
+'''
+MODES = {"parent-utf8-mode": ["-X", "utf8"], "parent-locale-mode": ["-X", "utf8=0"]}
+
+
+@pytest.mark.parametrize("locale", ["latin1", "c-utf8"])
+@pytest.mark.parametrize("mode", list(MODES))
+def test_a_helper_hands_the_os_the_bytes_its_parent_would(tmp_path, locale, mode):
+    env = dict(os.environ, PYTHONUTF8="0", LC_ALL="C.UTF-8", LANG="C.UTF-8")
+    if locale == "latin1":
+        env.update(latin1_env(tmp_path / "locales"))
+    where = tmp_path / "where"
+    where.mkdir()
+
+    result = subprocess.run([sys.executable, *MODES[mode], "-c", HELPER, str(where)], env=env,
+                            capture_output=True, text=True, encoding="ascii", errors="replace",
+                            timeout=HANG_SECONDS)
+
+    assert result.returncode == 0, result.stderr
+    passed, meant, held, names = result.stdout.strip().split(" ", 3)
+    assert passed == meant, result.stdout
+    assert held == "True", result.stdout
+    assert names == repr([bytes.fromhex(meant)]), result.stdout

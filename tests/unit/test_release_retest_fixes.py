@@ -49,7 +49,9 @@ def test_a_repo_with_no_coverable_language_gets_no_lane_template_at_all():
     assert _template_lines(set(), {"cmd": ("go",)}) == []
 
 
-def test_missing_pytest_cov_failure_names_the_package(tmp_path):
+def test_missing_pytest_cov_failure_names_the_package(tmp_path, monkeypatch):
+    from crapkit import launchers
+    monkeypatch.setattr(launchers, "_uv_made", lambda python: False)  # `python` is PATH's
     with pytest.raises(ToolError) as err:
         _raise_no_artifact(tmp_path, _lane(), _FakeLog("ERROR: usage: python -m pytest\n"
                                              "python -m pytest: error: unrecognized "
@@ -58,7 +60,8 @@ def test_missing_pytest_cov_failure_names_the_package(tmp_path):
 
 
 class _FakeLog:
-    """Stands in for the lane log path: read_text is all _log_tail needs."""
+    """Stands in for the lane log path: read_bytes is all _log_tail needs, since
+    the log's bytes go through repotext.lenient."""
 
     def __init__(self, text: str):
         self._text = text
@@ -66,17 +69,20 @@ class _FakeLog:
     def is_file(self) -> bool:
         return True
 
-    def read_text(self, encoding: str = "utf-8", errors: str = "replace") -> str:
-        return self._text
+    def read_bytes(self) -> bytes:
+        return self._text.encode("utf-8")
 
 
 def test_stale_artifact_note_names_uncommitted_edits_and_the_remedy():
-    from crapkit import uncovered
+    """The cause is lanes' sentence, which the reuse warning prints too; the
+    remedy is the note's own, and a rerun is the one move that clears it."""
+    from crapkit import lane_freshness, uncovered
     import inspect
 
-    src = inspect.getsource(uncovered._artifact_state)
-    assert "uncommitted" in src, "the note must name the real cause"
-    assert "commit" in src
+    assert "uncommitted" in inspect.getsource(lane_freshness._scope_drift), \
+        "the note must name the real cause"
+    assert "rerun" in inspect.getsource(uncovered._artifact_state)
+    assert "rerun" in inspect.getsource(lane_freshness.Freshness._file_note)
 
 
 def test_test_files_route_to_the_only_templated_scope():

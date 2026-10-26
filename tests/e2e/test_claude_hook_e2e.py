@@ -1,16 +1,18 @@
-"""Protocol 1: a recorded Claude Code hook payload on stdin, an exit code and a
-line of stderr out.
+"""Protocol 1: a recorded PostToolUse payload on stdin, an exit code and the
+advisory out, on stderr or as one line of JSON on stdout.
 
 Each golden under tests/goldens/claude_hook/ carries a payload shaped the way a
-live PostToolUse event arrives, the fixture repo it was recorded against, and
-the verdict it must draw. The test builds the repo, spawns the real subcommand,
-and diffs. Nothing here reaches into the module: an adapter for another harness
-maps its own payload onto the same JSON and these files still decide.
+live PostToolUse event arrives from one harness (Claude Code unless the case
+names Copilot CLI, Cursor or VS Code), the fixture repo it was recorded
+against, and the verdict it must draw. The test builds the repo, spawns the
+real subcommand, and diffs. Nothing here reaches into the module.
 
 Two rules hold across every case, so they are asserted on every case:
 
-- stdout is always empty. Protocol 1 reserves it for a future JSON channel, and
-  Claude Code parses stdout JSON on exit 0.
+- stdout is empty unless the golden records the JSON a harness reads there.
+  Claude Code parses stdout JSON on exit 0, so its cases and Copilot CLI's
+  print nothing there; Cursor and VS Code read exit 2 as a deny or a block, so
+  theirs carry the advisory as one JSON object on exit 0.
 - the process runs from a directory that is not the repo. The root comes from
   the edited file's own path, never from cwd and never from
   ${CLAUDE_PROJECT_DIR}, which stays at the session root while an edit follows a
@@ -167,6 +169,14 @@ def fx_stale_breach(repo: Path) -> None:
     os.utime(repo / "calc" / "grade.py", (stale, stale))
 
 
+def fx_unborn_staged_breach(repo: Path) -> None:
+    """A new project after `git init` and `git add`: no commit yet."""
+    init(repo)
+    write(repo, "crapkit.toml", TOML)
+    write(repo, "calc/grade.py", BREACH)
+    git(repo, "add", "-A")
+
+
 FIXTURES = {
     "measured_breach": fx_measured_breach,
     "broken_syntax": fx_broken_syntax,
@@ -179,6 +189,7 @@ FIXTURES = {
     "marked_breach": fx_marked_breach,
     "measured_clean": fx_measured_clean,
     "stale_breach": fx_stale_breach,
+    "unborn_staged_breach": fx_unborn_staged_breach,
 }
 
 
@@ -198,9 +209,15 @@ def _resolved(value, repo: str):
     backslashes never have to survive an escape round trip."""
     if isinstance(value, str):
         return value.replace("{REPO}", repo)
+    return _resolved_items(value, repo) if isinstance(value, (dict, list)) else value
+
+
+def _resolved_items(value, repo: str):
+    """A payload object or list with `{REPO}` resolved in every value under it:
+    Cursor's `workspace_roots` is a list of paths."""
     if isinstance(value, dict):
         return {key: _resolved(item, repo) for key, item in value.items()}
-    return value
+    return [_resolved(item, repo) for item in value]
 
 
 def _stdin_text(golden: dict, repo: str) -> str:
@@ -239,12 +256,17 @@ def test_the_recorded_payload_draws_the_recorded_verdict(golden: dict, tmp_path)
 
 
 @pytest.mark.parametrize("golden", CASES, ids=IDS)
-def test_stdout_stays_empty_whatever_the_verdict(golden: dict, tmp_path):
-    """Protocol 1 reserves stdout for a future JSON channel, and Claude Code
-    parses stdout JSON on exit 0. A stray print there is a protocol break."""
+def test_stdout_carries_only_the_json_the_harness_reads(golden: dict, tmp_path):
+    """Claude Code parses stdout JSON on exit 0, so a stray print there is a
+    protocol break. The one thing stdout may carry is the single JSON object a
+    Cursor or VS Code golden records."""
     done = run_hook(golden, _built(golden, tmp_path), tmp_path)
 
-    assert done.stdout == ""
+    expected = golden["expect"].get("stdout")
+    if expected is None:
+        assert done.stdout == ""
+    else:
+        assert done.stdout.count("\n") == 1 and json.loads(done.stdout) == expected
 
 
 # --- import hygiene, and the store that is never opened ----------------------
@@ -321,6 +343,25 @@ def test_a_breach_run_leaves_the_repo_byte_identical(tmp_path):
     done = run_hook(golden, repo, tmp_path)
 
     assert done.returncode == 2, "the run has to have done its work"
+    assert _tree(repo) == before
+
+
+def test_a_touch_after_a_bash_advisory_repeats_nothing_in_the_next_process(tmp_path):
+    """The session memory outlives the process that wrote it, and lives under
+    the git directory: a second Bash event in the same session, after a touch
+    that moved no byte, is silent, and the working tree stays byte-identical."""
+    golden = _case("bash_written_breach")
+    repo = _built(golden, tmp_path)
+    before = _tree(repo)
+    first = run_hook(golden, repo, tmp_path)
+    grade = repo / "calc" / "grade.py"
+    stale = time.time() - 60
+    os.utime(grade, (stale, stale))
+    os.utime(grade, None)
+
+    again = run_hook(golden, repo, tmp_path)
+
+    assert (first.returncode, again.returncode, again.stderr) == (2, 0, "")
     assert _tree(repo) == before
 
 

@@ -17,17 +17,20 @@ rather than editing any row: see prune_keep_set for what it may never take.
 """
 from __future__ import annotations
 
+from itertools import groupby
 import json
+from operator import itemgetter
 import sqlite3
 import sys
 import zlib
 from pathlib import Path
 from typing import NamedTuple
 
-from .keys import (claim_holds, claim_key, expression_group, expression_reader_current,
-                   key_names, position,
+from .keys import (claim_holds, claim_in_run, claim_key, expression_group,
+                   expression_reader_current, key_names, position,
                    refuse_ambiguous, split_ordinal)
 from .dup import SHINGLE_FORMAT
+from .score import AT_CEILING, crap_load
 from .snapshot import InventoryRow
 from .worklist import Marks
 from .errors import CrapkitError, ToolError
@@ -71,7 +74,7 @@ _CODE_DDL = """CREATE TABLE IF NOT EXISTS {table} (
 # stores that met the same names in a different order hold different integers,
 # and a store is a file people copy between machines. A name from outside this
 # list is still stored, at a code minted after these.
-_CODE_SEEDS = {"flags": ("measured", "untested", "no-lane", "cc-only"),
+_CODE_SEEDS = {"flags": ("measured", "untested", "no-lane", "cc-only", "excluded"),
                "remedies": ("ok", "add-tests", "decompose", "split-lines")}
 
 # One run's shingle index, for brief's twins and for duplication: the marker
@@ -145,29 +148,43 @@ CREATE TABLE IF NOT EXISTS run_collisions (
     legacy INTEGER NOT NULL,
     PRIMARY KEY (run_id, identity_id)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS run_sources (
+    run_id INTEGER PRIMARY KEY REFERENCES runs(id),
+    blobs BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS lane_refusals (
+    artifact TEXT PRIMARY KEY,
+    sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+) WITHOUT ROWID;
 {_TWIN_DDL}
 """
 
-# Indexes run after the migration, never with it: on a store still in the old
-# shape none of these columns exists yet.
+# Indexes run after the migration, never before it: on a store still in the
+# old shape none of these columns exists yet.
 #
 # Two per-row indexes on functions, not three. A run-keyed seek and an
 # identity-keyed seek are the only two shapes any read asks for; a third index
 # keyed (run_id, identity_id) answered neither of them better and cost 10.8 MB
 # and a fifth of the insert time on the flagship consumer's store.
-_INDEXES = """
-CREATE INDEX IF NOT EXISTS idx_functions_run ON functions(run_id);
-CREATE INDEX IF NOT EXISTS idx_functions_identity ON functions(identity_id, run_id);
-CREATE INDEX IF NOT EXISTS idx_attempts_open ON attempts(closed_at);
-CREATE INDEX IF NOT EXISTS idx_attempts_identity ON attempts(path, key_name);
-"""
+#
+# Statements, not a script: they run inside the setup's transaction, and
+# executescript would commit it first.
+_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_functions_run ON functions(run_id)",
+    "CREATE INDEX IF NOT EXISTS idx_functions_identity ON functions(identity_id, run_id)",
+    "CREATE INDEX IF NOT EXISTS idx_attempts_open ON attempts(closed_at)",
+    "CREATE INDEX IF NOT EXISTS idx_attempts_identity ON attempts(path, key_name)",
+)
 
 # Indexes an earlier shape carried that nothing reads now. idx_identities_path
 # is what the reordered UNIQUE replaced; both are dropped on open.
 _DEAD_INDEXES = ("idx_functions_run_path", "idx_identities_path")
 
 _CURRENT_OBJECTS = frozenset(("runs", "identities", "flags", "remedies", "functions",
-                              "overrides", "attempts", "run_rollup", "run_collisions", "idx_functions_run",
+                              "overrides", "attempts", "run_rollup", "run_collisions", "lane_refusals",
+                              "run_sources",
+                              "idx_functions_run",
                               "idx_functions_identity", "idx_attempts_open", "idx_attempts_identity",
                               *_TWIN_TABLES))
 _ADDED_COLUMNS = {"functions": {"cov", "flag", "crap", "remedy", "cognitive", "identity_id", "occurrence",
@@ -287,6 +304,15 @@ class CrapRow(NamedTuple):
     occurrence: int = 0
 
 
+class FunctionPlace(NamedTuple):
+    """Where one function sat in a run and how the run scored it: its span, its
+    scope, and its flag (None for a run with no verdicts, such as inventory)."""
+    start: int
+    end: int
+    scope: str
+    flag: str | None
+
+
 class _Codes(NamedTuple):
     """One lookup table, both ways: names on the way in, back out on the way out."""
     ids: dict
@@ -307,6 +333,11 @@ def _code(ids: dict, name):
 def _name(names: dict, code):
     """The verdict string a stored code stands for."""
     return None if code is None else names[code]
+
+
+def _no_names(_path: str) -> frozenset:
+    """No run to spell claims against: each claim pairs by the name it saved."""
+    return frozenset()
 
 
 def _deflate(text: str) -> bytes:
@@ -386,21 +417,35 @@ def _ceiling_key(target: int, scope_targets: dict[str, int] | None) -> str:
 
     _own_ceilings, not the raw dict. A scope whose target IS the repo target
     changes no answer, and keying on it would split the cache and pay for a
-    second full scan of history for nothing. Nothing else belongs in the key:
-    a run's rows never change after it is written, so within one ceiling a
-    stored number cannot go stale.
+    second full scan of history for nothing. A run's rows never change after it
+    is written, so within one ceiling a stored number goes stale only when the
+    rule that decided it changes, and _ROLLUP_RULES names that rule.
     """
-    return json.dumps([target, _own_ceilings(target, scope_targets)],
+    return json.dumps([_ROLLUP_RULES, target, _own_ceilings(target, scope_targets)],
                       separators=(",", ":"), sort_keys=True)
 
 
-# The rollup, cut per (run, scope): run_scope_totals answers it as-is and
-# run_totals adds each run's scopes up, so one scan feeds both. `scope = ''` is
-# the marker a filled run leaves whether or not it scored anything, and every
-# read excludes it.
+# 2: a CRAP that is exactly its ceiling is not over it (score.over_ceiling).
+# Keys without the number were decided by the plain `crap > ceiling`, which
+# counted CRAP(18, 2/3) = 30.000000000000004 over a target of 30.
+# 3: every load is score.crap_load of the stored scores, and the whole run's
+# totals are the `scope = ''` row's. Rule 2 wrote SQL SUMs and a zero there.
+_ROLLUP_RULES = 3
+
+
+# The rollup, one row per (run, scope) plus the `scope = ''` row, which holds
+# the whole run: run_scope_totals answers the first and run_totals the second,
+# so one scan feeds both. The whole run is summed from its scores, never from
+# the scopes' rounded loads, which add up to a different double. A run that
+# scored nothing leaves only that row, at zero functions, so it reads as filled
+# and every read leaves it out.
 _ROLLUP_COLS = "run_id, ceiling_key, scope, functions, over_target, crap_load"
 _ROLLUP_READ = ("SELECT run_id, scope, functions, over_target, crap_load FROM run_rollup "
-                "WHERE ceiling_key = ? AND scope <> '' ORDER BY run_id, scope")
+                "WHERE ceiling_key = ? AND functions > 0 ORDER BY run_id, scope")
+# The fill streams the scores out in run order and adds them up in Python:
+# SQLite's SUM() adds in scan order before 3.43, so it cannot give crap_load.
+_ROLLUP_SCAN = ("SELECT f.run_id, i.scope, f.crap, f.crap > ({ceiling}) * ? " + _JOINED
+                + " WHERE f.crap IS NOT NULL AND f.run_id IN ({holes}) ORDER BY f.run_id")
 
 
 # Same-line collision groups, one row per (run, identity), cached like the
@@ -436,11 +481,26 @@ def _one_run(run_id: int | None, column: str) -> tuple[str, tuple]:
     return ("", ()) if run_id is None else (f" AND {column} = ?", (run_id,))
 
 
-def _summed(by_scope: dict[str, tuple]) -> tuple:
-    """One run's scopes added back up into the whole-run triple."""
-    parts = list(by_scope.values())
-    return (sum(n for n, _o, _l in parts), sum(o for _n, o, _l in parts),
-            sum(load for *_x, load in parts))
+def _whole_and_scopes(by_scope: dict[str, tuple]) -> tuple[tuple, dict[str, tuple]]:
+    """One run's rollup split into the whole-run triple, which the '' row
+    holds, and the per-scope triples."""
+    scopes = dict(by_scope)
+    return scopes.pop("", (0, 0, 0.0)), scopes
+
+
+def _run_rollup(scores) -> dict[str, tuple]:
+    """One run's (functions, over_target, crap_load) per scope and, under '',
+    for the whole run, from its (run_id, scope, crap, over) rows. Scopes come
+    back sorted, the order the cached read hands them back in."""
+    craps: dict[str, list[float]] = {"": []}
+    overs: dict[str, int] = {"": 0}
+    for _run_id, scope, crap, over in scores:
+        craps.setdefault(scope, []).append(crap)
+        craps[""].append(crap)
+        overs[scope] = overs.get(scope, 0) + over
+        overs[""] += over
+    return {scope: (len(values), overs[scope], crap_load(values))
+            for scope, values in sorted(craps.items())}
 
 
 def _by_run(rows) -> dict[int, dict[str, tuple]]:
@@ -625,14 +685,33 @@ class SnapshotStore:
             "SELECT 1 FROM runs WHERE typeof(lanes) = 'text' LIMIT 1").fetchone() is not None
 
     def _prepare(self) -> None:
-        """Create or upgrade a store only when its measured shape requires it."""
-        self._conn.executescript(_SCHEMA)
-        self._seed_codes()
-        self._migrate()
-        # after the migration, never with it: on a store still in the old shape
-        # these index columns do not exist yet
-        self._conn.executescript(_INDEXES)
-        self._conn.commit()
+        """Create or upgrade a store only when its measured shape requires it.
+
+        All of it is one transaction, so it commits once, and an interrupt
+        anywhere leaves the store as the previous code wrote it. Outside a
+        transaction every CREATE commits on its own, and every commit waits on
+        the disk: four syncs on Linux (the journal twice, the database, its
+        directory). A new store cost 19 commits. On a windows-latest CI runner
+        whose disk the other test workers were flooding, three `crapkit
+        coverage` calls on new repos were stopped in here at the suite's 120 s
+        hang bound, and in a Linux container with every sync held 1.5 s, every
+        call was.
+
+        The script opens the transaction itself, because executescript commits
+        any open one before it starts, and IMMEDIATE takes the write lock before
+        the first read. Every CREATE here is IF NOT EXISTS, so a deferred BEGIN
+        on an existing store reads first, and SQLite fails a reader that then
+        asks to write with "database is locked" at once. A write lock asked for
+        first waits out another crapkit's write under the busy timeout.
+        """
+        with self._conn:
+            self._conn.executescript(f"BEGIN IMMEDIATE;{_SCHEMA}")
+            self._seed_codes()
+            self._migrate()
+            # after the migration, never before it: on a store still in the old
+            # shape these index columns do not exist yet
+            for statement in _INDEXES:
+                self._conn.execute(statement)
 
     def _seed_codes(self) -> None:
         """The known verdict names, at their fixed codes. Before any migration:
@@ -654,7 +733,6 @@ class SnapshotStore:
         self._add_inline_body_column()
         self._add_run_provenance_columns()
         self._add_claim_handle_column()
-        self._conn.commit()
         self._normalize_identities()
         self._restack()
 
@@ -729,20 +807,15 @@ class SnapshotStore:
         """Move scope, path and long_name out of every functions row.
 
         The old shape is the one that still has a scope column. The rewrite runs
-        as one transaction and swaps the table in last, so an interrupt leaves
-        the old table whole, rows and all, and the next open retries from there.
-        Old databases migrate silently; `runs prune` reclaims the freed pages.
+        inside _prepare's transaction and swaps the table in last, so an
+        interrupt leaves the old table whole, rows and all, and the next open
+        retries from there. Old databases migrate silently; `runs prune`
+        reclaims the freed pages.
         """
         if "scope" not in self._existing_columns("functions"):
             return
-        self._conn.execute("BEGIN")  # DDL does not open one, and this must be atomic
-        try:
-            for statement in _IDENTITY_MIGRATION:
-                self._conn.execute(statement)
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
+        for statement in _IDENTITY_MIGRATION:
+            self._conn.execute(statement)
 
     def _identity_key(self) -> tuple:
         """The columns of the identity UNIQUE, in key order."""
@@ -777,19 +850,14 @@ class SnapshotStore:
         """Re-key the identities, code the verdicts, deflate the lane records.
 
         Together these took the flagship consumer's store from 131.4 to 92.3 MB
-        with every timed read faster. One transaction, tables built under temp
-        names and swapped in last, so a process killed anywhere in here leaves a
-        database the previous code still reads and the next open retries.
+        with every timed read faster. They run inside _prepare's transaction,
+        tables built under temp names and swapped in last, so a process killed
+        anywhere in here leaves a database the previous code still reads and the
+        next open retries.
         """
-        self._conn.execute("BEGIN")  # DDL does not open one, and this must be atomic
-        try:
-            for statement in self._restack_steps():
-                self._conn.execute(statement)
-            self._deflate_lanes()
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
+        for statement in self._restack_steps():
+            self._conn.execute(statement)
+        self._deflate_lanes()
 
     def _cache_identities(self) -> None:
         """Every identity in the store, keyed by triple.
@@ -838,7 +906,12 @@ class SnapshotStore:
         return self._codes[table].ids
 
     def write_run(self, *, commit: str, tool_versions: dict[str, str], rows: list,
-                  lanes: dict | None = None, kind: str = "coverage") -> int:
+                  lanes: dict | None = None, kind: str = "coverage",
+                  sources: dict[str, str] | None = None) -> int:
+        """One run and its rows in one transaction. `sources` is the run's
+        content record, the git blob id of every scored file as the run read
+        it; None records none, which `run_sources` answers for every run a
+        crapkit older than 0.8.1 wrote."""
         flag_names, remedy_names = _verdict_names(rows)
         with self._conn:
             cur = self._conn.execute(
@@ -847,6 +920,7 @@ class SnapshotStore:
                  _deflate(json.dumps(lanes or {}, sort_keys=True)), kind),
             )
             run_id = cur.lastrowid
+            self._write_sources(run_id, sources)
             ids = self._identity_ids(rows)
             flags = self._code_ids("flags", flag_names)
             remedies = self._code_ids("remedies", remedy_names)
@@ -859,6 +933,18 @@ class SnapshotStore:
                 ((run_id, ids[row[:3]], *_writable(row, flags, remedies)) for row in rows),
             )
         return run_id
+
+    def _write_sources(self, run_id: int, sources: dict[str, str] | None) -> None:
+        if sources is not None:
+            self._conn.execute("INSERT INTO run_sources (run_id, blobs) VALUES (?, ?)",
+                               (run_id, _deflate(json.dumps(sources, sort_keys=True))))
+
+    def run_sources(self, run_id: int) -> dict[str, str] | None:
+        """path -> the git blob id each scored file held when the run read it,
+        or None when the run recorded none."""
+        row = self._conn.execute("SELECT blobs FROM run_sources WHERE run_id = ?",
+                                 (run_id,)).fetchone()
+        return None if row is None else json.loads(_inflate(row[0]))
 
     def read_rows(self, run_id: int, *, min_ccn: int = 0,
                   scopes: list[str] | None = None) -> list[InventoryRow]:
@@ -1124,28 +1210,28 @@ class SnapshotStore:
         numbers back rather than re-reading them is what lets the write fail
         without failing the command.
         """
-        scored, pending = self._rollup_values(key, run_ids, target, scope_targets)
+        filled, pending = self._rollup_values(key, run_ids, target, scope_targets)
         self._store_rollup(pending)
-        return _by_run(scored)
+        return filled
 
     def _rollup_values(self, key: str, run_ids: list[int], target: int,
-                       scope_targets: dict[str, int] | None) -> tuple[list, list]:
-        """Compute missing values without publishing during a read snapshot."""
+                       scope_targets: dict[str, int] | None) -> tuple[dict, list]:
+        """Compute missing values without publishing during a read snapshot.
+
+        One run's scores at a time are held, never the whole history's. Every
+        run gets its '' row, zero for a run that scored nothing, so it reads
+        as filled.
+        """
         if not run_ids:
-            return [], []
+            return {}, []
         ceiling = _ceiling_expr(target, scope_targets)
-        holes = ",".join("?" * len(run_ids))
         cur = self._conn.execute(
-            f"SELECT f.run_id, i.scope, COUNT(*), SUM(f.crap > {ceiling.expr}), "
-            f"SUM(f.crap) {_JOINED} WHERE f.crap IS NOT NULL AND f.run_id IN ({holes}) "
-            "GROUP BY f.run_id, i.scope ORDER BY f.run_id, i.scope",
-            (*ceiling.params, *run_ids))
-        scored = cur.fetchall()
-        # the marker first, so a run that scored nothing still reads as filled
-        pending = ([(rid, key, "", 0, 0, 0.0) for rid in run_ids]
-                   + [(rid, key, scope, n, over, load)
-                      for rid, scope, n, over, load in scored])
-        return scored, pending
+            _ROLLUP_SCAN.format(ceiling=ceiling.expr, holes=",".join("?" * len(run_ids))),
+            (*ceiling.params, AT_CEILING, *run_ids))
+        filled = {rid: _run_rollup(scores) for rid, scores in groupby(cur, itemgetter(0))}
+        pending = [(rid, key, scope, *agg) for rid in run_ids
+                   for scope, agg in filled.get(rid, {"": (0, 0, 0.0)}).items()]
+        return filled, pending
 
     def _store_rollup(self, rows: list[tuple]) -> None:
         """Best effort. trend and report WRITE now, and two crapkit processes
@@ -1178,20 +1264,20 @@ class SnapshotStore:
 
     def run_totals(self, *, target: int,
                    scope_targets: dict[str, int] | None = None) -> dict[int, tuple]:
-        """Per-run (functions, over_target, crap_load), added up from the rollup.
+        """Per-run (functions, over_target, crap_load), off the rollup's '' rows.
 
-        Summing the per-scope rows is what keeps the whole history one scan
-        instead of two: the per-scope cut is the finer one, and the whole-run
-        numbers fall out of it.
+        The fill that writes the per-scope rows writes these beside them, so
+        the whole history stays one scan instead of two.
         """
-        return {run_id: _summed(by_scope)
+        return {run_id: _whole_and_scopes(by_scope)[0]
                 for run_id, by_scope in self._rollup(target, scope_targets).items()}
 
     def run_scope_totals(self, *, target: int,
                          scope_targets: dict[str, int] | None = None) -> dict[int, dict[str, tuple]]:
         """run_totals cut one level finer: (functions, over_target, crap_load) per
-        (run, scope). The grain the rollup is stored at, so this is the raw read."""
-        return self._rollup(target, scope_targets)
+        (run, scope)."""
+        return {run_id: _whole_and_scopes(by_scope)[1]
+                for run_id, by_scope in self._rollup(target, scope_targets).items()}
 
     def history_totals(self, *, target: int, scope_targets: dict | None = None) -> list[tuple]:
         """Trusted run metadata and both totals from one short read snapshot.
@@ -1204,24 +1290,32 @@ class SnapshotStore:
         try:
             runs = self.list_runs()
             totals = _by_run(self._conn.execute(_ROLLUP_READ, (key,)))
-            scored, pending = self._rollup_values(key, self._unrolled(key), target, scope_targets)
-            totals.update(_by_run(scored))
+            filled, pending = self._rollup_values(key, self._unrolled(key), target, scope_targets)
+            totals.update(filled)
         finally:
             self._conn.execute("RELEASE history_totals")
         self._store_rollup(pending)
-        return [(run, _summed(totals.get(run["id"], {})), totals.get(run["id"], {}))
+        return [(run, *_whole_and_scopes(totals.get(run["id"], {})))
                 for run in runs if is_trusted(run)]
 
     def function_span(self, run_id: int, path: str, long_name: str) -> tuple | None:
         """One keyed function's span; duplicate scopes count as one twin."""
+        place = self.function_place(run_id, path, long_name)
+        return None if place is None else (place.start, place.end)
+
+    def function_place(self, run_id: int, path: str, long_name: str) -> FunctionPlace | None:
+        """One keyed function's span, with the scope and flag the run scored it
+        under: a reader that names why a function has no dark lines needs the
+        flag, since no lane covers a no-lane row whatever a lane's stamp says."""
         name, ordinal = split_ordinal(long_name)
         self._require_identity(run_id=run_id, path=path, name=name)
-        cur = self._conn.execute(
-            f"SELECT f.start, f.end {_BY_PATH} WHERE i.path = ? AND i.long_name = ? "
-            "AND f.run_id = ? GROUP BY f.start, f.occurrence "
+        row = self._conn.execute(
+            f"SELECT f.start, f.end, i.scope, f.flag {_BY_PATH} WHERE i.path = ? "
+            "AND i.long_name = ? AND f.run_id = ? GROUP BY f.start, f.occurrence "
             "ORDER BY f.start, f.occurrence LIMIT 1 OFFSET ?",
-            (path, name, run_id, ordinal - 1))
-        return cur.fetchone()
+            (path, name, run_id, ordinal - 1)).fetchone()
+        return None if row is None else FunctionPlace(
+            row[0], row[1], row[2], _name(self._codes["flags"].names, row[3]))
 
     def set_verdict_ok(self, run_id: int, ok: bool, *, findings: int = 0) -> None:
         """Stamp a verdict on a run, with how many findings it carried.
@@ -1233,6 +1327,24 @@ class SnapshotStore:
         with self._conn:
             self._conn.execute("UPDATE runs SET verdict_ok = ?, findings = ? WHERE id = ?",
                                (1 if ok else 0, findings, run_id))
+
+    def record_refusals(self, refused: dict[str, str]) -> None:
+        """Keep each artifact's refused sha256 (lane_stamps): the copy of a
+        refusal that outlives a deleted or unreadable .crapkit/artifacts.json."""
+        with self._conn:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO lane_refusals (artifact, sha256) VALUES (?, ?)",
+                sorted(refused.items()))
+
+    def clear_refusals(self, artifacts) -> None:
+        """Drop the refusal of each artifact a run just measured."""
+        with self._conn:
+            self._conn.executemany("DELETE FROM lane_refusals WHERE artifact = ?",
+                                   [(artifact,) for artifact in artifacts])
+
+    def lane_refusals(self) -> dict[str, str]:
+        """artifact -> the sha256 of the leftover its lane's last attempt left."""
+        return dict(self._conn.execute("SELECT artifact, sha256 FROM lane_refusals"))
 
     def list_runs(self) -> list[dict]:
         cur = self._conn.execute(
@@ -1311,13 +1423,18 @@ class SnapshotStore:
                  "created_at": ts, "handle": handle, "key_name": name, "key_version": version}
                 for cid, p, n, sha, ts, handle, name, version in cur]
 
-    def attempts_for(self, keys) -> dict[tuple[str, str], list[dict]]:
+    def attempts_for(self, keys, names_in=_no_names) -> dict[tuple[str, str], list[dict]]:
         """Every claim ever taken on each named function, oldest first.
 
         One query for the whole batch, filtered on the indexed path and paired
         up here: a packet run asks about N functions, and a query apiece is N
         round trips for what one path filter already returns. Every requested
         key is in the answer, so a function nobody ever claimed reads as [].
+
+        `names_in(path)` is every long_name the run the keys come from holds
+        there, so a claim taken before analysis version 11 on a nested def
+        pairs with that def under the name the run gives it
+        (keys.claim_in_run). Without it, claims pair by the name they saved.
         """
         wanted = list(dict.fromkeys(keys))
         found: dict[tuple[str, str], list[dict]] = {key: [] for key in wanted}
@@ -1327,18 +1444,18 @@ class SnapshotStore:
         cur = self._conn.execute(
             "SELECT path, long_name, handle, key_name, key_version, created_at, closed_at FROM attempts "
             f"WHERE path IN ({','.join('?' * len(paths))}) ORDER BY id", paths)
-        self._pair_attempts(cur, found)
+        self._pair_attempts(cur, found, names_in)
         return found
 
     @staticmethod
-    def _pair_attempts(rows, found: dict) -> None:
+    def _pair_attempts(rows, found: dict, names_in) -> None:
         grouped: dict[tuple, list] = {}
         for key in found:
             grouped.setdefault((key[0], split_ordinal(key[1])[0]), []).append(key)
         for path, name, handle, precise, version, opened, closed in rows:
-            claim = {"path": path, "long_name": name, "handle": handle, "key_name": precise,
-                     "key_version": version}
-            for key in grouped.get((path, name), ()):
+            claim = claim_in_run({"path": path, "long_name": name, "handle": handle,
+                                  "key_name": precise, "key_version": version}, names_in)
+            for key in grouped.get((path, claim["long_name"]), ()):
                 if claim_holds(claim, key):
                     found[key].append({"opened": opened, "closed": closed})
 
@@ -1485,6 +1602,7 @@ class SnapshotStore:
             self._conn.executemany("DELETE FROM functions WHERE run_id = ?", doomed)
             self._conn.executemany("DELETE FROM run_rollup WHERE run_id = ?", doomed)
             self._conn.executemany("DELETE FROM run_collisions WHERE run_id = ?", doomed)
+            self._conn.executemany("DELETE FROM run_sources WHERE run_id = ?", doomed)
             self._drop_twins("run_id = ?", doomed)
             self._conn.executemany("DELETE FROM runs WHERE id = ?", doomed)
         return len(doomed)
@@ -1623,21 +1741,44 @@ def _verify_blocker(run: dict, previous: dict | None) -> dict | None:
     return None if run["verdict_ok"] else run
 
 
-def pick_baseline(runs: list[dict]) -> BaselinePick:
-    """The newest trusted run no unanswered failed verify stands in front of.
+def anywhere(run: dict) -> bool:
+    """The `pick_baseline` predicate for a caller with no git to ask: every run counts."""
+    return True
 
-    One chronological walk remembers the newest clean candidate and the newest
-    refused one. A crashed verify changes neither trust nor the outstanding
-    failure. An explicit `verify --baseline ID` still skips this decision.
-    """
-    picked = BaselinePick(None, None, None)
-    blocker = None
+
+def _trusted_states(runs: list[dict]) -> list[tuple[dict, dict | None]]:
+    """Each trusted run, oldest first, with the failed verify that stood
+    unanswered in front of it when it was made (None when nothing did)."""
+    states, blocker = [], None
     for run in runs:
         blocker = _verify_blocker(run, blocker)
         if is_trusted(run):
-            picked = (BaselinePick(picked.run, run, blocker) if blocker
-                      else BaselinePick(run, None, None))
-    return picked
+            states.append((run, blocker))
+    return states
+
+
+def pick_baseline(runs: list[dict], behind=anywhere) -> BaselinePick:
+    """The newest trusted run behind HEAD that no unanswered failed verify stands in front of.
+
+    A crashed verify changes neither trust nor the outstanding failure. An
+    explicit `verify --baseline ID` still skips this decision.
+
+    `behind(run)` says whether the run's commit is at or behind HEAD. A store
+    keeps every branch's runs, and the newest trusted one can sit on a branch
+    HEAD does not contain: verify measured against it, then refused with exit 4
+    and blamed a rebase that never happened. The walk goes newest first and asks
+    only until the pick is made, because each answer can cost a git spawn.
+    Callers with no git to ask keep the default, which counts every run.
+    """
+    pick = BaselinePick(None, None, None)
+    for run, blocker in reversed(_trusted_states(runs)):
+        if not behind(run):
+            continue
+        if blocker is None:
+            return pick._replace(run=run)
+        if pick.skipped is None:
+            pick = BaselinePick(None, run, blocker)
+    return pick
 
 
 def outstanding_failure(runs: list[dict]) -> dict | None:

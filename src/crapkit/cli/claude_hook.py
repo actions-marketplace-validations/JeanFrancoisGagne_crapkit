@@ -1,16 +1,32 @@
-"""Protocol 1: one Claude Code PostToolUse payload on stdin, a ccn advisory out.
+"""Protocol 1: one PostToolUse payload on stdin, a ccn advisory out.
 
-Exit 2 with three lines of stderr is the only thing this ever says, and it says
-it about exactly one thing: a function the edit changed, in a scope crapkit
-measures, over its ceiling, carrying no ratchet mark. Everything else is exit 0
-and silence: the malformed payload, the unmeasured repo, the half-typed source
-and the internal exception included.
+The advisory is the only thing this ever says, and it says it about an edit in
+a scope crapkit measures: a function the edit changed, over its ceiling,
+carrying no ratchet mark; or a changed file the edit left unjudged, because no
+reader could read it, because git names it in bytes that are not UTF-8, or
+because git ran and could not report what the edit changed. The unjudged lines
+name the file and the reason; the commit gate refuses the first two once
+staged. Everything else is exit 0 and silence: the malformed payload, the
+unmeasured repo, a machine with no git and the internal exception included.
 
-An Edit, Write or MultiEdit event names its file in `tool_input.file_path` and
-is judged as that one file. A Bash event carries `tool_input.command` instead —
-a heredoc or `python - <<'PY'` writes source no file_path ever names — so it
-falls back to the working tree: the changed *.py files fresh enough for this
-command to have plausibly written, each through the same per-file ladder.
+The plugin's one handler runs under several harnesses, and each sends the event
+in its own words. Claude Code and Cursor name the written file in
+`tool_input.file_path`, GitHub Copilot CLI in `tool_input.path`, and VS Code in
+`tool_input.filePath` or its patch text; Cursor also spells the event
+`postToolUse`. Each file is judged on its own, and only when its suffix is one
+crapkit measures. A Bash event carries `tool_input.command` instead (a heredoc
+or `python - <<'PY'` writes source no file_path ever names), so it falls back to
+the working tree: the changed *.py files fresh enough for this command to have
+plausibly written, each through the same per-file ladder. Fresh means an mtime
+inside the window and bytes this session has not judged yet, so a touch or a
+same-bytes rewrite never repeats an advisory (`_Memory`).
+
+Where the advisory goes depends on who reads the exit code. Claude Code hands
+exit 2's stderr to the model, so there it is three lines of stderr and exit 2.
+Cursor reads exit 2 as a deny, VS Code as a blocking error, and Copilot CLI
+shows it to the user alone, so for those three it is exit 0 and one line of
+JSON on stdout, the text under both keys they read: `additionalContext` (Copilot
+CLI, Cursor) and `hookSpecificOutput.additionalContext` (VS Code).
 
 That silence is the design, not laziness. On PostToolUse a nonzero exit that is
 not 2 is invisible and a 2 is text the model has to read, so a hook that fires
@@ -28,13 +44,16 @@ Two constraints shape the code rather than the contract:
   module before the body runs, so anything imported here is paid by every edit
   on the machine, including the ones in repos crapkit never measures.
 - The snapshot store is never opened. The advisory needs source, configuration
-  and committed ratchet marks; opening a store would add schema inspection and
+  and the marks file in the working tree; opening a store would add schema inspection and
   database I/O to every edit. Old stores can still need a migration. The hook
-  stays independent of that lifecycle and writes nothing.
+  stays independent of that lifecycle. The one thing it writes is its session
+  memory, under the git directory, so the working tree stays byte-identical.
 """
 from __future__ import annotations
 
 import json
+import os
+import re
 import subprocess
 import sys
 import time
@@ -43,17 +62,52 @@ from pathlib import Path
 
 PROTOCOL = "1"
 
+# The one event judged, as Claude Code, Copilot CLI and VS Code spell it, then
+# as Cursor does.
+_EVENTS = ("PostToolUse", "postToolUse")
+
+# Where an Edit or Write names its file: Claude Code and Cursor, then Copilot CLI.
+_PATH_KEYS = ("file_path", "path")
+
+# VS Code's tools that write a file. VS Code runs every plugin hook on every
+# tool call and drops the `Edit|Write` matcher, so this set is that matcher in
+# VS Code's own tool names.
+_VSCODE_WRITES = frozenset({"create_file", "insert_edit_into_file", "replace_string_in_file",
+                            "multi_replace_string_in_file", "apply_patch"})
+
+# The file lines of an apply_patch body that leave a file written.
+_PATCHED = re.compile(r"^\*\*\* (?:Update File|Add File|Move to): (.+?)[ \t\r]*$", re.MULTILINE)
+
+# The shell tool, as Claude Code and Copilot CLI name it and as Cursor maps a
+# Bash matcher onto its own.
+_SHELL_TOOLS = frozenset({"Bash", "Shell"})
+
 # Git state meaning the working tree holds content this edit did not author.
 _SEQUENCING_MARKERS = ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD")
 
-# The Bash fallback's freshness window: a dirty *.py whose mtime is older than
-# this was not written by the command this event reports, so advising it again
-# would repeat the advisory on every later Bash call in the session.
+# The Bash fallback's first filter: a dirty *.py whose mtime is older than this
+# was not written by the command this event reports, so advising it again would
+# repeat the advisory on every later Bash call in the session. A touch or a
+# same-bytes rewrite moves an mtime into the window with no new content, so
+# `_Memory` is the second filter. Content that lands with an old mtime (`mv`,
+# `cp -p`, an unpacked archive, a write more than this long before the event)
+# is never judged here: the documented miss, and the commit gate's to catch.
 _FRESH_WINDOW_SECONDS = 12
 
 # And its bound: PostToolUse waits this process out, so a huge dirty tree is a
 # stall, not a license to judge everything in it.
 _MAX_COMMAND_FILES = 25
+
+# The session memory: `<git dir>/crapkit/claude-hook/<session_id>/`, one small
+# file per judged path. A session idle this long is pruned when another starts;
+# one resumed after that hears each advisory once more, and loses nothing else.
+_MEMORY_DIR = ("crapkit", "claude-hook")
+_MEMORY_DAYS = 7
+_SESSION_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+_SESSION_MAX = 128
+
+# The closing line of each advisory that judged nothing: what to do next.
+_GIT_NEXT = "fix what git reports; until git can read this repository, no edit in it is judged"
 
 
 def cmd_claude_hook(args) -> int:
@@ -74,19 +128,38 @@ def _advise(args, stream) -> int:
     payload = _payload(stream)
     if args.protocol != PROTOCOL:
         return 0
-    edited = _edited_file(payload)
+    return _deliver(payload, _advisory(payload))
+
+
+def _advisory(payload: dict) -> list[str]:
+    """Every advisory line this event earns: the edited files' when it names
+    any, else the Bash fallback's."""
+    memory = _memory(payload)
+    edited = _edited_files(payload)
     if edited:
-        return _judge_path(_edited_path(payload, edited))
-    return _advise_command(payload)
+        return _judge_paths(_measured(payload, edited), memory)
+    return _advise_command(payload, memory)
 
 
-def _judge_path(path: Path) -> int:
+def _judge_paths(paths: list[Path], memory: _Memory) -> list[str]:
+    return [line for path in paths for line in _judge_path(path, memory)]
+
+
+def _judge_path(path: Path, memory: _Memory) -> list[str]:
     """Root discovery and judgement for one absolute file path: the tail every
-    event shape shares once it holds a file to answer for."""
+    event shape shares once it holds a file to answer for.
+
+    The path below the root takes the case its directories list: on a
+    case-insensitive disk a payload's `CALC\\mod.py` opens calc/mod.py, and
+    keyed as typed it matched no scope, so a breach went unadvised, while
+    `calc\\Mod.py` read the tracked file as untracked and advised debt the
+    edit never touched."""
+    from ..repopath import tracked_spelling
+
     root = _repo_root(path.parent)
     if root is None or _sequencing(root):
-        return 0
-    return _judge(root, path.relative_to(root).as_posix())
+        return []
+    return _judge(root, tracked_spelling(root, path.relative_to(root).as_posix()), memory)
 
 
 def _payload(stream) -> dict:
@@ -95,21 +168,65 @@ def _payload(stream) -> dict:
     return event if isinstance(event, dict) else {}
 
 
-def _edited_file(payload: dict) -> str:
-    """The path this event edited, or "" when protocol 1 does not judge the event.
+def _edited_files(payload: dict) -> list[str]:
+    """The paths this event wrote, or [] when protocol 1 does not judge the event.
 
     PostToolUse only: PreToolUse arrives before the edit lands and judges source
     that does not exist yet, and a Stop hook's exit 2 blocks the stop, which on a
     verdict read off the filesystem is an infinite loop generator. NotebookEdit
     carries `notebook_path`, so it falls out here rather than needing a rule.
     """
-    if payload.get("hook_event_name") != "PostToolUse":
-        return ""
     tool_input = payload.get("tool_input")
-    if not isinstance(tool_input, dict):
-        return ""
-    edited = tool_input.get("file_path")
-    return edited if isinstance(edited, str) else ""
+    if payload.get("hook_event_name") not in _EVENTS or not isinstance(tool_input, dict):
+        return []
+    if payload.get("tool_name") in _VSCODE_WRITES:
+        return _vscode_files(tool_input)
+    return _named_file(tool_input)
+
+
+def _named_file(tool_input: dict) -> list[str]:
+    """The one file an Edit or Write names, under whichever key its harness uses."""
+    for key in _PATH_KEYS:
+        if isinstance(tool_input.get(key), str):
+            return [tool_input[key]]
+    return []
+
+
+def _vscode_files(tool_input: dict) -> list[str]:
+    """The files one of VS Code's writing tools names, each once: `filePath`,
+    every replacement's `filePath`, and every file an apply_patch body leaves
+    written."""
+    named = [tool_input.get("filePath"), *(r.get("filePath") for r in _replacements(tool_input))]
+    patch = tool_input.get("input")
+    patched = _PATCHED.findall(patch) if isinstance(patch, str) else []
+    return list(dict.fromkeys(p for p in [*named, *patched] if isinstance(p, str)))
+
+
+def _replacements(tool_input: dict) -> list[dict]:
+    """multi_replace_string_in_file's edits, one object per replacement."""
+    items = tool_input.get("replacements")
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
+def _measured(payload: dict, edited: list[str]) -> list[Path]:
+    """The edited files a scope could hold, absolute, each once: on disk, with a
+    suffix crapkit measures. The plugin's per-file-type `if` rules used to screen
+    the suffix before the spawn; one handler now serves every edit, so the screen
+    runs here, before any config is read.
+
+    The screen lets through what the ladder must answer for. A suffix matches in
+    any letter case, because a case-folding disk opens `calc\\MOD.PY` as the
+    tracked `calc/mod.py`; the scope rung still decides on the tracked spelling.
+    A directory spelled like a source file stays, so its read names the OS error."""
+    suffixes = _suffixes()
+    paths = dict.fromkeys(_edited_path(payload, p) for p in edited)
+    return [path for path in paths if path.suffix.lower() in suffixes and path.exists()]
+
+
+def _suffixes() -> frozenset[str]:
+    from ..languages import LANGUAGE_EXTENSIONS
+
+    return frozenset(e.lower() for extensions in LANGUAGE_EXTENSIONS.values() for e in extensions)
 
 
 def _edited_path(payload: dict, edited: str) -> Path:
@@ -121,78 +238,100 @@ def _edited_path(payload: dict, edited: str) -> Path:
     edit inside a worktree would resolve to the mainline checkout's store with
     the edited file untracked from that root.
     """
-    path = Path(edited)
-    if path.is_absolute():
-        return path
-    return Path(payload.get("cwd") or ".") / path
+    return _native_path(edited, payload.get("cwd"))
+
+
+def _native_path(raw: str | None, stand: str | None = None) -> Path:
+    """A payload path as this OS opens it, through repopath's typed entry,
+    imported here so an event that judges nothing never loads it. Claude Code on
+    Windows reports a session cwd as `/c/Users/...`, and a model can write a
+    file_path the same way; either one read as a Windows path named no
+    directory. A payload with no `cwd` reads as the directory the hook runs in."""
+    from ..repopath import typed_path
+
+    return typed_path(raw or ".", stand or "")
 
 
 def _command_event(payload: dict) -> bool:
-    """Whether this is a PostToolUse for a tool that wrote through the shell.
+    """Whether this is a PostToolUse for the shell tool, carrying its command.
 
     Bash carries `tool_input.command` and never `file_path`, so protocol 1 has
-    no single file to judge and reads the working tree instead. Shape-based like
-    `_edited_file`: NotebookEdit and friends carry no `command` and fall out
-    here rather than needing a rule.
+    no single file to judge and reads the working tree instead. Named rather
+    than shape-based: Codex's apply_patch carries its patch in `command`, and
+    VS Code's terminal tool reaches the hook whatever the matcher says, and
+    neither was registered for the working-tree scan.
     """
-    if payload.get("hook_event_name") != "PostToolUse":
+    if payload.get("hook_event_name") not in _EVENTS or payload.get("tool_name") not in _SHELL_TOOLS:
         return False
     tool_input = payload.get("tool_input")
     return isinstance(tool_input, dict) and isinstance(tool_input.get("command"), str)
 
 
-def _advise_command(payload: dict) -> int:
+def _advise_command(payload: dict, memory: _Memory) -> list[str]:
     """The Bash fallback: judge the fresh *.py files the working tree changed.
 
     A shell heredoc or `python - <<'PY'` writes source no Edit event ever names,
     so judging only `file_path` left every Bash-written breach unadvised. Each
     file takes the same per-file ladder an Edit takes, so a file under no
-    crapkit root, mid-sequencing, unscoped or marked stays silent, and exit 2
-    means what it always means.
+    crapkit root, mid-sequencing, unscoped or marked stays silent, and the
+    advisory means what it always means.
     """
     if not _command_event(payload):
-        return 0
-    top = _repo_top(Path(payload.get("cwd") or "."))
+        return []
+    top = _repo_top(_native_path(payload.get("cwd")))
     if top is None:
-        return 0
-    verdicts = [_judge_path(path) for path in _fresh_python(top)]
-    return 2 if 2 in verdicts else 0
+        return []
+    return _judge_paths(_fresh_python(top, memory), memory)
 
 
 def _repo_top(cwd: Path) -> Path | None:
     """The git working-tree top above the command's own cwd, or None outside any
     repo. The event's `cwd` is where the command ran, and `status --porcelain`
-    names every file relative to this top whatever directory asks."""
+    names every file relative to this top whatever directory asks. A directory
+    named in bytes that are not UTF-8 keeps them, as every path git names does."""
+    from ..repotext import escaped
+
     if not cwd.is_dir():
         return None
-    res = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cwd,
-                         capture_output=True, text=True, encoding="utf-8",
-                         errors="replace")
-    top = res.stdout.strip()
+    res = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cwd, capture_output=True)
+    top = escaped(res.stdout).strip()
     return Path(top) if res.returncode == 0 and top else None
 
 
-def _fresh_python(top: Path) -> list[Path]:
-    """Absolute paths of the changed *.py files this command plausibly wrote:
-    dirty or untracked per git, on disk, and with an mtime inside the window."""
+def _fresh_python(top: Path, memory: _Memory) -> list[Path]:
+    """Absolute paths of the changed *.py files this command plausibly wrote,
+    at most `_MAX_COMMAND_FILES` of them."""
     cutoff = time.time() - _FRESH_WINDOW_SECONDS
     fresh: list[Path] = []
     for status, rel in _status_records(_porcelain(top)):
-        if _judgeable(status, rel) and _fresh(top / rel, cutoff):
+        if _unheard(top / rel, status, rel, cutoff, memory):
             fresh.append(top / rel)
         if len(fresh) == _MAX_COMMAND_FILES:
             break
     return fresh
 
 
+def _unheard(path: Path, status: str, rel: str, cutoff: float, memory: _Memory) -> bool:
+    """Dirty or untracked per git, on disk, with an mtime inside the window, and
+    holding bytes no judgement in this session has read."""
+    return _judgeable(status, rel) and _fresh(path, cutoff) and not memory.judged(path)
+
+
 def _porcelain(top: Path) -> str:
     """`git status --porcelain -z` over the whole tree, or "" when git cannot
     answer. -uall, because a heredoc that creates a new DIRECTORY of source
-    would otherwise arrive as one collapsed `?? newdir/` row naming no file."""
-    res = subprocess.run(["git", "status", "--porcelain", "-z", "-uall"], cwd=top,
-                         capture_output=True, text=True, encoding="utf-8",
-                         errors="replace")
-    return res.stdout if res.returncode == 0 else ""
+    would otherwise arrive as one collapsed `?? newdir/` row naming no file.
+    Each name keeps its bytes: read leniently, a Latin-1 name held U+FFFD,
+    named no file on disk, and a breach written under it passed in silence.
+    --no-optional-locks, because this read runs beside the agent's own git
+    commands: a plain status writes its refreshed index over .git/index, and
+    on Windows another git process that opens the index during that rename
+    fails with "index file open failed: Permission denied"."""
+    from ..repotext import escaped
+
+    res = subprocess.run(["git", "--no-optional-locks", "status", "--porcelain", "-z", "-uall"],
+                         cwd=top, capture_output=True)
+    return escaped(res.stdout) if res.returncode == 0 else ""
 
 
 def _status_records(text: str) -> Iterator[tuple[str, str]]:
@@ -218,7 +357,8 @@ def _judgeable(status: str, rel: str) -> bool:
 
 
 def _fresh(path: Path, cutoff: float) -> bool:
-    """mtime inside the window — the approximation of "this command wrote it".
+    """mtime inside the window: the first approximation of "this command wrote
+    it", which `_Memory.judged` narrows to bytes the session has not judged.
     A path status names but disk lacks is not fresh, whatever the record said."""
     try:
         return path.stat().st_mtime >= cutoff
@@ -253,25 +393,67 @@ def _sequencing(root: Path) -> bool:
     return any((git_dir / marker).exists() for marker in _SEQUENCING_MARKERS)
 
 
-def _judge(root: Path, rel: str) -> int:
-    """Rungs 6 to 9: scope, analysis, verdict, output.
+def _judge(root: Path, rel: str, memory: _Memory) -> list[str]:
+    """Rungs 6 to 9: scope, analysis, verdict, the advisory's lines, and the
+    session's record of the bytes the verdict read. A git failure records
+    nothing: its advisory says nothing about the bytes, and the next read may
+    get git's answer."""
+    from ..gitpaths import readable
+
+    cfg = _config(root)
+    if not readable(rel):
+        return _unreadable(cfg, rel)
+    in_scope = _scoped(cfg, rel)
+    if in_scope is None:
+        return []
+    raw, records, ranges = _read(root, rel)
+    lines = _answer(root, cfg, in_scope, rel, records, ranges)
+    if not isinstance(ranges, _Unknown):
+        memory.remember(root / rel, raw)
+    return lines
+
+
+def _read(root: Path, rel: str) -> tuple:
+    """The file's bytes, its function records and what the edit changed.
 
     The statement order is the latency budget. `git diff` on one file costs
     31.4 ms and importing lizard costs 38.1, so the diff is started first and
     finishes inside the import that follows it.
     """
-    cfg = _config(root)
-    in_scope = _scoped(cfg, rel)
-    if in_scope is None:
-        return 0
     diff = _diff_proc(root, rel)
     try:
-        records = _records(root, rel)
-        ranges = _changed(root, rel, _diff_text(diff))
+        raw, records = _records(root / rel, rel)
+        return raw, records, _changed(root, rel, diff)
     finally:
         diff.close()
-    breaches, ceiling = _verdict(cfg, in_scope, rel, records, ranges)
-    return _report(root, cfg, rel, breaches, ceiling, records)
+
+
+def _unreadable(cfg, rel: str) -> list[str]:
+    """The advisory for a file a scope takes whose name git gives in bytes that
+    are not UTF-8. No function in it can be keyed, so none is judged, and the
+    commit gate refuses the file at exit 3; saying nothing here would
+    pass it unread. Advisory wording, as rung 9's: the edit landed. A name no
+    scope takes stays silent, like any unscoped edit."""
+    from ..gitpaths import shown
+    from ..universe import claiming_scope
+
+    scope = claiming_scope(rel, cfg)
+    if scope is None:
+        return []
+    return [f"crapkit advisory: {shown(rel)} is in scope {scope!r}, but git names it in bytes "
+            "that are not UTF-8 and crapkit reads every path as UTF-8, so no function in it was "
+            "judged (the edit landed; nothing was blocked)",
+            "the commit gate refuses such a file (exit 3); rename it to a UTF-8 name"]
+
+
+def _check_advisory(breaches: list, ceiling: int, in_scope: dict, cfg) -> None:
+    """The breaches and the ceiling the head line prints, against the parsed
+    config (`invariants.check_advisory`). A number past its bound stops the
+    advisory before it prints; the catch-all turns that stop into the silent
+    exit 0 every internal failure here gets."""
+    from ..invariants import check_advisory
+
+    check_advisory(breaches, ceiling, in_scope, cfg.ceiling_of)
 
 
 def _config(root: Path):
@@ -309,56 +491,154 @@ def _diff_proc(root: Path, rel: str):
 
     Scoped to the path on purpose: 31.4 ms against 92.4 for the whole tree.
     The commit gate's adapter owns display flags, exact paths and binary-marked
-    source fallback. A failed diff leaves the untracked-file decision to _changed.
+    source fallback. A git that cannot start raises here, before anything is
+    judged, and the catch-all keeps a machine with no git silent. A diff that
+    started and failed is `_changed`'s to read.
     """
     from ..gitio import SourcePatch
 
     return SourcePatch(root, "HEAD", paths=(rel,))
 
 
-def _diff_text(diff) -> str:
-    from ..errors import GitError
-
-    try:
-        return diff.result()
-    except GitError:
-        return ""
-
-
-def _records(root: Path, rel: str) -> list:
-    """The edited file's functions, off the working tree the edit just landed in.
+def _records(path: Path, rel: str) -> tuple:
+    """The edited file's bytes and functions, off the working tree the edit just
+    landed in: (None, a refusal) when the file cannot be read at all.
 
     This import is what pulls lizard in, so it happens here, with the diff
-    subprocess already running. Source nobody can parse yields zero functions and
-    therefore zero breaches, which is the right failure direction for a hook that
-    fires while an agent is still typing.
+    subprocess already running. A file no reader could read comes back as an
+    `UnanalyzableFile`, empty and carrying the reader's reason, and `_unjudged`
+    names it instead of reading its zero records as zero breaches.
     """
-    from ..analyze import analyze_source, read_source
+    from ..analyze import analyze_source, decode_source
+    from ..merge import UnanalyzableFile
 
-    return analyze_source(rel, read_source(str(root / rel)), note=False)
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        return None, UnanalyzableFile(f"{rel}: {exc.strerror or exc}")
+    return raw, analyze_source(rel, decode_source(raw), note=False)
 
 
-def _changed(root: Path, rel: str, diff_text: str):
-    """New-side ranges this edit changed, or None when the file is untracked.
+class _Unknown:
+    """The change set git could not report, carrying git's error."""
+
+    __slots__ = ("reason",)
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+
+def _changed(root: Path, rel: str, diff):
+    """New-side ranges this edit changed; None when every function in the file
+    counts; `_Unknown` when git ran and could not say.
 
     None is not "nothing changed": git diff cannot see a file it never recorded,
     and reading its empty diff as an empty change set would pass every function
-    in it. That is the one state where the verdict would lie, so an untracked
-    file is judged in full, exactly as `rescore --gate` judges one.
+    in it. So an untracked file is judged in full, exactly as `rescore --gate`
+    judges one, and so is every file before the first commit. A failed read is
+    never an answer: it read as "nothing changed" (a staged breach before the
+    first commit drew silence) and as "untracked" (a corrupt index made a
+    one-line edit answer for every legacy function in the file).
     """
-    if diff_text.strip():
-        from ..diffparse import changed_ranges
+    from ..errors import GitError
 
-        return changed_ranges(diff_text).get(rel, [])
-    return [] if _tracked(root, rel) else None
+    try:
+        text = diff.result()
+    except GitError as exc:
+        return _without_diff(root, rel, exc)
+    if text.strip():
+        from ..diffparse import worktree_ranges
+
+        return worktree_ranges(text, root).get(rel, [])
+    return _listed(root, rel)
 
 
-def _tracked(root: Path, rel: str) -> bool:
-    """Whether git has this one path in the index. Asked only when the diff came
-    back empty, which is the only case that cannot tell untracked from unchanged."""
-    listed = subprocess.run(["git", "ls-files", "--", rel], cwd=root, capture_output=True,
-                            text=True, encoding="utf-8", errors="replace")
-    return bool(listed.stdout.strip())
+def _without_diff(root: Path, rel: str, exc) -> None | _Unknown:
+    """What a failed `git diff HEAD` leaves, read off HEAD itself.
+
+    When HEAD resolves, git failed at something else, so its error is named.
+    When it does not, there is no commit to diff against: before the first
+    commit, or in a measured directory no repository holds. Every function in
+    the file is new there, so the file is judged whole, staged or not.
+    """
+    if _head_resolves(root):
+        return _Unknown(f"git diff HEAD -- {rel}: {_git_said(exc, root)}")
+    return None
+
+
+def _git_said(exc, root: Path) -> str:
+    """git's own words out of a GitError, without the argv the model has no use
+    for; the whole message when it is not shaped `... failed in ROOT: WORDS`."""
+    text = str(exc)
+    return text.partition(f" failed in {root}: ")[2] or text
+
+
+def _head_resolves(root: Path) -> bool:
+    """Whether `git rev-parse --verify --quiet HEAD` names a commit. Asked only
+    after the diff failed, so it costs nothing on the ordinary path."""
+    return subprocess.run(["git", "rev-parse", "--verify", "--quiet", "HEAD"], cwd=root,
+                          capture_output=True).returncode == 0
+
+
+def _listed(root: Path, rel: str) -> list | None | _Unknown:
+    """For a file with no diff against HEAD: [] when the index lists it (nothing
+    changed), None when it does not (untracked), git's error when ls-files fails.
+    Asked only when the diff came back empty, the one case that cannot tell
+    untracked from unchanged. Literal, so `[id].py` never matches `i.py`."""
+    from ..repotext import lenient
+
+    listed = subprocess.run(["git", "--literal-pathspecs", "ls-files", "--", rel], cwd=root,
+                            capture_output=True)
+    if listed.returncode != 0:
+        return _Unknown(f"git ls-files -- {rel}: {lenient(listed.stderr).strip()}")
+    return [] if listed.stdout.strip() else None
+
+
+def _answer(root: Path, cfg, in_scope: dict, rel: str, records: list, ranges) -> list[str]:
+    """Rungs 8 and 9: an edit judged nowhere says why; the rest get the verdict."""
+    unjudged = _unjudged(rel, records, ranges)
+    if unjudged:
+        return unjudged
+    breaches, ceiling = _verdict(cfg, in_scope, rel, records, ranges)
+    _check_advisory(breaches, ceiling, in_scope, cfg)
+    return _report(root, cfg, rel, breaches, ceiling, records)
+
+
+def _unjudged(rel: str, records: list, ranges) -> list[str]:
+    """The advisory for an edit no function of which could be judged, or [].
+
+    A git failure first: without the change set nothing can be judged. Then a
+    file no reader could read, when the edit changed it: zero records read as
+    zero breaches, so every function in it passed unjudged. A file left as HEAD
+    has it stays silent, as the commit gate never judges an untouched file.
+    """
+    if isinstance(ranges, _Unknown):
+        return _unjudged_lines(f"git could not report what changed in {rel}", ranges.reason,
+                               _GIT_NEXT)
+    reason = getattr(records, "reason", None)
+    if reason is not None and ranges != []:
+        return _unread_advisory(rel, reason)
+    return []
+
+
+def _unread_advisory(rel: str, reason: str) -> list[str]:
+    """The advisory for an edited file no reader could read, in the advisory's
+    own voice: the head line says nothing was blocked, the reason is the
+    commit gate's own UNREAD line, and the last line says what that gate will
+    do and how to clear it."""
+    from ..merge import UNREAD_ADVICE
+
+    return [f"crapkit advisory: {rel} could not be read, so no function in it was judged "
+            "(the edit landed; nothing was blocked)",
+            f"  UNREAD  {rel}: {reason}",
+            f"the commit gate refuses this file once staged; {UNREAD_ADVICE}"]
+
+
+def _unjudged_lines(what: str, reason: str, next_step: str) -> list[str]:
+    """Three lines, shaped like the breach advisory: what went unjudged, why in
+    the reader's or git's own words, and what to do."""
+    return [f"crapkit advisory: {what}, so no function in it was judged "
+            "(the edit landed; nothing was blocked)", f"  {reason}", next_step]
 
 
 def _verdict(cfg, in_scope: dict, rel: str, records: list, ranges) -> tuple[list, int]:
@@ -402,19 +682,15 @@ def _keys(records: list) -> dict:
     return key_names(records)
 
 
-def _report(root: Path, cfg, rel: str, breaches: list, ceiling: int, records: list) -> int:
-    """Rung 9. stdout stays empty whatever happens: protocol 1 reserves it for a
-    future JSON channel, and Claude Code parses stdout JSON on exit 0."""
+def _report(root: Path, cfg, rel: str, breaches: list, ceiling: int, records: list) -> list[str]:
+    """Rung 9: the advisory for the breaches no ratchet mark covers, or [] when
+    every one is marked. `_deliver` decides where the lines go."""
     from ..keys import key_of
 
     keys = _keys(records)
     marked = _marks_for(root / cfg.ratchet_file, rel, records)
     unmarked = [rec for rec in breaches if key_of(keys, rec)[1] not in marked]
-    if not unmarked:
-        return 0
-    for line in _advisory_lines(rel, unmarked, ceiling):
-        print(line, file=sys.stderr)
-    return 2
+    return _advisory_lines(rel, unmarked, ceiling) if unmarked else []
 
 
 def _marks_for(marks_path: Path, rel: str, records=()) -> set[str]:
@@ -427,12 +703,15 @@ def _marks_for(marks_path: Path, rel: str, records=()) -> set[str]:
 
     Parse only this file's lines and the format comments. Whole-repo entry
     construction costs 35 ms for 40,303 marks and answers no extra question.
+    The file reads by `repotext.marks_text`, the rule every marks reader
+    shares, so a UTF-16 save keeps its marks and a cp1252 byte costs only the
+    mark whose name held it.
     """
-    from ..repotext import repo_text
+    from ..repotext import marks_text
 
     if not marks_path.is_file():
         return set()
-    text = repo_text(marks_path, marks_path.name)
+    text = marks_text(marks_path.read_bytes())
     return _known_marks(_file_lines(text, rel), records)
 
 
@@ -491,3 +770,169 @@ def _advisory_lines(rel: str, breaches: list, ceiling: int) -> list[str]:
     body = [f"  ccn {rec.ccn}  {rel}:{rec.start}  {rec.long_name}" for rec in breaches]
     return [head, *body,
             "the commit gate enforces this; decompose there or mark the debt"]
+
+
+# --- the session memory ------------------------------------------------------
+
+
+class _Memory:
+    """The bytes this session's judgements read: per file, the sha256 of the
+    bytes last judged there, one small file per path under the git directory.
+
+    Every judgement writes its record, a silent one included, so bytes that
+    leave and come back count as new. The Bash fallback reads it and skips a
+    fresh file whose bytes match: a touch, a same-bytes rewrite or a command
+    that writes nothing right after an Edit never repeats an advisory. An Edit
+    is always judged; it names its file, and the record only follows it.
+
+    A payload with no usable `session_id` gets no memory, and a record that
+    cannot be read or written reads as "not judged". Either way the hook
+    judges as it did before this memory existed, and no verdict changes.
+    """
+
+    __slots__ = ("session",)
+
+    def __init__(self, session: str | None) -> None:
+        self.session = session
+
+    def judged(self, path: Path) -> bool:
+        """Whether the bytes at `path` are the ones this session last judged there."""
+        slot = self._slot(path)
+        if slot is None:
+            return False
+        try:
+            return slot.read_text(encoding="ascii") == _digest(path.read_bytes())
+        except (OSError, ValueError):
+            return False
+
+    def remember(self, path: Path, raw: bytes | None) -> None:
+        """Record `raw` as the bytes judged at `path`; nothing when there are none."""
+        slot = self._slot(path) if raw is not None else None
+        if slot is not None:
+            _record(slot, _digest(raw))
+
+    def _slot(self, path: Path) -> Path | None:
+        git_dir = _git_dir(path.parent) if self.session is not None else None
+        if git_dir is None:
+            return None
+        return git_dir.joinpath(*_MEMORY_DIR, self.session, _path_key(path))
+
+
+def _memory(payload: dict) -> _Memory:
+    """The session's memory, keyed on the payload's `session_id`. Claude Code
+    sends one on every event; an id that could climb out of the memory
+    directory, or none at all, turns the memory off."""
+    session = payload.get("session_id")
+    usable = isinstance(session, str) and 0 < len(session) <= _SESSION_MAX
+    return _Memory(session if usable and set(session) <= _SESSION_CHARS else None)
+
+
+def _git_dir(start: Path) -> Path | None:
+    """The git directory above `start`, found without starting git: the first
+    `.git` directory, or the directory a `.git` file names (a linked worktree
+    or a submodule). The crapkit root sits at or under the git top, so the walk
+    from any judged file ends at the repository that tracks it."""
+    for directory in [start, *start.parents][:64]:
+        entry = directory / ".git"
+        if entry.is_dir():
+            return entry
+        if entry.is_file():
+            return _named_git_dir(entry)
+    return None
+
+
+def _named_git_dir(entry: Path) -> Path | None:
+    """The directory a `.git` file's `gitdir:` line names, relative to the file."""
+    try:
+        first = entry.read_text(encoding="utf-8").splitlines()[0]
+    except (OSError, UnicodeDecodeError, IndexError):
+        return None
+    name = first.partition("gitdir:")[2].strip()
+    return entry.parent / name if first.startswith("gitdir:") and name else None
+
+
+def _path_key(path: Path) -> str:
+    """One file name per judged path, the same whichever event spelled it: an
+    Edit's payload path and the Bash fallback's `git status` path resolve alike."""
+    import hashlib
+
+    name = os.path.normcase(os.path.realpath(path))
+    return hashlib.sha256(os.fsencode(name)).hexdigest()[:32]
+
+
+def _digest(raw: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _record(slot: Path, digest: str) -> None:
+    """Write one record whole, through a rename, so a parallel hook reads the
+    old record or the new one. A session directory made now prunes idle ones.
+    A write that fails loses a record and changes no verdict."""
+    started = not slot.parent.is_dir()
+    try:
+        slot.parent.mkdir(parents=True, exist_ok=True)
+        part = slot.with_name(f"{slot.name}.{os.getpid()}.part")
+        part.write_text(digest, encoding="ascii")
+        os.replace(part, slot)
+    except OSError:
+        return
+    if started:
+        _prune(slot.parent)
+
+
+def _prune(session: Path) -> None:
+    """Remove every other session directory idle past `_MEMORY_DAYS`."""
+    import shutil
+
+    cutoff = time.time() - _MEMORY_DAYS * 86400
+    for other in _sessions(session.parent):
+        if other != session and _last_write(other) < cutoff:
+            shutil.rmtree(other, ignore_errors=True)
+
+
+def _sessions(directory: Path) -> list[Path]:
+    try:
+        return list(directory.iterdir())
+    except OSError:
+        return []
+
+
+def _last_write(directory: Path) -> float:
+    """When the session last wrote a record; unknown reads as now, and stays."""
+    try:
+        return directory.stat().st_mtime
+    except OSError:
+        return time.time()
+
+
+def _deliver(payload: dict, lines: list[str]) -> int:
+    """Hand the advisory to the harness that sent the event, or stay silent.
+
+    Claude Code gets three lines of stderr and exit 2, which `asyncRewake`
+    hands the model; its stdout stays empty, because it parses stdout JSON on
+    exit 0. Every other harness gets exit 0 and one JSON object carrying the
+    text under both keys harnesses read: top-level `additionalContext` for
+    Copilot CLI and Cursor, `hookSpecificOutput.additionalContext` for VS Code.
+    """
+    if not lines:
+        return 0
+    text = "\n".join(lines)
+    if not _reads_context(payload):
+        print(text, file=sys.stderr)
+        return 2
+    print(json.dumps({"additionalContext": text,
+                      "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": text}}))
+    return 0
+
+
+def _reads_context(payload: dict) -> bool:
+    """Whether the harness that sent this event reads exit 2 as something
+    other than text for the model, told apart by its own payload: Cursor (a
+    deny) by its camelCase event, VS Code (a blocking error) by its own tool
+    names, Copilot CLI (shown to the user only) by `tool_result`, where Claude
+    Code sends `tool_response`."""
+    return (payload.get("hook_event_name") == "postToolUse"
+            or payload.get("tool_name") in _VSCODE_WRITES
+            or "tool_result" in payload)

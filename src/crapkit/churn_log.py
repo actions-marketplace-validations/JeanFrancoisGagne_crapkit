@@ -19,12 +19,24 @@ only asks which lines open a commit and the churn parser reads either header
 shape, so no reader pays a pass to strip it. And the key records the HEAD the
 log was built from, so a HEAD that grew from it costs `git log cached..HEAD`
 instead of the window — 0.77 s instead of 6.9 s at a day-old HEAD, for the
-same 628k lines. Commit date is not author date: `--since` filters on the
+same 628k lines. Commit date is not author date: the window filters on the
 committer's clock while the recency weight uses the author's, and a rebased
-commit has two different ones. The key also records the cutoff the log was cut
-at, because that cutoff can move back: git's month arithmetic puts 6 months
-before Aug 31 on Mar 3 and before Sep 1 on Mar 1, and a log cut at the later
-cutoff cannot be re-dated to the earlier one.
+commit has two different ones.
+
+The window ends at HEAD's own commit date, never at the wall clock: its cutoff
+is `months` calendar months before that date, so a fixed tree keeps its window,
+and its ranking, forever. `git log --since=12.months.ago` read today's date,
+and a tree measured a year after its last commit had no churn at all. The key
+also records the cutoff the log was cut at, because that cutoff can move back
+when HEAD moves: month arithmetic puts 6 months before Aug 31 on Mar 3 and
+before Sep 1 on Mar 1, and a log cut at the later cutoff cannot be re-dated to
+the earlier one.
+
+The key holds the clone's history depth too (`history_depth`). A sha pins
+which history HEAD reaches, not how much of it the clone holds: `git fetch
+--unshallow` or `--deepen` adds commits under an unmoved HEAD, and a log cut
+from the shallow history would otherwise be served, or carried forward, until
+the UTC date rolled. churn_cache and coupling_cache key on the same depth.
 
 A cache is disposable. An unreadable, torn or unkeyable log reads as cold, never
 as a crash, and a HEAD the cached log is not an ancestor of (a rewind, a rebase,
@@ -32,12 +44,12 @@ a force-push) rebuilds rather than prepends.
 """
 from __future__ import annotations
 
-import codecs
 import json
 import zlib
 from collections.abc import Iterable, Iterator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
+from hashlib import blake2b
 from itertools import chain
 from operator import methodcaller
 from pathlib import Path
@@ -45,17 +57,29 @@ from tempfile import NamedTemporaryFile
 from typing import BinaryIO, NamedTuple
 
 from .errors import GitError
-from .gitio import _git_lines, head_commit, is_ancestor
+from .gitio import _common_dir, _git_dir, _git_lines, commit_time, head_commit, is_ancestor
+from .repotext import lenient_decoder
 
 # Versioned like churn_cache's map, and for the same reason: a version that
 # writes another key shape writes another file, so two installs on one tree
-# both stay warm instead of rewriting each other's key on every run.
-LOG_NAME = "churn-log-v2.z"
-# The name 0.4.4 wrote, with this very key shape. Its pair is adopted where no
-# v2 log stands yet and deleted once one does: a 4.4 MB file nothing will read
-# again is not something to leave in every upgraded repo.
+# both stay warm instead of rewriting each other's key on every run. v3 is the
+# first log cut at a window that ends at HEAD's commit date. The v2 log 0.4.5
+# to 0.8.0 write stays theirs: this version never reads it and never deletes it.
+LOG_NAME = "churn-log-v3.z"
+# The name 0.4.4 wrote. Every release since 0.4.5 deletes it: 0.4.5 to 0.8.0
+# adopted the log under their own name first, and this one cannot adopt a log
+# whose window ended at the wall clock. A 4.4 MB file is not litter to leave.
 LEGACY_NAME = "churn-log.z"
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_SECOND = timedelta(seconds=1)
+# The Gregorian calendar repeats every 400 years: 146,097 days, 4,800 months.
+# months_before folds a date and a count into one cycle from 1970, so it counts
+# exactly past datetime's year 9999 and back past its year 1.
+_CYCLE_SECONDS = 146_097 * 86_400
+_CYCLE_MONTHS = 4_800
 LOG_FORMAT = "--format=%x01%an%x02%at%x02%ct"
+# Names in UTF-8 whatever i18n.logOutputEncoding says: the reader decodes UTF-8.
+_LOG_ARGS = (LOG_FORMAT, "--encoding=UTF-8", "--name-only")
 CHUNK = 1 << 20
 # Characters of log text per compress call and file write. One call and one
 # write per line cost 0.36-0.57 s over a 635k-line log; a megabyte at a time,
@@ -66,12 +90,18 @@ _TRIM = methodcaller("rstrip", "\n")
 # the only kind that joins against ls-files rows when the root sits below the
 # repo top. A key without it names a top-relative log, and that one is cold —
 # served OR refreshed, it would feed every consumer paths that match nothing.
-RELATIVE_PATHS = "root-relative"
+# "-lf": lines end at LF alone. A log laid down before could hold an author
+# name cut at its \r, with the rest read as a path.
+RELATIVE_PATHS = "root-relative-lf"
+# The depth of a clone that holds every commit its HEAD reaches. Keys written
+# before depth joined them carry none and read as this: a full clone laid down
+# nearly every one of them, and a shallow clone keeps no commit table either.
+FULL_HISTORY = "full"
 
 
 class Window(NamedTuple):
-    """The window's log and the --since cutoff it was cut at. The cutoff is None
-    when git would not name one, or when a laid-down log recorded none."""
+    """The window's log and the cutoff it was cut at. The cutoff is None when
+    HEAD has no commit date to anchor on, or when a laid-down log recorded none."""
     lines: Iterator[str]
     cutoff: int | None
 
@@ -95,7 +125,7 @@ def walked_window(root: Path, months: int, head: str | None) -> Window:
     nothing down: for a reader that needs commit dates where no log is on disk
     yet. None walks whatever HEAD is when git starts."""
     cutoff = window_cutoff(root, months, head)
-    return Window(_window_log(root, months, head, cutoff), cutoff)
+    return Window(_window_log(root, head, cutoff), cutoff)
 
 
 # The per-process answers below are shared by the two copies a HEAD move
@@ -118,19 +148,49 @@ def grew_from(root: Path, base: str, head: str) -> bool:
 
 
 def window_cutoff(root: Path, months: int, head: str | None) -> int | None:
-    """git's --since cutoff for the window, the commit date a commit must reach
-    to stay in it; None when git will not name one.
+    """The commit date a commit must reach to stay in the window: `months`
+    before the commit date of `head`, the commit the caller keys its copy on.
+    None reads HEAD. None when there is no commit to anchor on.
 
-    Read once per HEAD and UTC day in a process, so a carry and the refresh
-    after it cut at the same cutoff. The cutoff moves with the clock, so a
-    long-running process reads it again at the next HEAD or the next day, the
-    two things every copy here is keyed on."""
-    return _cutoff_at(root, months, head, _utc_date())
+    The wall clock plays no part, so the same HEAD names the same cutoff on
+    every day and every machine."""
+    stamp = _anchor(root, head)
+    return None if stamp is None else months_before(stamp, months)
+
+
+def months_before(stamp: int, months: int) -> int:
+    """`months` calendar months before `stamp`, in UTC: the same day and time
+    of day, where a day the earlier month lacks runs on into the next, the way
+    git counts "N months ago" (6 months before Aug 31 is Mar 3). 0 when that
+    falls before 1970. Exact at any date: a commit a skewed clock dated past
+    the year 9999 still has a window of `months` months."""
+    cycles, months = divmod(months, _CYCLE_MONTHS)
+    shift = stamp - stamp % _CYCLE_SECONDS
+    cut = shift + _calendar_months_before(stamp - shift, months) - cycles * _CYCLE_SECONDS
+    return max(cut, 0)
+
+
+def _calendar_months_before(stamp: int, months: int) -> int:
+    """months_before for a stamp in 1970-2369 and fewer than 4,800 months,
+    where every date lies inside datetime's range; negative before 1970."""
+    moment = _EPOCH + timedelta(seconds=stamp)
+    year, month = divmod(moment.year * 12 + moment.month - 1 - months, 12)
+    first = moment.replace(year=year, month=month + 1, day=1)
+    return (first + timedelta(days=moment.day - 1) - _EPOCH) // _SECOND
+
+
+def _anchor(root: Path, head: str | None) -> int | None:
+    """The commit date of `head`, or of HEAD when None; None when git has none."""
+    try:
+        return _commit_date(root, head or head_commit(root))
+    except GitError:
+        return None
 
 
 @lru_cache(maxsize=16)
-def _cutoff_at(root: Path, months: int, head: str | None, date: str) -> int | None:
-    return _window_cutoff(root, months)
+def _commit_date(root: Path, commit: str) -> int:
+    """Asked of git once per commit in a process: a commit's date never changes."""
+    return commit_time(root, commit)
 
 
 @lru_cache(maxsize=16)
@@ -154,31 +214,10 @@ def has_cache(root: Path) -> bool:
 
 
 def sweep_legacy(root: Path) -> None:
-    """0.4.4's log pair: renamed onto the v2 names where none stand yet, deleted
-    once they do.
-
-    Adopted rather than validated here — the two key shapes are the same, so the
-    key check downstream decides warm or cold exactly as it would have. Both
-    files go either way, because nothing reads the old names again.
-    """
+    """0.4.4's log pair, deleted, as every release since 0.4.5 deletes it."""
     old = root / ".crapkit" / LEGACY_NAME
-    if not old.is_file():
-        return
-    path = root / ".crapkit" / LOG_NAME
-    if not path.exists() and not _key_path(path).exists():
-        _adopt(old, path)
     _drop(old)
     _drop(_key_path(old))
-
-
-def _adopt(old: Path, path: Path) -> None:
-    """Best effort, and either rename alone is safe: a log without its key reads
-    as cold, and a key without its log reads as cold too."""
-    try:
-        _key_path(old).replace(_key_path(path))
-        old.replace(path)
-    except OSError:
-        return
 
 
 def _drop(path: Path) -> None:
@@ -205,7 +244,7 @@ def _stored_window(root: Path, months: int, head: str | None) -> Window:
     cutoff = window_cutoff(root, months, key["head"])
     source = _refreshed(root, path, stored, key, cutoff)
     if source is None:
-        source = _window_log(root, months, key["head"], cutoff)
+        source = _window_log(root, key["head"], cutoff)
     return Window(_tee(source, path, {**key, "cutoff": cutoff}), cutoff)
 
 
@@ -220,15 +259,67 @@ def _utc_date() -> str:
 
 
 def _cache_key(root: Path, months: int, head: str | None = None) -> dict | None:
-    """Keyed on `head` when the caller read one, else on HEAD now. None when
-    HEAD is unreadable — then there is nothing safe to key on."""
+    """Keyed on `head` when the caller read one, else on HEAD now, and on the
+    clone's history depth. None when HEAD or the depth is unreadable: then
+    there is nothing safe to key on."""
     if head is None:
         try:
             head = head_commit(root)
         except GitError:
             return None
+    depth = history_depth(root)
+    if depth is None:
+        return None
     return {"head": head, "months": months, "date": _utc_date(),
-            "paths": RELATIVE_PATHS}
+            "paths": RELATIVE_PATHS, "depth": depth}
+
+
+def history_depth(root: Path) -> str | None:
+    """How much of HEAD's history this clone holds: FULL_HISTORY, or a digest
+    of git's shallow boundary, or None when the boundary file is there and
+    cannot be read.
+
+    git lists a shallow clone's boundary commits in `shallow` in the common
+    git directory. `git fetch --deepen` rewrites that file and `--unshallow`
+    deletes it, while HEAD stays where it was. Read off disk the way
+    gitio.head_from_refs reads HEAD, since every churn and coupling read keys
+    on it. A root git places nowhere has no boundary to read, and head_commit
+    refuses that root on its own."""
+    common = _common_git_dir(root)
+    return FULL_HISTORY if common is None else _boundary_digest(common / "shallow")
+
+
+def _common_git_dir(root: Path) -> Path | None:
+    """The common git directory, found as HEAD's fast path finds its own, or
+    asked of git when that walk finds none (GIT_DIR set outside the tree)."""
+    gitdir = _git_dir(root)
+    return _common_dir(gitdir) if gitdir is not None else _asked_common_dir(root)
+
+
+@lru_cache(maxsize=16)
+def _asked_common_dir(root: Path) -> Path | None:
+    """git's answer, once per root in a process: where a repository keeps its
+    git directory does not move while a command runs."""
+    try:
+        named = "".join(_git_lines(root, "rev-parse", "--git-common-dir")).strip()
+    except GitError:
+        return None
+    return root / named if named else None
+
+
+def _boundary_digest(path: Path) -> str | None:
+    """FULL_HISTORY when the clone lists no boundary, else a short digest of
+    the list; None when the file is there and cannot be read, which no key
+    may read as either answer."""
+    try:
+        boundary = path.read_bytes()
+    except FileNotFoundError:
+        return FULL_HISTORY
+    except OSError:
+        return None
+    if not boundary.strip():
+        return FULL_HISTORY
+    return "shallow-" + blake2b(boundary, digest_size=8).hexdigest()
 
 
 def _key_path(path: Path) -> Path:
@@ -244,7 +335,14 @@ def _read_key(path: Path) -> dict | None:
 
 
 def _key_fields(doc: dict) -> dict:
-    return {field: doc.get(field) for field in ("head", "months", "date", "paths")}
+    fields = {field: doc.get(field) for field in ("head", "months", "date", "paths")}
+    return {**fields, "depth": _stored_depth(doc)}
+
+
+def _stored_depth(doc: dict):
+    """The depth a laid-down log was cut at; FULL_HISTORY for a key written
+    before depth joined it."""
+    return doc.get("depth", FULL_HISTORY)
 
 
 def _answers(stored: dict | None, key: dict | None) -> bool:
@@ -284,7 +382,7 @@ def _inflate(blob: bytes) -> Iterator[str]:
     the middle of a multi-byte character and author names are full of them.
     """
     dec = zlib.decompressobj()
-    utf8 = codecs.getincrementaldecoder("utf-8")("replace")
+    utf8 = lenient_decoder()
     tail = ""
     for start in range(0, len(blob), CHUNK):
         text = tail + utf8.decode(dec.decompress(blob[start:start + CHUNK]))
@@ -316,9 +414,11 @@ def _refreshable(root: Path, stored: dict | None, key: dict, cutoff: int | None)
 
 
 def _same_window(stored: dict, key: dict) -> bool:
-    """Same months, and root-relative paths: prepending to a top-relative log
-    would stack fresh commits on wrong paths."""
-    return stored.get("months") == key["months"] and stored.get("paths") == key["paths"]
+    """Same months, root-relative paths and the same history depth: prepending
+    to a top-relative log would stack fresh commits on wrong paths, and a log
+    cut from a shallower history lacks commits no range walk brings back."""
+    return (stored.get("months") == key["months"] and stored.get("paths") == key["paths"]
+            and _stored_depth(stored) == key["depth"])
 
 
 def _cutoff_holds(stored: dict, cutoff: int | None) -> bool:
@@ -416,7 +516,7 @@ def _keep(part: BinaryIO, path: Path, stamp: dict) -> None:
         _drop(scratch)
 
 
-def _window_log(root: Path, months: int, head: str | None, cutoff: int | None) -> Iterator[str]:
+def _window_log(root: Path, head: str | None, cutoff: int | None) -> Iterator[str]:
     """The whole window, from git. The expensive one: on a big repo 21 MB of
     text, so it is streamed and never held whole. --relative, because every
     consumer joins these paths against root-relative ls-files rows: log
@@ -429,30 +529,25 @@ def _window_log(root: Path, months: int, head: str | None, cutoff: int | None) -
     sit in a copy keyed on its parent, and the next range walk would add it
     again. Only a caller with no HEAD to key on walks HEAD itself.
 
-    Cut at `cutoff`, the one the caller records, rather than at a second
-    reading of "N months ago": the clock moves between the two, and at a month
-    end it moves the cutoff back. Only when git named no cutoff does the walk
-    read the clock itself."""
-    since = f"--since={months} months ago" if cutoff is None else f"--max-age={cutoff}"
-    return _git_lines(root, "log", "--relative", since, LOG_FORMAT, "--name-only",
+    Cut at `cutoff`, the one the caller records, never at `--since=N months
+    ago`, which git reads against today's date. No cutoff means no commit to
+    anchor the window on, and so nothing in it."""
+    if cutoff is None:
+        return iter(())
+    return _git_lines(root, "log", "--relative", _since(cutoff), *_LOG_ARGS,
                       *([head] if head else []))
+
+
+def _since(cutoff: int) -> str:
+    """The git option that keeps commits dated at or after `cutoff`, in Unix
+    seconds. `@<seconds> +0000` is the one date form git reads as that exact
+    second at any size: git 2.43 for Windows reads `--max-age=<seconds>` as a
+    32-bit int, so a cutoff past 2038-01-19 wrapped and the window listed
+    nothing, and it reads a bare `@<seconds>` through its date parser, which
+    misreads any second past 2099."""
+    return f"--since=@{cutoff} +0000"
 
 
 def _range_log(root: Path, base: str, head: str) -> Iterator[str]:
     """Only what HEAD added on top of the cached log."""
-    return _git_lines(root, "log", "--relative", f"{base}..{head}", LOG_FORMAT, "--name-only")
-
-
-def _window_cutoff(root: Path, months: int) -> int | None:
-    """git's own reading of "N months ago": rev-parse prints the --max-age it would
-    hand rev-list, so a re-dated log expires exactly what a fresh --since would.
-
-    None when git will not answer — and then a refresh would be guessing at the
-    window, which is what the full walk is for.
-    """
-    try:
-        out = "".join(_git_lines(root, "rev-parse", f"--since={months} months ago"))
-    except GitError:
-        return None
-    digits = out.strip().rpartition("=")[2]
-    return int(digits) if digits.isdigit() else None
+    return _git_lines(root, "log", "--relative", f"{base}..{head}", *_LOG_ARGS)

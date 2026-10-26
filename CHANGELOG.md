@@ -1,5 +1,446 @@
 # Changelog
 
+## 0.8.1 — 2026-10-01
+
+0.8.1 fixes what two new test suites found in 0.8.0: one installs crapkit the way the
+docs say, through each channel and into each agent, and one checks every number crapkit
+computes against outside tools and hand tables. Many fixes change how crapkit reads C,
+C++, Objective-C, Java, Swift, Rust, Go, Zig, shell and PowerShell, so scores move under
+analysis version 13, where 0.8.0 wrote 11, and every repo re-seeds its marks once. Others
+name a value nobody measured, where 0.8.0 read it as zero, empty or passing.
+
+Python lanes need coverage.py 7.13.1 or newer (step 1), and several exit codes move (step
+10). The twelve MCP tools keep their names, JSON schema version 1 stays, and `flag`
+gains the value `excluded`. crapkit supports Python 3.14, and lizard is capped at
+`lizard>=1.24.0,<1.25`. Each line below links to its full entry in [crapkit 0.8.1 in
+detail](docs/releases/0.8.1.md).
+
+### Upgrading from 0.8.0
+
+Take these steps in order, the order of [the upgrade guide's
+list](docs/upgrading.md#080-to-081-in-order); steps 1 and 2 come before you upgrade
+crapkit. Each step links the part of the upgrade guide that explains it, and [the detail
+page](docs/releases/0.8.1.md#upgrading-from-080) keeps the full upgrade notes.
+
+1. Upgrade coverage.py where each Python lane runs: `pip install -U "coverage>=7.13.1"`.
+   Coverage 7.6 to 7.13.0 writes no function `start_line`, and 0.8.1 refuses that report
+   at exit 5. [0.8.1 on coverage 7.6 to 7.13.0](docs/upgrading.md#081-on-coverage-76-to-7130)
+2. Run `crapkit doctor --show-files > before-doctor.txt` and `crapkit coverage --export
+   before.tsv`, then run both again after the upgrade and compare the per-scope file
+   counts. 0.8.1 reads every `crapkit.toml` path the same on every OS, so an `[exclude]`
+   glob spelled `src\gen\**` and a `path_prefix` spelled `./api/` now match, a scope path
+   in another letter case matches on a disk that ignores case, and an absolute scope path
+   exits 3.
+   [Config paths](docs/upgrading.md#config-paths-that-081-reads-on-every-os)
+3. On Windows, first stop every crapkit MCP server by closing the agent sessions that run
+   it: a running `crapkit.exe mcp` holds the launcher, and `uv tool upgrade`, `pipx
+   upgrade` under uv and pip 22.3.1 then fail. Upgrade the CLI in every clone with the
+   installer that owns it: the [upgrade table](docs/upgrading.md) has a row for each. The
+   CI install pin, the Action's `uses:` pin and the pre-commit `rev` wait for step 6.
+   [Windows launcher locks](docs/upgrading.md#windows-launcher-locks)
+4. Re-seed each repo once: `crapkit coverage`, then `crapkit ratchet prune`, then
+   `crapkit ratchet seed`. When a failed verify pins the baseline, pass the new run to
+   both: `crapkit ratchet prune --baseline N`, then `crapkit ratchet seed --baseline N`.
+   Until the re-seed, `verify` refuses marks stamped with analysis version 11 at exit 3.
+   The first run analyzes every file again. Once no 0.8.0 runs in a checkout, delete
+   `.crapkit/churn-cache-v2.json`, `.crapkit/churn-log-v2.z`, `.crapkit/churn-log-v2.json`
+   and `.crapkit/coupling-cache-v1.json`, which 0.8.1 never reads.
+   [Measure before changing marks](docs/upgrading.md#measure-before-changing-marks),
+   [Analysis version 13](docs/upgrading.md#analysis-version-13)
+5. Run `crapkit hook-precommit` with nothing staged. Under `pre-commit run --all-files`,
+   the form pre-commit.ci and pre-commit/action run, the hook now judges every tracked
+   file and exits 6 on a function over its ceiling that no mark signs, where 0.8.0 passed
+   at 0. Record the debt it names with `crapkit coverage` and `crapkit ratchet seed`, or
+   decompose those functions, before you move the pre-commit `rev`.
+   [The commit gate in 0.8.1](docs/upgrading.md#the-commit-gate-in-081)
+6. Commit the new marks together with every pin that runs crapkit: the CI install pin,
+   the Action's `uses:` pin and the pre-commit `rev`. 0.8.1's `verify` refuses marks
+   stamped 11 and 0.8.0's refuses marks stamped 13, so a pin that moves alone turns CI
+   red until the other lands.
+   [A team upgrades every reader first](docs/upgrading.md#a-team-upgrades-every-reader-before-the-re-seed-lands)
+7. Before you push that commit, run `crapkit verify`. `ratchet seed` never raises a mark,
+   so each marked function whose CRAP rose under version 13 prints a `RATCHET` line and
+   verify exits 7, even where no diff touched it. An override cannot accept a ratchet
+   regression: raise each such mark in `crapkit-ratchet.tsv` by hand to the score verify
+   prints, and commit it where a reviewer sees it. Once the commit lands, emit any
+   committed `verify --emit-baseline` file again on the default branch: a file 0.8.0
+   wrote holds no failure list, so `verify --baseline-tsv` forgives none of its failures.
+   [0.8.1 on coverage 7.6 to 7.13.0](docs/upgrading.md#081-on-coverage-76-to-7130),
+   [Measure before changing marks](docs/upgrading.md#measure-before-changing-marks)
+8. A config that 0.8.0's `init` wrote names one OS's python. Swap the venv launcher,
+   `.venv\Scripts\python.exe` or `.venv/bin/python`, for `{python:.venv}`, and a bare
+   `python` for `{python}`. 0.8.0 does not know the token and hands it to the shell, where
+   the lane fails at exit 5, so commit the swap only once every clone, the Action's
+   `uses:` pin and the pre-commit `rev` run 0.8.1. To go back to 0.8.0 later, write each
+   token back as its launcher first ([Downgrading](docs/upgrading.md#downgrading)).
+   [The launcher token](docs/configuration.md#the-launcher-token),
+   [Config paths](docs/upgrading.md#config-paths-that-081-reads-on-every-os)
+9. A commit hook written from the 0.8.0 README runs `python -m crapkit` alone and refuses
+   every commit under a pipx or uv tool install. Write it again from
+   [Route 1](README.md#route-1-githookspre-commit-local-not-committed) or
+   [Route 2](README.md#route-2-a-committed-hooks-directory).
+   [Teammates' clones](docs/upgrading.md#teammates-clones)
+10. Read what moves an exit code before you move a CI job:
+    [missing values](docs/upgrading.md#missing-values-that-081-names),
+    [the commit gate](docs/upgrading.md#the-commit-gate-in-081),
+    [text that is not UTF-8](docs/upgrading.md#text-that-is-not-utf-8) and
+    [the rest](docs/upgrading.md#other-exit-codes-that-move-in-081). Three config-path
+    exit codes change. A root on a Windows network share exits 3, a lane whose `cwd` names
+    no directory fails, and a lane fed another checkout's coverage report fails where it
+    passed. A `bash -c` lane that narrows its suite exits 3 at load: drop the positional or
+    set `full_suite = false`. So do a lane name Windows cannot use and two lane names that
+    differ only in case (rename the lane), and an `artifact` that is empty or `.` or a
+    `results_artifact` of `.` (name the report file). The commit hook now scores a staged
+    file with an upper-case extension, such as `src/Tool.PY`, and exits 6 on a function
+    over its ceiling there, where 0.8.0 passed at 0. `test-scoped` refuses a test-named
+    file outside every scope and every test directory at exit 3: move it under a scope's
+    `paths` or into `tests/`. `verify` rounds a hand-typed mark to four decimals.
+    `verify --override` in a repo whose `crapkit.toml` sets no `alert_command` exits 3
+    before any lane runs, where 0.8.0 exited with the verdict's code: set `alert_command`
+    or drop `--override`.
+11. Check what reads crapkit's output. Messages spell a dash as ` - `, `worklist` ends with
+    a `-> next:` line, a no-lane row prints `cov -`, a run with no scored function prints a
+    load of `0.0`, a partial run's `crap_load` counts only the scopes it measured, and
+    SARIF's `$schema` names the docs.oasis-open.org copy. `flag` can read `excluded`, and
+    the coverage summary gains an `excluded` count. An agent loop written against the
+    three-clause stop rule needs a fourth, `scored_changes == 0`; anything else, `null`
+    included, means refresh and ask again. A lane's `artifact` and `results_artifact` sit
+    under `.crapkit/aside/` while it runs, so a lane command that reads or appends to its
+    previous report finds nothing there: write the report fresh each run.
+    [Values that move without an exit code](docs/upgrading.md#values-that-move-without-an-exit-code),
+    [Freshness in 0.8.1](docs/upgrading.md#freshness-in-081)
+12. Upgrade the plugin. In Claude Code, run `claude plugin marketplace update crapkit`,
+    then `claude plugin update crapkit@crapkit --scope user`; a marketplace added with
+    0.8.0's line clones the whole repository, so remove it, add it back with `--sparse
+    .claude-plugin plugin`, and install the plugin again. 0.8.0's README added the Codex
+    marketplace with no `--ref`, so it follows main, and Codex updates the plugin from it
+    when it starts, while a marketplace added at a tag stays at that tag. Move either one:
+    run `codex plugin marketplace remove crapkit`, the README's `codex plugin marketplace
+    add` line at the release's `--ref` and `codex plugin add crapkit@crapkit`, start a new
+    thread, then run `crapkit doctor --plugin-root PATH`. Then restart every MCP session,
+    and start any running `crapkit watch` again: a 0.8.0 watch can end in a traceback at
+    its next rescore. An MCP client that parses answers meets five JSON-RPC answers that
+    move: `params` that are not an object get `-32602`, a `method` that is not a string
+    gets `-32601`, a message with an `id` and nothing to do gets `-32600`, a response the
+    server never asked for gets no reply, and `arguments` that are not an object get a
+    tool result with `isError: true`. A client on MCP `2024-11-05` or `2025-03-26` no
+    longer gets `structuredContent`, and an answer over 7,500 characters carries
+    `truncated`.
+    [Plugin and MCP clients](docs/upgrading.md#plugin-and-mcp-clients),
+    [MCP answers in 0.8.1](docs/upgrading.md#mcp-answers-in-081)
+13. Library callers: `lanes.suite_drops`, `lanes.lane_sources_unchanged` and
+    `lanes.staleness_reads` warn until 0.9.0, and `lanes.uncommitted_changes` raises
+    `GitError` where it returned `[]`. `mutate_pool.run_one` and `run_mutants` return
+    `MutantVerdict`, and a survivor is truthy, so compare with the enum. Other names moved
+    with no warning. [Library callers](docs/upgrading.md#library-callers)
+
+### Scores that move: analysis version 13
+
+These changes move scores and share the one re-seed in step 4. [Analysis version
+13](docs/releases/0.8.1.md#analysis-version-13) sums them up. The accuracy suite declares
+the score moves its corpus shows in two changes. The first, analysis version 12, holds the
+Rust, Go and Zig readers, a `//` comment and a heredoc line that end where their language
+ends them, `crap = ccn` for a function its coverage tool leaves out, and the CRAP cube
+(accuracy change C2). The second, version 13, holds `nesting` and `cognitive` in every
+language and the C family, Java, Swift, shell and PowerShell readers (accuracy change C7).
+
+- [`nesting`](docs/releases/0.8.1.md#nesting-reads-block-depth-in-every-language) comes
+  from crapkit's cognitive pass in every language, as Python's has since 0.5.0, not from
+  lizard's ND column, and
+  [`cognitive`](docs/releases/0.8.1.md#cognitive-complexity-reads-each-languages-own-rules)
+  follows each language's own rules.
+- C, C++ and Objective-C list [the functions lizard hid, invented or
+  misnamed](docs/releases/0.8.1.md#c-c-and-objective-c-functions-that-were-hidden-invented-or-misnamed),
+  such as each function of a libstdc++ header, which 0.8.0 read as one row, [count every
+  declared parameter](docs/releases/0.8.1.md#the-c-family-counts-every-parameter-a-function-declares),
+  and [a C++ reference's `&&`](docs/releases/0.8.1.md#the--of-a-c-reference-decides-nothing)
+  costs nothing. Java lists [the methods lizard
+  hid](docs/releases/0.8.1.md#java-methods-that-were-hidden-invented-or-misnamed) behind
+  an annotated local, an enum constant's body or a text block.
+- Swift gets [rows for the functions lizard
+  hid](docs/releases/0.8.1.md#swift-functions-the-reader-hid-get-their-rows), [counts
+  decisions as the McCabe text
+  does](docs/releases/0.8.1.md#swift-decisions-count-the-way-the-mccabe-text-counts-them)
+  and [reads an interpolation as
+  code](docs/releases/0.8.1.md#a-swift-interpolation-reads-as-code).
+- Rust [reads its own syntax](docs/releases/0.8.1.md#rust-reads-its-own-syntax-not-cs): a
+  signature, a `for` that is no loop and a closure's `||` decide nothing, and [a `#` keeps
+  the rest of its line](docs/releases/0.8.1.md#a-rust--keeps-the-rest-of-its-line).
+- Go and Zig
+  [signatures](docs/releases/0.8.1.md#go-and-zig-signatures-end-where-the-language-ends-them),
+  [blocks and strings](docs/releases/0.8.1.md#go-and-zig-blocks-and-strings-end-where-the-language-ends-them)
+  end where the language ends them, [a Zig switch or a Go
+  `select`](docs/releases/0.8.1.md#switch-prongs-and-select-count-as-the-switch-they-belong-to)
+  counts once in `ccn_mod`, and [Zig's `try`, optional `?` and error-set
+  `||`](docs/releases/0.8.1.md#words-that-decide-nothing-stop-counting) open no nesting
+  level. [A `//` comment](docs/releases/0.8.1.md#a--comment-ends-at-its-line) that ends in
+  a backslash ends at its line outside C, C++ and Objective-C.
+- Shell reads [`(( ))` as C](docs/releases/0.8.1.md#shell-arithmetic-reads-as-c), [the
+  depth of its blocks and the commands inside a quoted
+  substitution](docs/releases/0.8.1.md#shell-reads-the-depth-of-its-blocks-and-the-commands-inside-its-strings)
+  and [a function's whole name](docs/releases/0.8.1.md#shell-keeps-a-functions-whole-name)
+  such as `log::info`, and a name spelled `switch` no longer adds to `ccn_mod` in shell or
+  Python. [A form feed on a heredoc
+  line](docs/releases/0.8.1.md#a-form-feed-on-a-heredoc-line-no-longer-ends-the-heredoc-in-the-shell-reader)
+  no longer ends the heredoc.
+- PowerShell reads [keywords in any case and PowerShell 7's
+  operators](docs/releases/0.8.1.md#powershell-reads-keywords-in-any-case-and-counts-powershell-7s-operators),
+  [functions named with a scope or dots](docs/releases/0.8.1.md#powershell-finds-the-functions-it-lost)
+  and [the decisions inside a quoted
+  subexpression](docs/releases/0.8.1.md#powershell-reads-the-expression-inside-a-quoted-subexpression).
+- [A comment counts one line per LF](docs/releases/0.8.1.md#a-comment-is-one-line-per-lf),
+  and [JavaScript and TypeScript
+  coverage](docs/releases/0.8.1.md#javascript-and-typescript-coverage-stays-with-its-own-function-below-a-lone-cr-or-u2028)
+  stays with its own function below a lone CR or U+2028.
+- [Coverage lands on the function that owns
+  it](docs/releases/0.8.1.md#coverage-lands-on-the-function-that-owns-it): an uncalled
+  arrow reads 0, a function its coverage tool leaves out reads the new flag `excluded` at
+  `crap = ccn`, and [a nested Python
+  function](docs/releases/0.8.1.md#the-coverage-readers-stop-reading-an-absent-field-as-a-value)
+  reads its own coverage.py region.
+- [`crap`](docs/releases/0.8.1.md#every-platform-computes-the-same-crap) cubes `1 - cov`
+  with two products, so Windows and Linux print the same score. Over ccn 1 to 60 and
+  every coverage fraction up to 240ths, 21 scores move by 0.0001.
+- [A source file saved as UTF-16](docs/releases/0.8.1.md#text-that-is-not-utf-8) scores
+  its functions, and in a source that is not UTF-8 an identifier holding a byte cp1252
+  leaves undefined keys by its own name.
+
+### Numbers that move without a version bump
+
+These move a printed value or an order, and no score moves. The ceiling rule also touches
+marks: a mark on a function whose CRAP is exactly its ceiling leaves the marks file at
+the next passing `verify`, and `ratchet seed` no longer writes one.
+
+- [A CRAP exactly at its ceiling](docs/releases/0.8.1.md#a-crap-exactly-at-its-ceiling-reads-ok)
+  reads `ok`,
+  [`est_uncovered_paths`](docs/releases/0.8.1.md#est_uncovered_paths-rounds-the-exact-product)
+  rounds half to even on the exact product, and
+  [`crap_load`](docs/releases/0.8.1.md#the-crap-load-is-the-exact-sum-of-the-scores) is
+  the exact sum of the scores.
+- Ties follow the stated tie-break, not float noise: [equal
+  scores](docs/releases/0.8.1.md#functions-with-the-same-crap-rank-by-their-tie-break),
+  [ratchet regressions that rose by the same
+  amount](docs/releases/0.8.1.md#marks-that-rose-by-the-same-amount-list-in-path-order),
+  [digest lines](docs/releases/0.8.1.md#digest-lines-that-tie-list-by-path), [coupled
+  pairs](docs/releases/0.8.1.md#coupled-pairs-that-tie-rank-by-their-paths) and [batch
+  risks](docs/releases/0.8.1.md#batches-whose-risks-sum-to-the-same-total).
+- [`worklist --batches`](docs/releases/0.8.1.md#batches-are-placed-by-the-risk-of-all-their-rows)
+  places files by the summed risk of their rows, and [parallel
+  lanes](docs/releases/0.8.1.md#parallel-lanes-start-in-the-order-doctor---tune-costs-them)
+  start in the order `doctor --tune` costs them.
+- [The churn window](docs/releases/0.8.1.md#the-churn-window-ends-at-heads-commit-date)
+  counts back from HEAD's commit date on the UTC calendar.
+- [`duplication` and brief's twins](docs/releases/0.8.1.md#near-duplicate-functions)
+  shingle each function from its own lines and read comments by language.
+
+The accuracy suite declares two changes that move none of its corpus scores. The first,
+beside analysis version 12, holds lane reuse and the full-suite guard, the churn window,
+exact ties in batches, coupling and digests, and line ends in the hooks and `mutate`
+(accuracy change C3). The second, beside version 13, holds duplication's shingles and
+comment lines and the PowerShell, shell and Java reader fixes that left its corpus scores
+alone (accuracy change C8).
+
+### Values nobody measured
+
+Thirteen changes that name a missing value can move an exit code, and the [upgrade
+guide](docs/upgrading.md#missing-values-that-081-names) lists each with its old and new
+exit.
+
+- [A lane with no test results](docs/releases/0.8.1.md#a-lane-with-no-test-results-is-not-a-lane-that-ran-0-tests-or-failed-none)
+  no longer reads as a lane that ran 0 tests or failed none, `verify --reuse-artifacts`
+  exits 5 on a junit report it cannot read, and `verify --baseline-tsv` forgives a failure
+  the baseline file recorded.
+- [A missing or empty marks file](docs/releases/0.8.1.md#a-missing-file-record-or-history-is-not-an-empty-one)
+  is judged by the marks last committed, and the gates refuse a changed file that no
+  reader could read, as `UNREAD` at exit 6.
+- [A row no coverage measured](docs/releases/0.8.1.md#a-value-nobody-measured-is-named-not-printed-as-a-fact)
+  carries `unmeasured: true` in `brief`, `next-item` and `rescore`, and a depth-1 clone
+  makes `ratchet report --enforce` with an age or repayment limit exit 4.
+- [The coverage readers](docs/releases/0.8.1.md#the-coverage-readers-stop-reading-an-absent-field-as-a-value)
+  refuse at exit 5 an artifact that lacks a field or a count, and name the file and the
+  field.
+- [A git question that fails](docs/releases/0.8.1.md#a-git-question-that-fails-is-named-and-a-count-names-its-files)
+  is named, and `ratchet prune` no longer drops a renamed file's marks when the commit
+  its renames start from is gone.
+- [A directory that is not a git repository](docs/releases/0.8.1.md#a-repository-git-cannot-use-is-named-not-quoted)
+  exits 4 with one line, where `verify` printed 129 lines of git's usage.
+- [Every file no reader can tokenize](docs/releases/0.8.1.md#every-refused-file-is-counted-and-named-once-per-run)
+  is counted and named once per run, and [the Action's
+  comment](docs/releases/0.8.1.md#the-actions-comment-tells-a-missing-payload-from-an-empty-one)
+  tells a missing worklist or summary from an empty one.
+
+### Lanes, reuse and freshness
+
+- [A lane's staleness](docs/releases/0.8.1.md#a-lanes-staleness-is-about-bytes-it-names-the-files-that-moved-and-a-touch-is-not-one)
+  compares git blob ids, so a `touch` is no change and an edit is.
+- [`--reuse-unchanged`](docs/releases/0.8.1.md#--reuse-unchanged-reuses-a-lane-whose-inputs-did-not-move-and-reruns-one-whose-inputs-did-whatever-gits-diff-skips)
+  reuses a lane across a message-only amend, a rebase or a branch switch that left its
+  inputs alone, and names what moved when it reruns.
+- [A failed attempt's leftover artifact](docs/releases/0.8.1.md#a-failed-lanes-leftover-stays-refused-until-new-bytes-replace-it)
+  stays refused until new bytes replace it, and a kill no longer loses the lane's last
+  artifact.
+- [`scored_changes`](docs/releases/0.8.1.md#scored_changes-says-whether-the-run-still-describes-the-files)
+  counts the scored files that changed since the run, and
+  [`watch`](docs/releases/0.8.1.md#watch-reads-content-and-the-history-caches-know-their-depth)
+  rescores on new bytes, not a new mtime.
+- [A `bash -c` lane](docs/releases/0.8.1.md#a-bash--c-lane-is-judged-by-what-its-payload-runs)
+  is judged by the commands its payload runs, and [the full-suite
+  guard](docs/releases/0.8.1.md#the-lane-guard-reads-a-command-the-way-sh-and-cmdexe-read-it)
+  reads a lane command the way sh and cmd.exe read it.
+- [`test-scoped`](docs/releases/0.8.1.md#test-scoped-reads-a-test-file-the-way-the-scored-corpus-does)
+  runs a file outside every scope only from a test directory, and [brief's
+  `is_test`](docs/releases/0.8.1.md#brief-marks-a-coupled-test-file-by-the-rule-init-and-doctor-read)
+  follows the test-file rule `init` and `doctor` read.
+- [A lane on Linux](docs/releases/0.8.1.md#a-process-that-exits-while-a-lane-stops-no-longer-fails-the-lane)
+  no longer fails when another process exits while it stops, [a lane on
+  macOS](docs/releases/0.8.1.md#a-lane-on-macos-stops-without-a-permission-error) no
+  longer fails with `Operation not permitted` after its tests pass, or under python.org's
+  Python 3.11 and 3.12 with `module 'os' has no attribute 'waitid'`, and [a refused analysis
+  worker](docs/releases/0.8.1.md#a-refused-analysis-worker-no-longer-hangs-the-commands-cleanup)
+  no longer hangs cleanup.
+
+### Paths, text and shells
+
+- [A path](docs/releases/0.8.1.md#a-path-reads-as-the-file-git-names-in-any-spelling-that-names-it)
+  in `crapkit.toml`, on the command line or in a coverage report names the file git
+  names: in another letter case on a disk that ignores case, and in Git Bash or WSL
+  spelling on Windows. `init` writes a lane's python as a launcher token, `{python:.venv}`
+  or `{python}`, which the loader reads for the OS reading the file. A source file whose
+  extension is upper case, such as `src/Tool.PY`, scores and gates as its lower-case twin
+  does. The accuracy suite declares it with step 1's refusal of a coverage.py report
+  without `start_line` (accuracy change C11).
+- [A command at the repository top](docs/releases/0.8.1.md#a-command-at-the-repository-top-is-told-which-root-to-name)
+  names the `--repo` that reaches each `crapkit.toml` below it.
+- [`init`](docs/releases/0.8.1.md#init-reads-packagejson-by-one-json-rule-appends-to-gitignore-as-git-reads-it-and-finishes-a-half-done-init)
+  reads `package.json` the way npm does, appends to `.gitignore` without rewriting its
+  bytes or line ends, and finishes an init that stopped halfway.
+- [A commit, file name, report or MCP frame that is not UTF-8](docs/releases/0.8.1.md#text-that-is-not-utf-8)
+  no longer ends a command in a traceback.
+- [A lone CR](docs/releases/0.8.1.md#a-lone-cr-no-longer-hides-a-changed-function-from-the-gates)
+  no longer moves a changed line off its function in the gates, and [a form
+  feed](docs/releases/0.8.1.md#a-form-feed-no-longer-moves-a-function-in-brief-mutate-and-duplication)
+  no longer moves a function in `brief`, `mutate` or `duplication`.
+- [crapkit's own messages](docs/releases/0.8.1.md#text-reaches-every-shell-and-encoding-intact)
+  are ASCII and quote a path as typed, and [a next step it
+  prints](docs/releases/0.8.1.md#a-command-crapkit-prints-for-the-reader-to-paste-runs-in-git-bash-and-powershell)
+  runs when pasted into Git Bash and PowerShell, and [under
+  uvx](docs/releases/0.8.1.md#running-crapkit-through-uvx) names `uvx crapkit`. Outside
+  uvx, a next step names `crapkit` only when PATH finds this installation's console
+  script, and otherwise the python that runs it (accuracy change C15).
+- [Help, usage errors and MCP results](docs/releases/0.8.1.md#colour-codes-stay-out-of-the-text-a-program-reads)
+  carry no colour codes off a terminal, and [tracked files missing from the working
+  tree](docs/releases/0.8.1.md#the-same-repo-prints-the-same-bytes-on-every-machine) are
+  named in path order.
+- crapkit reads history as git stored it: [`explain
+  --history`](docs/releases/0.8.1.md#explain---history-returns-each-commit-message-as-git-stored-it)
+  returns each commit message as committed,
+  [churn](docs/releases/0.8.1.md#churn-reads-an-author-name-as-one-name-whatever-bytes-it-holds)
+  reads an author name holding a `\r` or `\x02` as one name, and [settings such as
+  `log.showSignature`](docs/releases/0.8.1.md#a-users-log-settings-no-longer-change-what-crapkit-reads-from-history)
+  change nothing.
+- [A Windows process started without `USERPROFILE`](docs/releases/0.8.1.md#a-process-started-without-userprofile-finds-its-home)
+  finds its home, and [a SARIF log's `$schema`](docs/releases/0.8.1.md#a-sarif-log-names-a-schema-uri-that-answers)
+  names a URI that answers.
+
+### doctor
+
+- [`crapkit doctor`](docs/releases/0.8.1.md#doctor-names-the-setups-the-next-command-refuses-and---plugin-root-names-repairs-that-close-the-gap)
+  names the setups the next command refuses: a coverage.py older than 7.13.1, an
+  artifact path that is a directory, a gate git never runs, a merge driver never defined,
+  marks verify refuses, and more than one launcher on PATH. `--plugin-root` names the
+  side that is behind and the command that closes each gap, and [reads every shape of the
+  installer's files](docs/releases/0.8.1.md#doctor---plugin-root-reads-every-shape-of-the-installers-files)
+  without a traceback.
+
+### MCP server
+
+- [`arguments` and `params` that are not objects](docs/releases/0.8.1.md#the-mcp-server-refuses-params-and-arguments-that-are-not-objects-in-words-an-agent-can-act-on)
+  get an answer that names the JSON type they hold, and [a string
+  argument](docs/releases/0.8.1.md#mcp-and-hook-arguments) that starts with `-` reaches
+  the command as a value.
+- [A 0.5.x tool name](docs/releases/0.8.1.md#the-mcp-server-answers-calls-it-used-to-fail)
+  answers with its new name, and Gemini CLI's `wait_for_previous` is dropped.
+- [The server](docs/releases/0.8.1.md#the-mcp-server-finds-the-workspace-when-the-client-starts-it-elsewhere)
+  finds the workspace through the client's `roots`, or Copilot CLI's session record, when
+  the client starts it elsewhere.
+- [Every JSON answer](docs/releases/0.8.1.md#an-mcp-answer-fits-in-one-tool-result) fits in
+  7,500 characters, and [a server that outlives an
+  upgrade](docs/releases/0.8.1.md#a-process-that-outlives-an-upgrade-says-to-restart-it)
+  says to restart it, from the next upgrade on.
+
+### Plugin, hooks and agents
+
+- [Wiring crapkit into your agent](docs/harnesses.md) is a new page with a setup block
+  for each of 27 agents ([detail](docs/releases/0.8.1.md#agents)).
+- [The advisory hook](docs/releases/0.8.1.md#the-advisory-hook-runs-in-every-agent-that-loads-the-plugin)
+  runs in Claude Code, Cursor, GitHub Copilot CLI and VS Code, and Codex gets a manifest
+  of its own. [Codex](docs/releases/0.8.1.md#the-plugin-in-each-agent) no longer offers
+  the onboard skill unasked.
+- [The marketplace lines](docs/releases/0.8.1.md#plugin-installs) clone only the plugin
+  directories, and the Codex line pins the release tag.
+- [`claude-hook`](docs/releases/0.8.1.md#claude-hook-remembers-what-it-judged-and-says-what-it-could-not-judge)
+  remembers what it judged in each session, and [reads a flag it does not
+  know](docs/releases/0.8.1.md#mcp-and-hook-arguments) as a version gap, exiting 0 where
+  it exited 2.
+
+### Install, the gate and the Action
+
+- [The install pages](docs/releases/0.8.1.md#install-upgrade-and-removal) cover PEP 668,
+  the `uvx crapkit` route on Python 3.10, where pip finds no crapkit, a `pip --user`
+  launcher off PATH, Windows launcher locks and removal.
+- [The gate recipes](docs/releases/0.8.1.md#the-gate-recipes-in-readme-and-the-handbook-arm-a-gate-that-runs)
+  run `crapkit`, then `uvx crapkit`, then `python -m crapkit`, and [the commit
+  gate](docs/releases/0.8.1.md#the-commit-gate-finds-the-crapkit-root-below-the-git-top-and-judges-cis---all-files)
+  gates each crapkit root below the git top.
+- [The steps `init` prints](docs/releases/0.8.1.md#the-printed-steps-from-init-reach-a-passing-verify)
+  reach a passing verify.
+- [The Action](docs/releases/0.8.1.md#the-action-finds-its-own-comment-on-every-thread)
+  edits its own comment on every thread, fits GitHub's comment limit and reads a `top`
+  that is not a whole number as 5, and [its
+  `working-directory` input](docs/releases/0.8.1.md#the-github-action-scores-a-crapkit-root-below-the-repository-top)
+  scores a crapkit root below the repository top.
+
+### mutate, ratchet and history
+
+- [`mutate`](docs/releases/0.8.1.md#mutate-keeps-an-operator-its-language-reads-as-one-token-whole)
+  keeps an operator its language reads as one token whole, and [flips `&&` and
+  `||`](docs/releases/0.8.1.md#mutate-flips-a--or--only-where-it-joins-two-operands) only
+  where they join two operands: never in a Rust closure, and never in a C++ reference
+  written against one side, such as `Foo&& x`. It [flips Zig's `and` and
+  `or`](docs/releases/0.8.1.md#mutate-flips-zigs-and-and-or-and-leaves-its--alone) and
+  [Swift's `==` and `===`](docs/releases/0.8.1.md#mutate-flips-swifts--and-), and
+  [recovery](docs/releases/0.8.1.md#recovery-recognizes-an-abandoned-temporary-mutation-run-of-any-size)
+  finds an abandoned mutation run of any size.
+- [`verify`, `ratchet seed` and `runs list`](docs/releases/0.8.1.md#verify-seed-and-runs-list-read-the-run-behind-head-not-another-branchs)
+  read the run behind HEAD, not another branch's, and [marks a newer crapkit
+  wrote](docs/releases/0.8.1.md#marks-a-newer-crapkit-wrote-are-sent-to-an-upgrade-not-a-re-seed)
+  send the reader to an upgrade.
+- [The merge driver](docs/releases/0.8.1.md#a-missing-file-record-or-history-is-not-an-empty-one)
+  merges two branches that each created `crapkit-ratchet.tsv`, where it refused, and [a
+  uvx clone](docs/releases/0.8.1.md#running-crapkit-through-uvx) gets a driver line git
+  can start.
+- [A claim taken before analysis version 11](docs/releases/0.8.1.md#a-claim-taken-before-analysis-version-11-keeps-holding-its-nested-def)
+  keeps holding its nested def.
+- [crapkit stops at exit 5](docs/releases/0.8.1.md#crapkit-stops-before-it-stores-or-prints-a-number-that-breaks-its-definition)
+  before it stores or prints a number that breaks its documented bound, and [the field
+  definitions](docs/releases/0.8.1.md#the-field-definitions-say-what-the-code-computes)
+  say what the code computes.
+
+### For contributors
+
+CI runs on macOS and on Python 3.14, a deploy suite installs crapkit the way the docs
+say, and a calculation-accuracy suite checks every number crapkit computes against
+outside tools. [For contributors](docs/releases/0.8.1.md#for-contributors) and [CI, tests
+and release tooling](docs/releases/0.8.1.md#ci-tests-and-release-tooling) have the
+detail. The accuracy suite's change log records this release's fixes as C2, C3, C7, C8,
+C11 and C15.
+The weekly mutation run passes both floors over each whole group: the calculation modules
+score 97.99% against 95% and the lizard readers 92.28% against 85%. Each shard also judges
+the floors over its own modules, so shard 6, whose one reader is lizardjava.py at 82.92%,
+reports the readers floor below. The run also fails its survivor set outside the floors;
+[For contributors](docs/releases/0.8.1.md#for-contributors) says what 0.9.0 does about
+both.
+
 ## 0.8.0 — 2026-09-23
 
 The Python reader moves to analysis version 11, so every repo re-seeds its marks once.
@@ -2130,11 +2571,11 @@ a number edited by hand fails the suite.
 ## 0.4.7 — 2026-08-31
 
 One contributed capability and three fixes. The capability is the per-edit advisory,
-which now hears writes that arrive through a shell: PR #45, from @nicolaschapados. The
-three fixes are #42, #43 and #44, filed off the review of PR #41, the incident report of
-his that became 0.4.6. They are a lane refusal that named the wrong cause, a cause line
-hoisted out of a superseded retry attempt, and a commented `init` template that handed
-back the environment bug the live lane no longer has. Nothing here is required of a
+which now hears writes that arrive through a shell: PR #45. The three fixes are #42,
+#43 and #44, filed off the review of PR #41, the incident report that became 0.4.6. They
+are a lane refusal that named the wrong cause, a cause line hoisted out of a superseded
+retry attempt, and a commented `init` template that handed back the environment bug the
+live lane no longer has. Nothing here is required of a
 consumer on upgrade; [Upgrading from 0.4.6](#upgrading-from-046) at the end of this
 section has the one thing you may want to choose.
 
@@ -2248,11 +2689,11 @@ start.
 
 ## 0.4.6 — 2026-08-31
 
-Three findings from @nicolaschapados, out of one incident on a real pytest/uv project
-checked out twice through git worktrees. The incident was not a crapkit bug: the shell
-held checkout B's venv while crapkit ran in checkout A, and B's editable install pointed
-pytest at B's sources. What crapkit owns is that it made the cause hard to find, and was
-one step away from reporting a confident wrong answer instead.
+Three findings out of one incident on a real pytest/uv project checked out twice through
+git worktrees. The incident was not a crapkit bug: the shell held checkout B's venv while
+crapkit ran in checkout A, and B's editable install pointed pytest at B's sources. What
+crapkit owns is that it made the cause hard to find, and was one step away from reporting
+a confident wrong answer instead.
 
 ### Reading a failed lane
 Every no-artifact refusal now carries `full log: <path>` before the tail it quotes, the
@@ -2373,11 +2814,11 @@ lines too; [docs/lanes.md](docs/lanes.md) has the section.
 
 A fix release with no new capability: an audit of 0.4.4 through six lenses, with every
 finding reproduced twice; a benchmark of every subsystem at consumer scale; and the
-field reports from the CodingGraph pilot. The audit filed issues #24 and #25; the pilot
-filed #26 through #31 and #37 and sent the pull requests that closed them, #32 through
-#40 (PR #23, from @nicolaschapados, was 0.4.4, not this release). After upgrading, run
-`crapkit ratchet seed` once, then read [Upgrading from 0.4.4](#upgrading-from-044) at
-the end of this section for the five other things that change.
+field reports from a pilot. The audit filed issues #24 and #25; the pilot filed #26
+through #31 and #37 and sent the pull requests that closed them, #32 through #40 (PR #23
+was 0.4.4, not this release). After upgrading, run `crapkit ratchet seed` once, then read
+[Upgrading from 0.4.4](#upgrading-from-044) at the end of this section for the five other
+things that change.
 
 ### Windows and lane commands
 0.4.4 taught the lane guard cmd.exe's quoting, with two gaps: a quote that opens
@@ -2595,7 +3036,7 @@ skill routes the pytest half of "no coverage provider" to the pytest docs.
 
 ## 0.4.4 — 2026-08-29
 
-Three field fixes from @nicolaschapados (PR #23) against a real pytest/uv project,
+Three field fixes (PR #23) against a real pytest/uv project,
 plus the Windows half of the first one. No new capability.
 
 ### The lane guard reads a command line like the shell does

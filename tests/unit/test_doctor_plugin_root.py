@@ -22,13 +22,18 @@ from pathlib import Path
 
 import pytest
 
+from uvx_process import as_uvx
+
 import crapkit
 from crapkit.cli import admin, main
 from crapkit.doctor import plugin_handshake
 
 CLI = crapkit.__version__
 REPO_PLUGIN = Path(__file__).resolve().parent.parent.parent / "plugin"
-ON_PATH = "/usr/local/bin/crapkit"
+# A directory no machine has: doctor names the interpreter it finds beside the
+# launcher, and the macOS runner's /usr/local/bin holds Homebrew's python3, so
+# /usr/local/bin/crapkit printed `/usr/local/bin/python3 -m pip` there.
+ON_PATH = "/crapkit-test-absent/bin/crapkit"
 # The memoized original, held before the autouse stub replaces the name. Its
 # `__wrapped__` is the uncached function, which is what the two probe tests below
 # drive: they set a PATH of their own and a cached answer would ignore it.
@@ -107,13 +112,21 @@ def test_the_plugin_this_repo_ships_matches_the_cli_it_ships_with(capsys):
 
 def test_a_version_gap_is_one_line_naming_both_numbers(tmp_path, capsys):
     """A reader holding one line has to be able to act on it, so the line says
-    which two versions disagree and how to close the gap from either side."""
+    which two versions disagree, which side is behind, and the commands that
+    move that side.
+
+    A plugin behind the CLI is already installed, and `claude plugin install`
+    on it only answers so (Claude Code 2.1.281): the same doctor line came back
+    after it. The marketplace refresh and `claude plugin update` the README runs
+    after an upgrade are what move it."""
     code, lines, err = check(plugin(tmp_path / "p", version="0.1.0"), capsys)
 
     assert (code, err) == (1, "")
     assert len(lines) == 1, lines
     assert "0.1.0" in lines[0] and CLI in lines[0], lines[0]
-    assert "claude plugin install crapkit@crapkit" in lines[0], lines[0]
+    assert "`claude plugin marketplace update crapkit`" in lines[0], lines[0]
+    assert "`claude plugin update crapkit@crapkit --scope user`" in lines[0], lines[0]
+    assert "claude plugin install" not in lines[0], lines[0]
 
 
 def test_a_protocol_this_cli_does_not_answer_is_one_line(tmp_path, capsys):
@@ -143,7 +156,9 @@ def test_a_root_with_no_manifest_names_the_file_it_wanted(tmp_path, capsys):
 
     assert code == 1
     assert lines == [f"crapkit doctor: the plugin at {tmp_path / 'p'} has no "
-                     ".claude-plugin/plugin.json"], lines
+                     ".claude-plugin/plugin.json, so it is no plugin root; name the plugin root or a "
+                     "directory above it, or run `crapkit doctor --plugin-root` with no PATH to "
+                     "check the installs Claude Code and Codex recorded."], lines
 
 
 def test_a_plugin_with_no_hooks_file_registers_no_advisory_and_says_so(tmp_path, capsys):
@@ -153,26 +168,21 @@ def test_a_plugin_with_no_hooks_file_registers_no_advisory_and_says_so(tmp_path,
     assert len(lines) == 1 and "hooks/hooks.json" in lines[0], lines
 
 
-def test_an_unparseable_manifest_reads_as_a_missing_one(tmp_path, capsys):
-    """`doctor` reports; it does not raise. A half-written plugin.json in a
-    plugin cache must not end this command in a traceback."""
-    root = plugin(tmp_path / "p")
-    _write(root / ".claude-plugin" / "plugin.json", "{not json")
-
-    code, lines, _ = check(root, capsys)
-
-    assert code == 1
-    assert len(lines) == 1 and ".claude-plugin/plugin.json" in lines[0], lines
-
-
 @pytest.mark.parametrize("hooks", [
     {"hooks": []},
+    {"hooks": None},
     {"hooks": {"PostToolUse": 1}},
+    {"hooks": {"PostToolUse": None}},
     {"hooks": {"PostToolUse": [None]}},
+    {"hooks": {"PostToolUse": [{"hooks": None}]}},
     {"hooks": {"PostToolUse": [{"hooks": [None]}]}},
+    {"hooks": {"PostToolUse": [{"hooks": [{"args": None}]}]}},
     {"hooks": {"PostToolUse": [{"hooks": [{"args": "--protocol 1"}]}]}},
     {"hooks": {"PostToolUse": [{"hooks": [{"args": ["--protocol", []]}]}]}},
-])
+    [],
+], ids=["hooks-a-list", "hooks-null", "event-a-number", "event-null", "matcher-null",
+        "matcher-hooks-null", "handler-null", "args-null", "args-a-string",
+        "args-holding-a-list", "top-level-list"])
 def test_malformed_hook_shapes_report_the_file_without_crashing(tmp_path, capsys, hooks):
     root = plugin(tmp_path / "p")
     _write(root / "hooks" / "hooks.json", hooks)
@@ -322,13 +332,53 @@ def test_no_path_honours_the_installer_s_record(tmp_path, capsys, monkeypatch):
 def test_no_path_and_no_install_is_one_line_naming_where_it_looked(tmp_path, capsys,
                                                                    monkeypatch):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
 
     code = main(["doctor", "--plugin-root"])
     lines = capsys.readouterr().out.splitlines()
 
     assert code == 1 and len(lines) == 1, lines
-    assert str(tmp_path / "plugins") in lines[0], lines[0]
-    assert "claude plugin install crapkit@crapkit" in lines[0], lines[0]
+    assert lines[0] == (
+        f"crapkit doctor: no installed crapkit plugin under {tmp_path / 'plugins'} or "
+        f"{tmp_path / 'codex'}. Claude Code installs it with `claude plugin marketplace add "
+        "JeanFrancoisGagne/crapkit --sparse .claude-plugin plugin`, then `claude plugin install "
+        "crapkit@crapkit`; Codex with `codex plugin marketplace add "
+        f"https://github.com/JeanFrancoisGagne/crapkit.git --ref v{CLI} --sparse .claude-plugin "
+        "--sparse plugin`, then `codex plugin add crapkit@crapkit`. For a plugin kept anywhere "
+        "else, pass --plugin-root PATH.")
+
+
+def test_no_path_and_no_claude_code_install_checks_codex_s_cache(tmp_path, capsys, monkeypatch):
+    """A Codex-only machine ran `doctor --plugin-root` and was told to install
+    the plugin with Claude Code."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    root = plugin(tmp_path / "codex" / "plugins" / "cache" / "crapkit" / "crapkit" / CLI)
+
+    code = main(["doctor", "--plugin-root"])
+    out = capsys.readouterr()
+
+    assert (code, out.err) == (0, "")
+    assert out.out.splitlines() == [f"crapkit doctor: checking {root}"], out.out
+
+
+def test_no_path_looks_under_the_user_home_without_home_variables(capsys, monkeypatch,
+                                                                  without_home_variables):
+    """With no CLAUDE_CONFIG_DIR and no USERPROFILE, `doctor --plugin-root` died
+    on `RuntimeError: Could not determine home directory.` instead of looking
+    where Claude Code keeps this user's plugins. The installs are stubbed away
+    so the answer does not depend on what this machine has installed."""
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setattr(admin, "_recorded_installs", lambda plugins: [])
+    monkeypatch.setattr(admin, "_manifest_roots", lambda under: [])
+
+    code = main(["doctor", "--plugin-root"])
+    lines = capsys.readouterr().out.splitlines()
+
+    assert code == 1 and len(lines) == 1, lines
+    assert str(without_home_variables / ".claude" / "plugins") in lines[0], lines[0]
+    assert str(without_home_variables / ".codex") in lines[0], lines[0]
 
 
 def test_a_cache_shared_with_other_plugins_yields_crapkit_not_the_highest_version(tmp_path,
@@ -370,7 +420,9 @@ def test_a_path_with_no_manifest_anywhere_under_it_still_names_the_file(tmp_path
 
     assert code == 1
     assert lines == [f"crapkit doctor: the plugin at {tmp_path / 'empty'} has no "
-                     ".claude-plugin/plugin.json"], lines
+                     ".claude-plugin/plugin.json, so it is no plugin root; name the plugin root or a "
+                     "directory above it, or run `crapkit doctor --plugin-root` with no PATH to "
+                     "check the installs Claude Code and Codex recorded."], lines
 
 
 # --- the CLI the hook will spawn, not the one this check runs in ---------------
@@ -422,6 +474,49 @@ def test_no_crapkit_on_path_is_a_fail_naming_what_cannot_start(tmp_path, capsys,
     assert "PATH" in lines[0], lines[0]
 
 
+def _launcher(directory: Path) -> Path:
+    directory.mkdir(parents=True)
+    launcher = directory / ("crapkit.exe" if os.name == "nt" else "crapkit")
+    launcher.write_bytes(b"")
+    return launcher
+
+
+def test_no_crapkit_on_path_names_the_directory_that_holds_this_crapkits_launcher(tmp_path, capsys,
+                                                                                 monkeypatch):
+    """pip --user puts the launcher in ~/.local/bin or %APPDATA%\\Python\\PythonXY\\Scripts,
+    which most PATHs lack, and the plugin then shows `Failed to connect`. The
+    doctor a user runs by its full path, or as `python -m crapkit`, knows which
+    directory its own launcher sits in, so the FAIL names it."""
+    scripts = _launcher(tmp_path / "user" / "bin").parent
+    monkeypatch.setattr(admin, "_spawned_cli", lambda: None)
+    monkeypatch.setattr(admin, "_launcher_dirs", lambda: [tmp_path / "venv" / "bin", scripts])
+
+    code, lines, _ = check(plugin(tmp_path / "p"), capsys)
+
+    assert code == 1 and len(lines) == 1, lines
+    assert lines[0].endswith(f"This crapkit's launcher is in {scripts}, which PATH does not list: add that "
+                             "directory to PATH, then restart the agent."), lines[0]
+    assert "(`pipx install crapkit`)" in lines[0], "the other way out stays on the line"
+
+
+def test_no_launcher_beside_this_crapkit_leaves_the_fail_as_it_was(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(admin, "_spawned_cli", lambda: None)
+    monkeypatch.setattr(admin, "_launcher_dirs", lambda: [tmp_path / "nothing-here"])
+
+    code, lines, _ = check(plugin(tmp_path / "p"), capsys)
+
+    assert code == 1 and lines[0].endswith("or point the plugin at the environment holding it."), lines[0]
+
+
+def test_the_launcher_dirs_are_this_interpreters_scripts_then_the_user_schemes():
+    import sysconfig
+
+    user = sysconfig.get_preferred_scheme("user")
+
+    assert admin._launcher_dirs() == [Path(sysconfig.get_path("scripts")),
+                                      Path(sysconfig.get_path("scripts", user))]
+
+
 def test_the_probe_reads_the_version_off_the_executable_it_found(tmp_path, monkeypatch):
     """The resolution itself, against a real shim: which() picks it up and the
     number comes back off its own `--version`, not out of this process."""
@@ -440,6 +535,37 @@ def test_an_empty_path_resolves_no_crapkit_at_all(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", str(empty))
 
     assert RESOLVE.__wrapped__() is None
+
+
+def _uvx_process(tmp_path: Path, monkeypatch) -> Path:
+    """This process as `uvx crapkit` starts it, with uvx's launcher in the
+    cached environment's bin. Returns that bin, which uv put first on this
+    process's PATH and on no other."""
+    own = as_uvx(tmp_path, monkeypatch)
+    _crapkit_shim(own, CLI)
+    return own
+
+
+def test_the_launcher_uvx_put_on_this_process_path_is_no_crapkit_on_path(tmp_path,
+                                                                         monkeypatch):
+    """`uvx crapkit doctor --plugin-root` found its own cached launcher on the
+    PATH uvx built for it, and passed with exit 0 on a machine whose shell had
+    no crapkit. The hook starts from the PATH Claude Code hands it, which uvx
+    never touched, so every edit fired a command that could not start."""
+    monkeypatch.setenv("PATH", str(_uvx_process(tmp_path, monkeypatch)))
+
+    assert RESOLVE.__wrapped__() is None
+
+
+def test_under_uvx_the_crapkit_installed_beyond_the_cache_answers(tmp_path, monkeypatch):
+    own = _uvx_process(tmp_path, monkeypatch)
+    _crapkit_shim(tmp_path / "tools", "9.9.9")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(own), str(tmp_path / "tools")]))
+
+    executable, version = RESOLVE.__wrapped__()
+
+    assert Path(executable).parent == tmp_path / "tools", executable
+    assert version == "9.9.9", version
 
 
 def test_an_executable_that_cannot_run_has_no_observed_version(tmp_path):
@@ -475,3 +601,252 @@ def test_a_zero_exit_is_still_read_for_its_version(tmp_path):
     name = "crapkit.bat" if os.name == "nt" else "crapkit"
 
     assert admin._probed_cli_version(str(tmp_path / "ok" / name)) == "9.9.9"
+
+
+# --- installed_plugins.json in every shape it arrives in -----------------------
+#
+# Claude Code writes V2, a list of installs per plugin id. An older Claude Code
+# wrote V1, one object per id, and a newer one converts it only when it loads
+# the file, so a config directory it has not loaded since still holds V1. Only
+# the top level was type-checked, and V1 or a hand edit ended the command meant
+# to diagnose the plugin in a traceback. A record naming a string installPath
+# is honoured; any other entry records nothing and the cache scan decides.
+
+def _records(recorded: str) -> dict:
+    v2 = {"plugins": {"crapkit@crapkit": [{"installPath": recorded, "version": CLI}]}}
+    return {
+        "v2-list-of-installs": (v2, "recorded"),
+        "v1-object-per-plugin": ({"version": 1, "plugins": {"crapkit@crapkit": {
+            "installPath": recorded, "version": CLI}}}, "recorded"),
+        "v1-object-without-installPath": ({"version": 1, "plugins": {"crapkit@crapkit": {
+            "version": CLI}}}, "cache"),
+        "plugins-null": ({"plugins": None}, "cache"),
+        "plugins-a-list": ({"plugins": []}, "cache"),
+        "plugins-absent": ({}, "cache"),
+        "installs-null": ({"plugins": {"crapkit@crapkit": None}}, "cache"),
+        "installs-empty-list": ({"plugins": {"crapkit@crapkit": []}}, "cache"),
+        "install-entry-null": ({"plugins": {"crapkit@crapkit": [None]}}, "cache"),
+        "install-entry-a-string": ({"plugins": {"crapkit@crapkit": [recorded]}}, "cache"),
+        "installPath-null": ({"plugins": {"crapkit@crapkit": [{"installPath": None}]}}, "cache"),
+        "installPath-a-number": ({"plugins": {"crapkit@crapkit": [{"installPath": 5}]}}, "cache"),
+        "another-plugins-entry-malformed": ({"plugins": {"other@vendor": None, **v2["plugins"]}},
+                                            "recorded"),
+        "top-level-list": ([], "cache"),
+        "not-json": ("{not json", "cache"),
+        "empty-file": ("", "cache"),
+        # Claude Code parses the file with Node's JSON.parse, which refuses a
+        # byte-order mark, so it cannot follow the record either.
+        "utf8-bom-before-v2": ("﻿" + json.dumps(v2), "cache"),
+    }
+
+
+@pytest.mark.parametrize("shape", list(_records("")))
+def test_no_path_reads_every_shape_of_the_installer_s_record(tmp_path, capsys, monkeypatch, shape):
+    """The config directory and the recorded install both sit under non-ASCII
+    names, so every shape also runs the non-ASCII case. The recorded install is
+    this CLI's version and the cached one is older, so the first line says which
+    of the two the record led to."""
+    config = tmp_path / "config-é"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    recorded = plugin(tmp_path / "elsewhere-ü" / "crapkit-plugin")
+    cached = plugin(config / "plugins" / "cache" / "crapkit" / "crapkit" / "0.0.1", version="0.0.1")
+    payload, expected = _records(str(recorded))[shape]
+    _write(config / "plugins" / "installed_plugins.json", payload)
+
+    code = main(["doctor", "--plugin-root"])
+    out = capsys.readouterr()
+
+    checked = recorded if expected == "recorded" else cached
+    assert out.err == ""
+    assert out.out.splitlines()[0] == f"crapkit doctor: checking {checked}"
+    assert code == (0 if checked == recorded else 1)
+
+
+# --- a manifest that parses and names no usable version -------------------------
+
+# The repair doctor names for a plugin Claude Code installed at user scope.
+CLAUDE_REINSTALL = ("reinstall it with `claude plugin uninstall crapkit@crapkit --scope user`, then "
+                    "`claude plugin install crapkit@crapkit --scope user`, and restart Claude Code's "
+                    "sessions")
+#
+# A plugin.json whose version is null, absent, a number or a list read as a
+# missing plugin.json, or, where installs were ranked by version, ended the
+# command in a TypeError.
+
+@pytest.mark.parametrize("version", [None, 0.8, ["0", "8"], "absent"],
+                         ids=["version-null", "version-a-number", "version-a-list", "version-absent"])
+def test_a_manifest_with_no_version_string_says_so(tmp_path, capsys, version):
+    root = plugin(tmp_path / "p")
+    manifest = {"name": "crapkit"} if version == "absent" else {"name": "crapkit", "version": version}
+    _write(root / ".claude-plugin" / "plugin.json", manifest)
+
+    code, lines, err = check(root, capsys)
+
+    assert (code, err) == (1, "")
+    assert lines == [f"crapkit doctor: the plugin at {root} has a .claude-plugin/plugin.json with no "
+                     f"version string, so it has no version to compare; {CLAUDE_REINSTALL}."], lines
+
+
+@pytest.mark.parametrize("manifest", ["{not json", "[]", "\"crapkit\""],
+                         ids=["not-json", "top-level-list", "top-level-string"])
+def test_a_manifest_that_is_not_an_object_names_the_file_it_found(tmp_path, capsys, manifest):
+    """`doctor` reports; it does not raise. A half-written plugin.json in a
+    plugin cache must not end this command in a traceback, and must not read
+    as a missing file either, since the file is there to repair."""
+    root = plugin(tmp_path / "p")
+    _write(root / ".claude-plugin" / "plugin.json", manifest)
+
+    code, lines, err = check(root, capsys)
+
+    assert (code, err) == (1, "")
+    assert lines == [f"crapkit doctor: the plugin at {root} has a .claude-plugin/plugin.json that is "
+                     f"not a JSON object, so it has no version to compare; {CLAUDE_REINSTALL}."], lines
+
+
+def test_a_manifest_whose_name_is_null_is_still_checked_by_version(tmp_path, capsys):
+    root = plugin(tmp_path / "p")
+    _write(root / ".claude-plugin" / "plugin.json", {"name": None, "version": CLI})
+
+    assert check(root, capsys) == (0, [], "")
+
+
+@pytest.mark.parametrize("version", [0.9, ["0", "9"], None], ids=["a-number", "a-list", "null"])
+def test_ranking_installs_passes_over_a_version_that_is_not_a_string(tmp_path, capsys, version):
+    cache = tmp_path / "cache" / "crapkit" / "crapkit"
+    good = plugin(cache / CLI)
+    odd = plugin(cache / "odd")
+    _write(odd / ".claude-plugin" / "plugin.json", {"name": "crapkit", "version": version})
+
+    code, lines, err = check(tmp_path / "cache", capsys)
+
+    assert (code, err) == (0, "")
+    assert lines == [f"crapkit doctor: checking {good}"], lines
+
+
+# --- the repair the gap line names ------------------------------------------------
+#
+# One fixed line named `claude plugin install crapkit@crapkit` and `pip install -U
+# crapkit` for every gap. Over an older install the first prints "already
+# installed" and moves nothing; the second reaches no uv tool or pipx install; and
+# a plugin Codex installed got two commands a Codex-only machine does not have.
+
+def _gap(tmp_path: Path, capsys, *, version: str, under: str = "p") -> str:
+    code, lines, err = check(plugin(tmp_path / under, version=version), capsys)
+    assert (code, err, len(lines)) == (1, "", 1), lines
+    return lines[0]
+
+
+def _head(where: Path, version: str) -> str:
+    return (f"crapkit doctor: the plugin at {where} is version {version}, and the crapkit its "
+            f"hooks spawn ({ON_PATH}) is {CLI}.")
+
+
+def test_a_claude_code_plugin_behind_the_cli_names_the_update_lines(tmp_path, capsys):
+    line = _gap(tmp_path, capsys, version="0.0.1")
+
+    assert line == (_head(tmp_path / "p", "0.0.1") + " The plugin is behind; update it with "
+                    "`claude plugin marketplace update crapkit`, then `claude plugin update "
+                    "crapkit@crapkit --scope user`, and restart Claude Code's sessions.")
+
+
+def test_a_cli_behind_the_plugin_names_the_upgrade_for_the_installer_that_owns_it(tmp_path, capsys,
+                                                                                   monkeypatch):
+    launcher = tmp_path / "share" / "uv" / "tools" / "crapkit" / "bin" / "crapkit"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(admin, "_spawned_cli", lambda: (str(launcher), CLI))
+
+    code, lines, _ = check(plugin(tmp_path / "p", version="99.0.0"), capsys)
+
+    assert code == 1
+    assert lines == [f"crapkit doctor: the plugin at {tmp_path / 'p'} is version 99.0.0, and the "
+                     f"crapkit its hooks spawn ({launcher}) is {CLI}. The CLI is behind; upgrade "
+                     "it with `uv tool upgrade crapkit`."], lines
+
+
+CODEX_CACHE = Path(".codex") / "plugins" / "cache" / "crapkit" / "crapkit"
+
+
+def test_a_codex_plugin_behind_the_cli_names_codex_s_refresh_and_no_claude_command(tmp_path, capsys):
+    line = _gap(tmp_path, capsys, version="0.0.1", under=str(CODEX_CACHE / "0.0.1"))
+
+    assert line == (_head(tmp_path / CODEX_CACHE / "0.0.1", "0.0.1") + " The plugin is behind; "
+                    "update it with `codex plugin marketplace remove crapkit`, then `codex plugin "
+                    "marketplace add https://github.com/JeanFrancoisGagne/crapkit.git --ref "
+                    f"v{CLI} --sparse .claude-plugin --sparse plugin`, then `codex plugin add "
+                    "crapkit@crapkit`, and start a new Codex task.")
+
+
+def test_the_codex_refresh_adds_the_marketplace_the_way_the_readme_does(tmp_path, capsys):
+    """A Codex marketplace added at a release tag stays at it, so `codex plugin
+    marketplace upgrade` moves nothing; the refresh adds it again at the CLI's
+    tag with the README's own line."""
+    from test_plugin_install_lines import CODEX_ADD, _sparse
+
+    line = _gap(tmp_path, capsys, version="0.0.1", under=str(CODEX_CACHE / "0.0.1"))
+    readme_line = f"{CODEX_ADD} --ref v{CLI}" + "".join(f" --sparse {p}" for p in _sparse())
+
+    assert f"`{readme_line}`" in line, line
+    assert "marketplace upgrade" not in line, line
+
+
+def test_a_codex_plugin_ahead_of_the_cli_names_no_claude_command(tmp_path, capsys):
+    line = _gap(tmp_path, capsys, version="99.0.0", under=str(CODEX_CACHE / "99.0.0"))
+
+    assert "claude" not in line
+    assert line.endswith("The CLI is behind; upgrade it with `python -m pip install --upgrade crapkit`.")
+
+
+def test_a_plugin_under_codex_home_is_codex_s_wherever_that_is(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "agents"))
+
+    line = _gap(tmp_path, capsys, version="0.0.1", under="agents/plugins/cache/crapkit/crapkit/0.0.1")
+
+    assert "`codex plugin marketplace remove crapkit`" in line and "`claude " not in line
+
+
+@pytest.mark.parametrize("version", ["0.9.0.dev3", "0.8.1+local", "1.0.0rc1"])
+def test_versions_that_do_not_order_plainly_name_both_repairs(tmp_path, capsys, version):
+    line = _gap(tmp_path, capsys, version=version)
+
+    assert line == (_head(tmp_path / "p", version) + " Update whichever is behind: the plugin "
+                    "with `claude plugin marketplace update crapkit`, then `claude plugin update "
+                    "crapkit@crapkit --scope user`; the CLI with `python -m pip install --upgrade "
+                    "crapkit`.")
+
+
+# --- what --help promises ------------------------------------------------------------------
+
+def _doctor_help(capsys) -> str:
+    with pytest.raises(SystemExit):
+        main(["doctor", "--help"])
+    return " ".join(capsys.readouterr().out.split())
+
+
+def test_the_help_says_where_a_bare_plugin_root_looks_and_what_it_names(capsys):
+    """The help said "the newest crapkit install in Claude Code's plugin cache"
+    after doctor learned to check a local directory marketplace in place and to
+    fall back to Codex's cache, and it named no repairs."""
+    text = _doctor_help(capsys)
+
+    assert "check an installed crapkit plugin, Claude Code's or Codex's," in text
+    assert ("with no PATH, every install Claude Code recorded, one per scope and version (a "
+            "local directory marketplace is checked in that directory, where Claude Code loads "
+            "it), else the newest in Claude Code's plugin cache, else the newest in Codex's") in text
+    assert "each line names the command that closes it" in text
+
+
+def test_the_help_says_what_an_agreeing_check_prints(tmp_path, capsys):
+    """The help said "silent when they agree", and a root doctor found under
+    the PATH given, rather than the root itself, printed `crapkit doctor:
+    checking ROOT` on agreement."""
+    cache = tmp_path / "cache" / "crapkit" / "crapkit"
+    plugin(cache / CLI)
+
+    code, lines, _ = check(tmp_path / "cache", capsys)
+    text = _doctor_help(capsys)
+
+    assert (code, lines) == (0, [f"crapkit doctor: checking {cache / CLI}"])
+    assert "silent when they agree" not in text
+    assert ("exit 0 when they agree, after naming a root it found under PATH rather than the "
+            "root PATH named") in text

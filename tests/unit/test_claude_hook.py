@@ -7,6 +7,7 @@ these a broken rung and a working one look identical from outside.
 """
 import argparse
 import io
+import itertools
 import json
 import os
 import time
@@ -18,10 +19,11 @@ from crapkit.cli.parser import build_parser
 from crapkit.cli import main
 from crapkit.cli import claude_hook
 from crapkit.cli.claude_hook import (_advise, _advisory_lines, _breaches, _command_event,
-                                     _edited_file, _edited_path, _fresh, _fresh_python,
-                                     _judgeable, _marks_for, _repo_root, _sequencing,
-                                     _status_records, cmd_claude_hook)
+                                     _edited_files, _edited_path, _fresh, _fresh_python,
+                                     _judgeable, _marks_for, _measured, _repo_root,
+                                     _sequencing, _status_records, cmd_claude_hook)
 from crapkit.merge import FunctionRecord
+from name_bytes import NOT_UTF8_NAMES
 
 EVENT = {"hook_event_name": "PostToolUse", "tool_name": "Edit",
          "tool_input": {"file_path": "/repo/calc/grade.py"}}
@@ -34,7 +36,7 @@ def record(name: str, ccn: int, start: int = 1, end: int = 16) -> FunctionRecord
 # --- rung 1: the payload -----------------------------------------------------
 
 def test_a_post_tool_use_edit_names_the_file_it_touched():
-    assert _edited_file(EVENT) == "/repo/calc/grade.py"
+    assert _edited_files(EVENT) == ["/repo/calc/grade.py"]
 
 
 @pytest.mark.parametrize("payload", [
@@ -45,9 +47,123 @@ def test_a_post_tool_use_edit_names_the_file_it_touched():
     {"hook_event_name": "PostToolUse", "tool_input": None},
     {"hook_event_name": "PostToolUse"},
     {"hook_event_name": "PostToolUse", "tool_input": {"file_path": 17}},
+    {"hook_event_name": "preToolUse", "tool_input": {"file_path": "/repo/a.py"}},
 ])
 def test_an_event_protocol_one_does_not_judge_names_no_file(payload: dict):
-    assert _edited_file(payload) == ""
+    assert _edited_files(payload) == []
+
+
+# --- rung 1, as the other harnesses that run the plugin's hook send it ---------
+#
+# The plugin's one handler also runs under GitHub Copilot CLI, Cursor (which
+# imports Claude Code plugins) and VS Code. Each names the edited file in its
+# own vocabulary, captured from the harness at the version named.
+
+# Copilot CLI 1.0.88: Claude's tool names, its own argument names.
+COPILOT_EDIT = {"hook_event_name": "PostToolUse", "session_id": "s", "timestamp": "t",
+                "cwd": "/repo", "tool_name": "Edit",
+                "tool_input": {"path": "/repo/calc/grade.py", "old_str": "a", "new_str": "b"},
+                "tool_result": {"result_type": "success"}}
+# Cursor 2026.09.23: the event name in camelCase, Edit and Write both as Write.
+CURSOR_WRITE = {"hook_event_name": "postToolUse", "conversation_id": "c", "cwd": "/repo",
+                "tool_name": "Write",
+                "tool_input": {"file_path": "/repo/calc/grade.py", "content": "b"}}
+# VS Code 1.139.0: its own tool names, `filePath`, every tool call whatever the matcher.
+VSCODE_REPLACE = {"hook_event_name": "PostToolUse", "session_id": "s", "timestamp": "t",
+                  "tool_name": "replace_string_in_file",
+                  "tool_input": {"filePath": "/repo/calc/grade.py", "oldString": "a",
+                                 "newString": "b"}}
+PATCH = ("*** Begin Patch\n*** Update File: /repo/calc/grade.py\n@@\n-a\n+b\n"
+         "*** Add File: /repo/calc/new.py\n+x = 1\n*** Delete File: /repo/calc/old.py\n"
+         "*** Update File: /repo/calc/moved.py\n*** Move to: /repo/calc/renamed.py\n"
+         "*** End Patch\n")
+
+
+@pytest.mark.parametrize("payload", [COPILOT_EDIT, CURSOR_WRITE, VSCODE_REPLACE],
+                         ids=["copilot-path", "cursor-postToolUse", "vscode-filePath"])
+def test_every_harness_names_the_edited_file_where_the_hook_finds_it(payload):
+    """Copilot's `path` and Cursor's camelCase event each read as no event at
+    all, so the hook exited 0 on every edit a Copilot or Cursor agent made."""
+    assert _edited_files(payload) == ["/repo/calc/grade.py"]
+
+
+def test_a_vscode_multi_replace_names_each_file_once():
+    replacements = [{"filePath": "/repo/calc/grade.py"}, {"filePath": "/repo/calc/grade.py"},
+                    {"filePath": "/repo/calc/other.py"}, "not an object"]
+    payload = dict(VSCODE_REPLACE, tool_name="multi_replace_string_in_file",
+                   tool_input={"explanation": "e", "replacements": replacements})
+
+    assert _edited_files(payload) == ["/repo/calc/grade.py", "/repo/calc/other.py"]
+
+
+def test_a_vscode_apply_patch_names_every_file_it_leaves_written():
+    """A deleted file has nothing left to judge. A moved one names both paths;
+    the old one is gone from disk by then and `_measured` drops it."""
+    payload = dict(VSCODE_REPLACE, tool_name="apply_patch",
+                   tool_input={"input": PATCH, "explanation": "e"})
+
+    assert _edited_files(payload) == ["/repo/calc/grade.py", "/repo/calc/new.py",
+                                      "/repo/calc/moved.py", "/repo/calc/renamed.py"]
+
+
+@pytest.mark.parametrize("tool,tool_input", [
+    ("read_file", {"filePath": "{FILE}", "startLine": 1, "endLine": 9}),
+    ("list_dir", {"path": "{DIR}"}),
+    ("run_in_terminal", {"command": "pytest", "explanation": "e", "isBackground": False}),
+    ("apply_patch", {"input": 17}),
+    ("multi_replace_string_in_file", {"replacements": "none"}),
+])
+def test_a_vscode_tool_that_writes_nothing_is_never_judged(tool, tool_input, tmp_path):
+    """VS Code runs the plugin's hook on every tool call and ignores its
+    `Edit|Write` matcher, so the hook applies it: a read, a listing or a terminal
+    command beside a breaching file is neither an edit nor the `Bash` event the
+    fallback answers."""
+    edited = _breaching_repo(tmp_path)
+    pointed = {key: str(value).replace("{FILE}", str(edited)).replace("{DIR}", str(edited.parent))
+               if isinstance(value, str) else value for key, value in tool_input.items()}
+    payload = dict(VSCODE_REPLACE, tool_name=tool, cwd=str(tmp_path), tool_input=pointed)
+
+    assert (claude_hook._advisory(payload), _command_event(payload)) == ([], False)
+
+
+def test_the_same_file_under_a_vscode_write_is_judged(tmp_path):
+    """Guards the case above: the breaching repo it reads does draw an advisory."""
+    edited = _breaching_repo(tmp_path)
+    payload = dict(VSCODE_REPLACE, cwd=str(tmp_path), tool_input={"filePath": str(edited)})
+
+    assert claude_hook._advisory(payload)[0].startswith("crapkit advisory: 1 function(s)")
+
+
+def test_a_file_of_a_type_crapkit_does_not_measure_is_never_judged(tmp_path):
+    """The plugin's per-file-type `if` rules skipped these before the spawn;
+    with one handler for every edit the hook screens them itself."""
+    for name in ("grade.py", "notes.md", "data.json"):
+        (tmp_path / name).write_text("x = 1\n", encoding="utf-8")
+    edited = [str(tmp_path / name) for name in ("grade.py", "notes.md", "data.json")]
+
+    assert _measured({}, edited) == [tmp_path / "grade.py"]
+
+
+def _touched(path: Path) -> str:
+    path.write_text("", encoding="utf-8")
+    return str(path)
+
+
+def test_every_type_the_language_map_names_is_judged(tmp_path):
+    """The screen and the map are one table, so a language added to the map is
+    advised on its first edit."""
+    from crapkit.universe import LANGUAGE_EXTENSIONS
+
+    extensions = list(itertools.chain.from_iterable(LANGUAGE_EXTENSIONS.values()))
+    edited = [_touched(tmp_path / f"x{extension}") for extension in extensions]
+
+    assert [path.suffix for path in _measured({}, edited)] == extensions
+
+
+def test_an_edited_file_gone_from_disk_is_not_judged(tmp_path):
+    """A patch that moved a file names its old path too; judging a path that
+    no longer exists would raise and silence the files beside it."""
+    assert _measured({}, [str(tmp_path / "gone.py")]) == []
 
 
 def test_a_relative_file_path_is_read_against_the_events_own_cwd():
@@ -66,7 +182,9 @@ def test_an_absolute_file_path_is_taken_as_given():
 # A Bash PostToolUse carries `tool_input.command` and never `file_path`, so the
 # single-file ladder has nothing to climb. The fallback judges the *.py files
 # the working tree changed, scoped by mtime to the ones this command plausibly
-# wrote, and capped so the hook's own timeout holds.
+# wrote, minus the ones whose bytes this session already judged, and capped so
+# the hook's own timeout holds. test_claude_hook_session_memory.py drives the
+# memory through real events.
 
 BASH_EVENT = {"hook_event_name": "PostToolUse", "tool_name": "Bash", "cwd": "/repo",
               "tool_input": {"command": "python - <<'PY'\nPY"}}
@@ -127,15 +245,33 @@ def test_a_just_written_file_is_fresh(tmp_path):
     assert _fresh(path, time.time() - 12) is True
 
 
-def test_a_file_dirty_since_before_the_command_is_not_fresh(tmp_path):
-    """The `ls` after an edit: the file is still dirty, but this command did not
-    write it, so re-advising it would repeat the advisory on every Bash call."""
-    path = tmp_path / "hot.py"
-    path.write_text("def f():\n    pass\n", encoding="utf-8")
-    stale = time.time() - 3600
-    os.utime(path, (stale, stale))
+def test_a_file_dirty_since_before_the_command_is_not_fresh(tmp_path, monkeypatch):
+    """Two filters, in order. The window: an mtime older than 12 s reads as
+    "this command did not write it", which keeps an `ls` after an edit quiet
+    and is also the documented miss (bytes moved in under an old mtime are
+    never judged here). The memory: a fresh file whose bytes this session
+    already judged is not judged again. Only a fresh file with unjudged bytes
+    is left to judge."""
+    stale, heard, new = (tmp_path / name for name in ("stale.py", "heard.py", "new.py"))
+    for path in (stale, heard, new):
+        path.write_text("def f():\n    pass\n", encoding="utf-8")
+    past = time.time() - 3600
+    os.utime(stale, (past, past))
+    monkeypatch.setattr(claude_hook, "_porcelain",
+                        lambda top: "?? stale.py\0?? heard.py\0?? new.py\0")
 
-    assert _fresh(path, time.time() - 12) is False
+    assert _fresh(stale, time.time() - 12) is False
+    assert _fresh_python(tmp_path, _HeardOnly(heard)) == [new]
+
+
+class _HeardOnly:
+    """A session memory that judged one file's bytes and nothing else."""
+
+    def __init__(self, heard: Path) -> None:
+        self.heard = heard
+
+    def judged(self, path: Path) -> bool:
+        return path == self.heard
 
 
 def test_a_path_status_names_but_disk_lacks_is_not_fresh(tmp_path):
@@ -147,7 +283,7 @@ def test_a_command_run_outside_any_git_repo_is_silent(tmp_path):
     the module's silence contract is built around."""
     payload = dict(BASH_EVENT, cwd=str(tmp_path))
 
-    assert claude_hook._advise_command(payload) == 0
+    assert claude_hook._advise_command(payload, claude_hook._Memory(None)) == []
 
 
 def test_a_cwd_that_is_not_a_directory_names_no_top(tmp_path):
@@ -158,7 +294,20 @@ def test_a_cwd_that_is_not_a_directory_names_no_top(tmp_path):
 
 def test_a_non_command_event_takes_no_fallback_judgement():
     assert claude_hook._advise_command({"hook_event_name": "PostToolUse",
-                                        "tool_input": {}}) == 0
+                                        "tool_input": {}}, claude_hook._Memory(None)) == []
+
+
+@pytest.mark.parametrize("tool", ["Bash", "Shell"])
+def test_the_shell_tool_under_each_name_a_harness_sends_is_a_command_event(tool):
+    """Claude Code and Copilot CLI send Bash; Cursor maps a Bash matcher onto its Shell tool."""
+    assert _command_event(dict(BASH_EVENT, tool_name=tool)) is True
+
+
+def test_a_command_string_under_another_tool_takes_no_fallback():
+    """Codex's apply_patch carries its patch in `command`, and VS Code's terminal
+    tool reaches the hook whatever the matcher says. Neither asked for the
+    working-tree scan the Bash half is registered for."""
+    assert _command_event(dict(BASH_EVENT, tool_name="apply_patch")) is False
 
 
 def test_the_fallback_caps_the_files_it_judges(monkeypatch, tmp_path):
@@ -168,7 +317,7 @@ def test_the_fallback_caps_the_files_it_judges(monkeypatch, tmp_path):
     monkeypatch.setattr(claude_hook, "_porcelain", lambda top: text)
     monkeypatch.setattr(claude_hook, "_fresh", lambda path, cutoff: True)
 
-    assert len(_fresh_python(tmp_path)) == 25
+    assert len(_fresh_python(tmp_path, claude_hook._Memory(None))) == 25
 
 
 # --- rungs 2 and 3: the root -------------------------------------------------
@@ -442,3 +591,268 @@ def test_a_configuration_saved_with_a_bom_reads_as_the_same_configuration(tmp_pa
     err = capsys.readouterr().err
     assert code == 2, err
     assert "crapkit advisory" in err, err
+
+
+# --- a file no reader could read ---------------------------------------------
+#
+# Since 0.7.2 a file a reader refuses scores as zero functions, and zero
+# functions read as zero breaches: the hook exited 0 in silence on an edit that
+# left a ccn-8 function beside a TypeScript arrow the reader refuses, and on a
+# Python def cut off at its signature, while the commit gate refuses both once
+# staged. The advisory now names the file, the reader's reason and the fix.
+
+ARROW_TOML = ('[crapkit]\ntarget = 6\n\n'
+              '[[scope]]\nname = "src"\npaths = ["src"]\nlanguages = ["typescript"]\n')
+KNOTTY_TS = ("export function knotty(n: number): number {\n"
+             + "".join(f"  if (n === {i}) {{ n += {i}; }}\n" for i in range(1, 8))
+             + "  return n;\n}\n")
+ARROW = "export const pick = (x: number) => convert<string, number>(x);\n"
+UNREAD_TAIL = ("the commit gate refuses this file once staged; change what the reason names so "
+               "a reader can parse the file, or list it under [exclude] globs in crapkit.toml "
+               "to leave it ungated")
+
+
+def _unread_repo(tmp_path: Path, rel: str, toml: str, source: str) -> Path:
+    (tmp_path / "crapkit.toml").write_text(toml, encoding="utf-8")
+    edited = tmp_path / rel
+    edited.parent.mkdir(parents=True, exist_ok=True)
+    edited.write_text(source, encoding="utf-8", newline="\n")
+    return edited
+
+
+@pytest.mark.parametrize(("rel", "toml", "source", "reason"), [
+    pytest.param("src/a.ts", ARROW_TOML, KNOTTY_TS + ARROW,
+                 "expression-arrow body has '<' before a comma", id="typescript-arrow"),
+    pytest.param("calc/grade.py", TOML, BREACH.replace("sprawl(n)", "sprawl(n"),
+                 "the Python reader reached no body for 1 def(s)", id="python-signature-cut-off"),
+])
+def test_an_edit_that_leaves_a_file_no_reader_can_read_draws_the_advisory(
+        tmp_path, capsys, monkeypatch, rel, toml, source, reason):
+    edited = _unread_repo(tmp_path, rel, toml, source)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_event(edited, tmp_path))))
+
+    code = main(["claude-hook", "--protocol", "1"])
+
+    lines = capsys.readouterr().err.splitlines()
+    assert code == 2, lines
+    assert lines[0] == (f"crapkit advisory: {rel} could not be read, so no function in it was "
+                        "judged (the edit landed; nothing was blocked)")
+    assert lines[1].startswith(f"  UNREAD  {rel}: ") and reason in lines[1], lines
+    assert lines[2:] == [UNREAD_TAIL]
+
+
+def test_the_unread_advisory_keeps_the_advisorys_own_voice():
+    text = "\n".join(claude_hook._unread_advisory("src/a.ts", "why"))
+
+    assert "the edit landed; nothing was blocked" in text
+    for banned in ("crapkit gate", "gate:", "decompose before committing"):
+        assert banned not in text
+
+
+@pytest.mark.parametrize(("ranges", "advised"), [
+    pytest.param(None, True, id="untracked"),
+    pytest.param([(3, 4)], True, id="edited-lines"),
+    pytest.param([], False, id="tracked-and-unchanged-against-HEAD"),
+])
+def test_an_unread_file_is_advised_only_when_the_edit_changed_it(ranges, advised):
+    """The commit gate refuses an unread file it was asked to judge, a staged
+    one; a tracked file whose diff against HEAD is empty holds no change."""
+    from crapkit.merge import UnanalyzableFile
+
+    unread = claude_hook._unjudged("src/a.ts", UnanalyzableFile("why"), ranges)
+
+    assert unread == (claude_hook._unread_advisory("src/a.ts", "why") if advised else [])
+    assert claude_hook._unjudged("src/a.ts", [], ranges) == []
+# --- every shape of the PostToolUse payload, through the whole subcommand -----
+#
+# A field null, absent, of another type or not UTF-8 either still names the
+# edited file, and the advisory fires (exit 2), or names none, and the hook
+# exits 0 in silence. Neither ends in a traceback.
+
+def _payload_bytes(root: Path, edited: Path, **over) -> bytes:
+    event = {"session_id": "s", "transcript_path": "t", "cwd": str(root),
+             "hook_event_name": "PostToolUse", "tool_name": "Edit",
+             "tool_input": {"file_path": str(edited), "old_string": "a", "new_string": "b"},
+             "tool_response": {"filePath": str(edited), "success": True}}
+    for key, value in over.items():
+        if value == "absent":
+            event.pop(key, None)
+        else:
+            event[key] = value
+    return json.dumps(event).encode("utf-8")
+
+
+_RELATIVE = {"file_path": "calc/café.py"}
+_PAYLOADS = {
+    "session_id-null": (lambda r, e: _payload_bytes(r, e, session_id=None), 2),
+    "tool_response-null": (lambda r, e: _payload_bytes(r, e, tool_response=None), 2),
+    "cwd-null-absolute-path": (lambda r, e: _payload_bytes(r, e, cwd=None), 2),
+    "cwd-a-number-absolute-path": (lambda r, e: _payload_bytes(r, e, cwd=5), 2),
+    "cwd-absent-relative-path": (lambda r, e: _payload_bytes(r, e, cwd="absent",
+                                                             tool_input=_RELATIVE), 2),
+    "cwd-null-relative-path": (lambda r, e: _payload_bytes(r, e, cwd=None, tool_input=_RELATIVE), 2),
+    # A number is no base to read a relative path against, so the hook stays silent.
+    "cwd-a-number-relative-path": (lambda r, e: _payload_bytes(r, e, cwd=5, tool_input=_RELATIVE),
+                                   0),
+    "a-byte-that-is-not-utf8": (lambda r, e: _payload_bytes(r, e).replace(
+        b'"session_id": "s"', b'"session_id": "' + bytes([0xE9]) + b'"'), 2),
+    "a-5-MB-field": (lambda r, e: _payload_bytes(r, e, transcript_path="x" * 5_000_000), 2),
+    "hook_event_name-null": (lambda r, e: _payload_bytes(r, e, hook_event_name=None), 0),
+    "hook_event_name-absent": (lambda r, e: _payload_bytes(r, e, hook_event_name="absent"), 0),
+    "tool_input-null": (lambda r, e: _payload_bytes(r, e, tool_input=None), 0),
+    "tool_input-a-list": (lambda r, e: _payload_bytes(r, e, tool_input=["x"]), 0),
+    "tool_input-a-string": (lambda r, e: _payload_bytes(r, e, tool_input="calc/café.py"), 0),
+    "file_path-null": (lambda r, e: _payload_bytes(r, e, tool_input={"file_path": None}), 0),
+    "file_path-a-number": (lambda r, e: _payload_bytes(r, e, tool_input={"file_path": 5}), 0),
+    "file_path-empty": (lambda r, e: _payload_bytes(r, e, tool_input={"file_path": ""}), 0),
+    "file_path-a-list": (lambda r, e: _payload_bytes(r, e, tool_input={"file_path": [str(e)]}), 0),
+    "bash-command-null": (lambda r, e: _payload_bytes(r, e, tool_name="Bash",
+                                                      tool_input={"command": None}), 0),
+    "payload-a-list": (lambda r, e: b"[1, 2]", 0),
+    "payload-null": (lambda r, e: b"null", 0),
+    "payload-a-json-string": (lambda r, e: b'"PostToolUse"', 0),
+    "payload-empty": (lambda r, e: b"", 0),
+    "payload-truncated": (lambda r, e: _payload_bytes(r, e)[:40], 0),
+}
+
+
+@pytest.mark.parametrize("shape", list(_PAYLOADS))
+def test_every_payload_shape_draws_the_advisory_or_silence_never_a_traceback(
+        tmp_path, capsys, monkeypatch, shape):
+    edited = _breaching_repo(tmp_path)
+    make, expected = _PAYLOADS[shape]
+    monkeypatch.chdir(tmp_path)  # where Claude Code starts the hook: the project
+    monkeypatch.setattr("sys.stdin", io.TextIOWrapper(io.BytesIO(make(tmp_path, edited)),
+                                                      encoding="utf-8"))
+
+    code = main(["claude-hook", "--protocol", "1"])
+
+    err = capsys.readouterr().err
+    assert code == expected, err
+    assert "Traceback" not in err
+    assert ("calc/café.py" in err) == (expected == 2), err
+# --- a Bash-written file whose name git gives in bytes that are not UTF-8 ------
+#
+# The Bash fallback read `git status --porcelain -z` as lenient text, so a name
+# in Latin-1 bytes came back holding U+FFFD, named no file on disk, and the hook
+# passed the breach in silence. Names now keep their bytes, and a file a scope
+# takes whose name crapkit cannot read gets an advisory naming it and the
+# rename: no function in it can be keyed, and the commit gate refuses it.
+
+POSIX_NAMES = pytest.mark.skipif(os.name == "nt", reason="NTFS stores names as UTF-16, so a "
+                                                         "name that is not UTF-8 exists only on POSIX")
+CLEAN = "def fine(n):\n    return n\n"
+UNREAD = ("crapkit advisory: calc/caf\\xe9.py is in scope 'calc', but git names it in bytes that "
+          "are not UTF-8 and crapkit reads every path as UTF-8, so no function in it was judged "
+          "(the edit landed; nothing was blocked)")
+RENAME = "the commit gate refuses such a file (exit 3); rename it to a UTF-8 name"
+BASH_WRITTEN = [
+    # id, the name as bytes, its source, the exit, a line stderr must hold ("" = silent)
+    pytest.param(b"calc/caf\xe9.py", BREACH, 2, UNREAD, marks=(POSIX_NAMES, NOT_UTF8_NAMES), id="latin1-scoped-breach"),
+    pytest.param(b"calc/caf\xe9.py", CLEAN, 2, UNREAD, marks=(POSIX_NAMES, NOT_UTF8_NAMES), id="latin1-scoped-clean"),
+    pytest.param(b"tools/caf\xe9.py", BREACH, 0, "", marks=(POSIX_NAMES, NOT_UTF8_NAMES), id="latin1-unscoped"),
+    pytest.param("calc/café.py".encode(), BREACH, 2, "in calc/café.py (the edit landed", id="utf8-scoped-breach"),
+    pytest.param("calc/李.py".encode(), CLEAN, 0, "", id="utf8-cjk-scoped-clean"),
+    pytest.param(b"calc/plain.py", BREACH, 2, "in calc/plain.py (the edit landed", id="ascii-scoped-breach"),
+]
+
+
+@pytest.mark.parametrize("name, source, code, line", BASH_WRITTEN)
+def test_a_bash_written_file_is_judged_by_the_name_git_gives_it(tmp_path, capsys, monkeypatch,
+                                                              name, source, code, line):
+    from raw_git import repository
+
+    root = repository(tmp_path / "repo")
+    (root / "crapkit.toml").write_text(TOML, encoding="utf-8")
+    written = Path(os.fsdecode(os.fsencode(root) + b"/" + name))
+    written.parent.mkdir(parents=True, exist_ok=True)
+    written.write_text(source, encoding="utf-8")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(dict(BASH_EVENT, cwd=str(root)))))
+
+    exit_code = main(["claude-hook", "--protocol", "1"])
+
+    err = capsys.readouterr().err
+    assert exit_code == code, err
+    assert (line in err) if line else err == "", err
+    assert (RENAME in err) is (line == UNREAD), err
+    assert "gate:" not in err and "crapkit gate" not in err, err
+
+
+# --- where the advisory goes, per harness ---------------------------------------
+#
+# Exit 2's stderr is text for the model in Claude Code alone. Cursor reads it as
+# a deny, VS Code as a blocking error, and Copilot CLI shows it to the user and
+# not the model (1.0.88, a stub-model session: of stderr on exit 2, a nested
+# hookSpecificOutput, a systemMessage and a top-level additionalContext, only
+# the last reached the model request). So those three get exit 0 and one JSON
+# object carrying the text under both keys they read.
+
+def _run(payload: dict, capsys, monkeypatch) -> tuple[int, str, str]:
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    code = main(["claude-hook", "--protocol", "1"])
+    out, err = capsys.readouterr()
+    return code, out, err
+
+
+def _aimed(payload: dict, edited: Path, root: Path) -> dict:
+    """One of the recorded payloads, pointed at a breaching file on disk."""
+    tool_input = {key: str(edited) if key in ("file_path", "path", "filePath") else value
+                  for key, value in payload["tool_input"].items()}
+    return dict(payload, tool_input=tool_input, cwd=str(root))
+
+
+def test_claude_code_hears_the_advisory_through_exit_2_and_stdout_stays_empty(
+        tmp_path, capsys, monkeypatch):
+    edited = _breaching_repo(tmp_path)
+
+    code, out, err = _run(_aimed(EVENT, edited, tmp_path), capsys, monkeypatch)
+
+    assert (code, out) == (2, "")
+    assert err.startswith("crapkit advisory: 1 function(s) over ceiling 6 in calc/café.py"), err
+
+
+@pytest.mark.parametrize("payload", [COPILOT_EDIT, CURSOR_WRITE, VSCODE_REPLACE],
+                         ids=["copilot", "cursor", "vscode"])
+def test_every_other_harness_hears_it_as_context_on_exit_0(payload, tmp_path, capsys,
+                                                          monkeypatch):
+    """Nothing is denied, blocked or left on a terminal the model never reads."""
+    edited = _breaching_repo(tmp_path)
+
+    code, out, err = _run(_aimed(payload, edited, tmp_path), capsys, monkeypatch)
+
+    assert (code, err) == (0, "")
+    answer = json.loads(out)
+    context = answer["additionalContext"]
+    assert answer["hookSpecificOutput"] == {"hookEventName": "PostToolUse",
+                                            "additionalContext": context}
+    assert context.startswith("crapkit advisory: 1 function(s) over ceiling 6"), context
+    assert context.endswith("decompose there or mark the debt"), context
+
+
+def test_copilots_bash_half_hears_it_as_context_too(tmp_path, capsys, monkeypatch):
+    """The Bash entry a Copilot user adds to .claude/settings.json sends the
+    same `tool_result` key, so its fallback verdict takes the same channel."""
+    payload = dict(COPILOT_EDIT, tool_name="Bash", tool_input={"command": "python gen.py"})
+
+    assert claude_hook._reads_context(payload) is True
+    assert claude_hook._reads_context(BASH_EVENT) is False
+
+
+def test_the_json_channel_stays_ascii_whatever_the_console_code_page(tmp_path, capsys,
+                                                                    monkeypatch):
+    """stdout is the harness's pipe in the console's code page; an escaped
+    non-ASCII path survives any of them."""
+    edited = _breaching_repo(tmp_path)
+
+    _, out, _ = _run(_aimed(CURSOR_WRITE, edited, tmp_path), capsys, monkeypatch)
+
+    assert out.isascii() and json.dumps("calc/café.py")[1:-1] in out
+
+
+@pytest.mark.parametrize("payload", [EVENT, COPILOT_EDIT, CURSOR_WRITE, VSCODE_REPLACE],
+                         ids=["claude", "copilot", "cursor", "vscode"])
+def test_a_clean_edit_prints_nothing_on_either_channel(payload, tmp_path, capsys, monkeypatch):
+    edited = _breaching_repo(tmp_path)
+    edited.write_text("def calm(n):\n    return n\n", encoding="utf-8")
+
+    assert _run(_aimed(payload, edited, tmp_path), capsys, monkeypatch) == (0, "", "")

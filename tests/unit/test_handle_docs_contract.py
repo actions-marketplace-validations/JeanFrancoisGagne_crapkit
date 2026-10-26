@@ -44,7 +44,7 @@ def test_the_documented_out_of_range_message_is_the_one_the_tool_prints():
     printed = _no_handle_message("calc/report.py", "(anonymous)#5", _anon_rows(2))
 
     assert printed == ("no (anonymous)#5 in calc/report.py in the latest scored run"
-                       " — it holds: (anonymous)#1, (anonymous)#2")
+                       " - it holds: (anonymous)#1, (anonymous)#2")
     assert printed in _doc("AGENTS.md"), "AGENTS.md prints a message nothing emits"
 
 
@@ -81,7 +81,7 @@ def test_no_page_still_prints_the_refresh_command_that_could_not_refresh():
 def test_the_json_page_prints_the_refresh_command_the_packet_carries():
     """Without the `python -m` prefix: the page's transcripts use the console
     script, and the flag is the load-bearing half."""
-    flag = packet.REFRESH.split("crapkit ", 1)[1]
+    flag = packet.REFRESH
 
     assert f"crapkit {flag}" in _doc("docs/agent-json.md")
     assert flag == "coverage --reuse-unchanged"

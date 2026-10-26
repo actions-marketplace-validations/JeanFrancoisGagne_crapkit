@@ -1,20 +1,29 @@
 """crapkit.toml parsing. Text in, Config out; every rejection is a ConfigError (exit 3).
 
-Pure, with one exception: given a `root`, the full-suite guard reads pytest's
-own configuration in a lane's working directory, and only when the lane's
-pytest command carries a positional to judge against `testpaths`."""
+Pure, with two exceptions, both only given a `root`. The full-suite guard reads
+pytest's own configuration in a lane's working directory, and only when the
+lane's pytest command carries a positional to judge against `testpaths`. And
+every path-valued key is read by repopath's declared entry (_PATH_KEYS), which
+gives a declared directory the letter case the directory lists where the
+filesystem opens it in another case, because git and every reader after this
+compare the text."""
 from __future__ import annotations
 
 import os
-import re
-import shlex
+import posixpath
 import tomllib
-from collections.abc import Iterator
 from pathlib import Path
 from typing import NamedTuple
 
 from .errors import ConfigError
+from .invocation import quoted_path
 from .config_contract import admit, enum_values
+from . import lane_command
+# shell_words and shell_segments are read through this module by callers that
+# predate lane_command's tokenizer.
+from .lane_command import Step, command_steps, shell_segments, shell_words  # noqa: F401
+from .repopath import Refused, declared, disk_spelling, file_separators
+from .repotext import plain_utf8
 
 # `cpp` is the whole C family, C included: lizard resolves every one of its
 # suffixes to a single CLikeReader, so a `c` label beside this one could never
@@ -78,208 +87,19 @@ _PYTEST_VALUE_FLAGS = frozenset({
 })
 
 
-# Lane commands run under shell=True: sh on POSIX, cmd.exe on Windows. The two
-# read a command line differently, and the guard has to read it like the one
-# that will run it, or it accepts a lane cmd.exe breaks and refuses one it runs.
+# Lane commands run under shell=True: sh on POSIX, cmd.exe on Windows. The one
+# flag every reader of a lane command asks; lane_command reads the line in the
+# dialect it names, and admin and verifying say which shell runs the lane.
 SHELL_IS_CMD = os.name == "nt"
 
 
-def shell_words(command: str, cmd: bool | None = None) -> list[str]:
-    """The words the shell hands the runner. `-m "not live and not perf"` is one
-    argument there and must be one token here — a whitespace split reads four
-    positionals into it. A command the shell would refuse (a quote that never
-    closes) gets the whitespace read instead: a rough lint beats a crash at
-    config load."""
-    return [word for word, _ in _shell_tokens(command, cmd)]
-
-
-def _shell_tokens(command: str, cmd: bool | None = None) -> list[tuple[str, bool]]:
-    """The words, each with a flag: True when quoting or an escape built it. A
-    built word is an argument and never the shell's own syntax, however it is
-    spelled — `"&&"` and cmd.exe's `^&` both reach the program as the text `&&`
-    and `&`. The whitespace fallback knows no quoting, so it builds nothing."""
-    cmd = SHELL_IS_CMD if cmd is None else cmd
-    try:
-        return _cmd_tokens(command) if cmd else _sh_tokens(command)
-    except ValueError:
-        return [(word, False) for word in command.split()]
-
-
-def _sh_tokens(command: str) -> list[tuple[str, bool]]:
-    """sh's reading, from shlex, plus the flag. shlex outside posix mode leaves
-    the quotes and backslashes in the word, so a word whose two spellings differ
-    is one sh built. When the two readings disagree on where the words are
-    (`a\\ b` is one word to posix mode and two outside it), nothing is called
-    built: the operator split then reads exactly what 0.4.4 read."""
-    words = shlex.split(command)
-    raw = shlex.split(command, posix=False)
-    if len(raw) != len(words):
-        raw = words
-    return [(word, word != spelling) for word, spelling in zip(words, raw)]
-
-
-def _uncaret(command: str) -> list[tuple[str, bool]]:
-    """cmd.exe's escape. Outside a quoted run `^` is dropped and the character
-    behind it is handed on untouched, so `-k ^"not slow^"` reaches the runner as
-    `-k "not slow"`. Inside a quoted run cmd.exe leaves the caret alone: `-k
-    "a^b"` reaches the runner with its caret, so stripping unconditionally would
-    misread the two spellings cmd.exe passes through. Each character carries a
-    flag: True when a caret handed it on, which makes it text, not syntax."""
-    kept: list[tuple[str, bool]] = []
-    chars = iter(command)
-    in_quote = False
-    for char in chars:
-        if char == "^" and not in_quote:
-            kept += _escaped(chars)
-            continue
-        if char == '"':
-            in_quote = not in_quote
-        kept.append((char, False))
-    return kept
-
-
-def _escaped(chars: Iterator[str]) -> list[tuple[str, bool]]:
-    """The character a caret hands on, marked as text. A caret at the end of the
-    line escapes nothing: cmd.exe asks for another line, and a lane command is
-    one line."""
-    char = next(chars, "")
-    return [(char, True)] if char else []
-
-
-def _cmd_tokens(command: str) -> list[tuple[str, bool]]:
-    """cmd.exe's reading: a double quote opens or closes a quoted run wherever it
-    sits, so `--cov-report=json:"a b\\py.json"` is one word and the quotes
-    themselves are dropped; a single quote is an ordinary character, so
-    `'not live'` is two words; a backslash separates path components and escapes
-    nothing. A caret-escaped quote still opens the run: cmd.exe hands the quote
-    itself to the program, and the program's own reader honours it. A quote that
-    never closes raises, and shell_words falls back."""
-    words: list[tuple[str, bool]] = []
-    word, built = "", False
-    in_quote = False
-    for char, escaped in _uncaret(command):
-        if char == '"':
-            in_quote, built = not in_quote, True
-        elif _ends_the_word(char, in_quote):
-            words += _kept(word, built)
-            word, built = "", False
-        else:
-            word, built = word + char, built or escaped
-    if in_quote:
-        raise ValueError(f"no closing quotation: {command}")
-    return words + _kept(word, built)
-
-
-# What breaks one word from the next, outside a quoted run: what cmd.exe splits
-# on and what 0.4.4's shlex had. str.isspace() is wider — U+00A0, U+000B, U+000C
-# and the unicode separators are all true — and a non-breaking space pasted out
-# of rendered docs stays inside the word cmd.exe hands the runner.
-_WORD_BREAKS = " \t\r\n"
-
-
-def _ends_the_word(char: str, in_quote: bool) -> bool:
-    """A word break separates words only outside a quoted run."""
-    return char in _WORD_BREAKS and not in_quote
-
-
-def _kept(word: str, built: bool) -> list[tuple[str, bool]]:
-    """The word so far. A run of whitespace ends no word, but a pair of quotes
-    writes one: cmd.exe hands the program the empty argument in `-k "" tests`,
-    and dropping it moved every later token one place left, so the flag in
-    front swallowed a path that is really a positional."""
-    return [(word, built)] if word or built else []
-
-
-# The operators that end one command and start another. sh and cmd.exe share
-# all four, and a lane that chains a report or an upload step after the run is
-# an ordinary shape (`coverage run -m pytest && coverage json`).
-_SHELL_OPERATORS = frozenset({"&&", "||", "&", "|"})
-
-
-# A redirection and its target: `>`, `>>`, `2>`, `2>&1`, `>nul`. Both shells
-# keep them, so neither reaches the program's argv (verified cmd.exe argv:
-# `--cov=src 2>&1` -> ["--cov=src"]). Not an operator: a redirection belongs to
-# the command it sits in and starts no new one.
-_REDIRECTION = re.compile(r"\d*[<>]{1,2}")
-
-
-def shell_segments(command: str, cmd: bool | None = None) -> list[list[str]]:
-    """One argv per command on the line, read by the shell that will run it."""
-    cmd = SHELL_IS_CMD if cmd is None else cmd
-    tokens = _drop_redirections(_shell_tokens(command, cmd))
-    if not cmd:
-        tokens = _split_semicolons(tokens)
-    return _command_segments(tokens, _separators(cmd))
-
-
-def _separators(cmd: bool) -> frozenset[str]:
-    """What ends one command and starts the next. sh adds ';'; to cmd.exe it is
-    an ordinary character the program is handed (verified argv for
-    `--cov=src; echo done`: ["--cov=src;", "echo", "done"])."""
-    return _SHELL_OPERATORS if cmd else _SHELL_OPERATORS | {";"}
-
-
-def _split_semicolons(tokens: list[tuple[str, bool]]) -> list[tuple[str, bool]]:
-    """sh's ';' as its own word. shlex leaves it stuck to the word in front
-    (`--cov=src;`), so the first command read clean while the next command's
-    words landed in its argv, and the lane was refused naming a program pytest
-    never sees. A quoted ';' is an argument and stays where it is."""
-    out: list[tuple[str, bool]] = []
-    for word, built in tokens:
-        if built or not word.endswith(";"):
-            out.append((word, built))
-        else:
-            out += _kept(word[:-1], False) + [(";", False)]
-    return out
-
-
-def _drop_redirections(tokens: list[tuple[str, bool]]) -> list[tuple[str, bool]]:
-    """The words left once the shell has taken its own plumbing. Reading `>` as
-    a word refused a lane naming a positional the program is never handed."""
-    kept: list[tuple[str, bool]] = []
-    skip = False
-    for word, built in tokens:
-        if skip:
-            skip = False
-        elif _redirects(word, built):
-            skip = _takes_the_next_word(word)
-        else:
-            kept.append((word, built))
-    return kept
-
-
-def _redirects(word: str, built: bool) -> bool:
-    """Is this the shell's plumbing? A quoted `">"` is an argument: quoting is
-    how an operator is written when the program is meant to get it."""
-    return not built and _REDIRECTION.match(word) is not None
-
-
-def _takes_the_next_word(word: str) -> bool:
-    """`> run.log` opens the word behind it; `2>run.log` and `2>&1` carry their
-    target, and the word behind them is the program's again."""
-    return _REDIRECTION.fullmatch(word) is not None
-
-
-def _command_segments(tokens: list[tuple[str, bool]],
-                      separators: frozenset[str]) -> list[list[str]]:
-    """One list per command on the line. Only the segment a runner sits in is
-    that runner's argv: reading `pytest --cov && coverage json` flat called
-    `coverage` a positional pytest is never handed. A word quoting or an escape
-    built is an argument whatever it spells, so `-k "a && b"`, `"&&"` and
-    cmd.exe's `^&` all stay inside their segment."""
-    segments: list[list[str]] = [[]]
-    for word, built in tokens:
-        if word in separators and not built:
-            segments.append([])
-        else:
-            segments[-1].append(word)
-    return segments
-
-
-def _quote_hint(command: str) -> str:
+def _quote_hint(step: Step) -> str:
     """The usual reason a Windows lane trips the guard: a value in single
-    quotes, which cmd.exe hands the runner one word per space."""
-    if SHELL_IS_CMD and "'" in command:
+    quotes, which cmd.exe hands the runner one word per space. Only a step
+    cmd.exe read keeps a ' in its words: a `bash -c` payload is read with sh's
+    quotes, and telling its author to switch to double quotes sent a lane past
+    the guard."""
+    if step.cmd and any("'" in word for word in step.words):
         return " (cmd.exe does not treat ' as a quote: write the value in double quotes)"
     return ""
 
@@ -386,7 +206,7 @@ def _toml_testpaths(text: str) -> tuple[str, ...] | None:
 def _pytest_text(directory: str | os.PathLike, name: str) -> str | None:
     """Read one candidate file without confusing absence with an empty file."""
     try:
-        return (Path(directory) / name).read_text(encoding="utf-8", errors="replace")
+        return plain_utf8((Path(directory) / name).read_bytes())
     except OSError:
         return None
 
@@ -412,13 +232,16 @@ def pytest_testpaths_at(directory: str | os.PathLike) -> tuple[str, ...]:
     return _pytest_testpaths(lambda name: _pytest_text(directory, name))
 
 
-def _as_testpath(token: str) -> str:
+def _as_testpath(token: str, base: Path | None = None) -> str:
     """One spelling for the comparison: forward slashes, no leading `./`, no
-    trailing separator. `tests/`, `./tests` and `tests` name one directory."""
-    spelled = token.replace("\\", "/")
+    trailing separator. `tests/`, `./tests` and `tests` name one directory.
+    Given the directory it is read from, it takes the case that directory
+    lists: on NTFS `Tests` is tests/."""
+    spelled = file_separators(token)
     if spelled.startswith("./"):
         spelled = spelled[2:]
-    return spelled.rstrip("/")
+    spelled = spelled.rstrip("/")
+    return disk_spelling(base, spelled) if base is not None and spelled else spelled
 
 
 def _declared_testpaths(positionals: list[str], lane_dir: Path | None) -> set[str]:
@@ -428,7 +251,7 @@ def _declared_testpaths(positionals: list[str], lane_dir: Path | None) -> set[st
     common lane costs a read-only command no file read."""
     if not positionals or lane_dir is None:
         return set()
-    return {_as_testpath(path) for path in pytest_testpaths_at(lane_dir)}
+    return {_as_testpath(path, lane_dir) for path in pytest_testpaths_at(lane_dir)}
 
 
 def _outside_testpaths(positionals: list[str], lane_dir: Path | None) -> list[str]:
@@ -441,23 +264,23 @@ def _outside_testpaths(positionals: list[str], lane_dir: Path | None) -> list[st
     of what a bare `pytest` does, which is the narrowing this guard exists to
     refuse, so one entry of several is not enough."""
     declared = _declared_testpaths(positionals, lane_dir)
-    if not declared <= {_as_testpath(tok) for tok in positionals}:
+    if not declared <= {_as_testpath(tok, lane_dir) for tok in positionals}:
         return positionals
     # An empty `declared` is a subset of anything and drops nothing below.
-    return [tok for tok in positionals if _as_testpath(tok) not in declared]
+    return [tok for tok in positionals if _as_testpath(tok, lane_dir) not in declared]
 
 
 def _validate_coveragepy_command(name: str, command: str, lane_dir: Path | None = None) -> None:
     # Subset coverage under a suite with cross-file pollution is run-order-dependent;
     # a full-suite lane refuses positional narrowing. Scoped suites opt out with
     # full_suite = false, an explicit and reviewable decision. Every chained
-    # segment is read: a second pytest run narrows just as much as the first.
-    for segment in shell_segments(command):
-        _refuse_pytest_narrowing(name, command, segment, lane_dir)
+    # step is read, a `bash -c` payload's included: a second pytest run
+    # narrows just as much as the first.
+    for step in command_steps(command).steps:
+        _refuse_pytest_narrowing(name, step, lane_dir)
 
 
-def _refuse_pytest_narrowing(name: str, command: str, tokens: list[str],
-                             lane_dir: Path | None = None) -> None:
+def _refuse_pytest_narrowing(name: str, step: Step, lane_dir: Path | None = None) -> None:
     """One command's argv. A segment that runs no pytest has nothing to narrow,
     and a positional equal to a configured testpaths entry narrows nothing.
 
@@ -467,12 +290,12 @@ def _refuse_pytest_narrowing(name: str, command: str, tokens: list[str],
     leaves its other testpaths unmeasured with nothing saying so, which is why
     the message names the multi-lane pattern rather than only the flag.
     """
-    positionals = _narrowing_arguments(_tokens_after_pytest(tokens))
+    positionals = _narrowing_arguments(_tokens_after_pytest(list(step.words)))
     for tok in _outside_testpaths(positionals, lane_dir):
         raise ConfigError(
             f"lane {name!r}: positional argument '{tok}' narrows a full-suite coverage run; "
             f"drop it, attach it to the flag it belongs to (-n8, --numprocesses=8), "
-            f"or set full_suite = false deliberately{_quote_hint(command)}; a suite whose "
+            f"or set full_suite = false deliberately{_quote_hint(step)}; a suite whose "
             f"testpaths cannot be collected in one process needs one lane per testpath, "
             f"each with full_suite = false and its own artifact")
 
@@ -514,10 +337,11 @@ def _validate_istanbul_command(name: str, command: str) -> None:
     # The measured vitest trap: any file filter passed beside --coverage silently
     # narrows the coverage include set. A lane command is fixed configuration, so
     # the combination is a config error, not a runtime surprise. Each chained
-    # segment is its own argv: a script path in a post-run step is that step's,
-    # and a vitest run after `npm run build` is still a vitest run.
-    for segment in shell_segments(command):
-        _refuse_istanbul_filter(name, segment)
+    # step is its own argv: a script path in a post-run step is that step's,
+    # and a vitest run after `npm run build`, or inside `sh -c`, is still a
+    # vitest run.
+    for step in command_steps(command).steps:
+        _refuse_istanbul_filter(name, list(step.words))
 
 
 def _refuse_istanbul_filter(name: str, tokens: list[str]) -> None:
@@ -589,8 +413,8 @@ class Config(NamedTuple):
     ratchet_file: str = "crapkit-ratchet.tsv"
     alert_command: str = ""
     scoped_tests: tuple[tuple[str, str], ...] = ()
-    mutation_command: str = ""  # the suite run once per mutant; nonzero exit = killed
-    mutation_timeout_seconds: int = 300  # a mutant that loops forever counts as killed
+    mutation_command: str = ""  # the suite run once per mutant; nonzero = killed, 5 = no verdict
+    mutation_timeout_seconds: int = 300  # past it a mutant counts as killed, reported as timed_out
     mutation_workers: int = 1  # one retained detached worktree per worker
     diff_uncovered_max: int | None = None  # verify exit 9 past this many dead changed lines
     # A tighten claims an improvement; one commit measured twice cannot have
@@ -626,53 +450,45 @@ def load_config_text(text: str, *, root: str | os.PathLike | None = None) -> Con
         raise ConfigError(f"crapkit.toml is missing a required key: {exc}") from exc
 
 
-def _unrooted(raw: str) -> str:
-    r"""One declared scope path spelled the way `git ls-files` spells a path.
-
-    universe.py hoists the declared string straight into a prefix, so `./src`
-    looked for `./src/...` while git emits `src/a.py`. Backslashes were already
-    collapsed one layer down, which made the tool look like it normalized paths
-    when it normalized one spelling of them.
-    """
-    path = raw.replace("\\", "/").rstrip("/")
-    while path.startswith("./"):
-        path = path[2:]
-    return path.lstrip("/")
-
-
-def _scope_path(name, raw: str) -> str:
-    """A declared path a tracked file could actually match.
-
-    `./src` claimed nothing: the scope scored zero files, every file under it
-    came back unclaimed, and neither doctor FAIL named the dot — so the reader
-    was sent to declare a second scope for a path the first one already owned.
-    A path that climbs above the root or names a drive can never match a
-    tracked path at all, so it is refused here rather than reported later as an
-    empty scope. `..` is refused as a SEGMENT, not as a prefix: `src/../etc` is
-    the spelling a reader reaches for when they mean a sibling directory, and
-    matching a leading `../` alone let it through into the same silent empty
-    scope. A bare `.` is the repo root. The matcher gives it the lowest path
-    precedence so a deeper scope can own its subtree.
-    """
-    path = _unrooted(raw)
-    if path == "" or ".." in path.split("/") or ":" in path:
-        raise ConfigError(f"scope {name!r}: path {raw!r} can never match a tracked file — "
-                          "scope paths are repo-relative, with no drive and no `..` "
-                          "(docs/configuration.md)")
-    return path
+# Every path-valued key crapkit.toml holds, and the kind repopath's declared
+# entry reads it as: "file" (a path the OS opens), "scope", "prefix" and "input"
+# (a directory as git spells it, in the case the directory lists) or "glob".
+_PATH_KEYS = {
+    "scope.paths": "scope",
+    "lane.path_prefix": "prefix",
+    "lane.inputs": "input",
+    "lane.cwd": "file",
+    "lane.artifact": "file",
+    "lane.results_artifact": "file",
+    "crapkit.ratchet_file": "file",
+    "exclude.globs": "glob",
+}
 
 
-def _parse_scope(row: dict) -> Scope:
+def _path(key: str, raw: str, root: str | os.PathLike | None = None, owner: str = "") -> str:
+    """One value of a path-valued key, read by repopath's declared entry as
+    _PATH_KEYS marks the key. A refusal names the key's owner and the value as
+    written, so `scope 'web': path '../web'` says which line to fix, with one
+    backslash where the reader typed one."""
+    try:
+        return declared(raw, _PATH_KEYS[key], root)
+    except Refused as exc:
+        raise ConfigError(f"{owner}{quoted_path(raw)} {exc}") from None
+
+
+def _parse_scope(row: dict, root: str | os.PathLike | None = None) -> Scope:
     languages = tuple(row.get("languages", ()))
     scope_target = row.get("target")
     return Scope(name=row["name"],
-                 paths=tuple(_scope_path(row.get("name"), p) for p in row["paths"]),
+                 paths=tuple(_path("scope.paths", p, root, f"scope {row.get('name')!r}: path ")
+                             for p in row["paths"]),
                  languages=languages,
                  target=scope_target,
                  coverage_optional=row.get("coverage_optional", False))
 
 
-def _parse_scopes(rows) -> tuple[tuple[Scope, ...], dict[str, tuple[str, ...]]]:
+def _parse_scopes(rows, root: str | os.PathLike | None = None
+                  ) -> tuple[tuple[Scope, ...], dict[str, tuple[str, ...]]]:
     """Every [[scope]] row and its notes, off ONE walk of the rows.
 
     Notes hang on the same rows the scopes come from, so collecting them in a
@@ -682,7 +498,7 @@ def _parse_scopes(rows) -> tuple[tuple[Scope, ...], dict[str, tuple[str, ...]]]:
     scopes: dict[str, Scope] = {}
     notes: dict[str, tuple[str, ...]] = {}
     for row in rows:
-        scope = _parse_scope(row)
+        scope = _parse_scope(row, root)
         if scope.name in scopes:
             raise ConfigError(f"duplicate scope name {scope.name!r}; each scope needs its own name")
         scopes[scope.name] = scope
@@ -690,6 +506,13 @@ def _parse_scopes(rows) -> tuple[tuple[Scope, ...], dict[str, tuple[str, ...]]]:
         if row_notes:
             notes[scope.name] = row_notes
     return tuple(scopes.values()), notes
+
+
+def _expanded(command: str) -> str:
+    """The command with its launcher tokens expanded for the OS reading the
+    file, once, as the Lane is built (lane_command.expand_launchers), so every
+    reader of the command sees the one the shell will run."""
+    return lane_command.expand_launchers(command)
 
 
 def _validate_lane_command(parser: str, full_suite: bool, name: str, command: str,
@@ -708,59 +531,103 @@ def _lane_dir(root: str | os.PathLike | None, cwd: str) -> Path | None:
     return Path(root) / cwd if cwd else Path(root)
 
 
+# What Windows refuses in a file name: these characters, the control
+# characters, the device names below (with or without an extension), and a
+# name that ends in a dot or a space. A lane's name is part of the file names
+# crapkit writes for it, so the loader refuses such a name on every OS.
+_NAME_CHARS = frozenset('<>:"/\\|?*')
+_DEVICE_NAMES = frozenset({"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
+                           *(f"{port}{n}" for port in ("COM", "LPT")
+                             for n in (*"0123456789", "\u00b9", "\u00b2", "\u00b3"))})
+
+
+def _lane_name(name: str) -> None:
+    """The lane's name, refused when Windows could not use it as a file name:
+    `unit?` ended `crapkit coverage` in a traceback, and `a:b` wrote the lane's
+    log into an alternate data stream of a file named .crapkit/lane-a."""
+    problem = _unusable_file_name(name)
+    if problem:
+        raise ConfigError(f"lane {name!r}: {problem}; crapkit writes the lane's log to "
+                          ".crapkit/lane-<name>.log and refuses such a name on every OS so "
+                          "one crapkit.toml works on each; rename the lane")
+
+
+def _unusable_file_name(name: str) -> str:
+    """Why Windows cannot use `name` as a file name, or "" when it can."""
+    held = _refused_characters(name)
+    if held:
+        return f"the name holds {' '.join(map(_shown, held))}, which Windows refuses in a file name"
+    device = name.split(".")[0].rstrip(" ").upper()
+    if device in _DEVICE_NAMES:
+        return f"{device} is a device name Windows reserves, so no file can take it"
+    return _unusable_end(name)
+
+
+def _refused_characters(name: str) -> list[str]:
+    return sorted({ch for ch in name if ch in _NAME_CHARS or ord(ch) < 32})
+
+
+def _shown(ch: str) -> str:
+    return f"U+{ord(ch):04X}" if ord(ch) < 32 else ch
+
+
+def _unusable_end(name: str) -> str:
+    if not name:
+        return "the name is empty"
+    if name[-1] in ". ":
+        return f"the name ends in {'a dot' if name[-1] == '.' else 'a space'}, which Windows drops"
+    return ""
+
+
 def _parse_lane(row: dict, scope_names: set, root: str | os.PathLike | None = None) -> Lane:
+    _lane_name(row["name"])
     parser = row["parser"]
     lane_scopes = tuple(row.get("scopes", ()))
     unknown_scopes = set(lane_scopes) - scope_names
     if unknown_scopes:
         raise ConfigError(f"lane {row.get('name')!r} references undeclared scope(s) {sorted(unknown_scopes)}")
     full_suite = row.get("full_suite", True)
-    _validate_lane_command(parser, full_suite, row.get("name", "?"), row["command"],
-                           _lane_dir(root, row.get("cwd", "")))
-    return Lane(name=row["name"], command=row["command"], artifact=row["artifact"],
+    cwd = _path("lane.cwd", row.get("cwd", ""))
+    command = _expanded(row["command"])
+    _validate_lane_command(parser, full_suite, row.get("name", "?"), command,
+                           _lane_dir(root, cwd))
+    return Lane(name=row["name"], command=command,
+                artifact=_lane_output(row.get("name"), "artifact", row["artifact"]),
                 parser=parser, scopes=lane_scopes,
-                cwd=row.get("cwd", ""), path_prefix=row.get("path_prefix", ""),
+                cwd=cwd, path_prefix=_path("lane.path_prefix", row.get("path_prefix", ""), root),
                 env=tuple(sorted(row.get("env", {}).items())),
                 full_suite=full_suite, container_ok=row.get("container_ok", False),
-                results_artifact=row.get("results_artifact", ""),
+                results_artifact=_lane_output(row.get("name"), "results_artifact",
+                                              row.get("results_artifact", "")),
                 timeout_seconds=row.get("timeout_seconds", 0),
                 no_progress_seconds=row.get("no_progress_seconds", 0),
                 retries=row.get("retries", 0),
-                retest_command=row.get("retest_command", ""),
-                inputs=_lane_inputs(row))
+                retest_command=_expanded(row.get("retest_command", "")),
+                inputs=_lane_inputs(row, root))
 
 
-_DRIVE_PATH = re.compile(r"[A-Za-z]:")
+def _lane_output(name, key: str, raw: str) -> str:
+    """A declared lane output, refused when it names the directory crapkit.toml
+    sits in: the runner clears each declared path before an attempt and reads
+    the one file there, and `artifact = "."` ended `crapkit coverage` in a
+    traceback."""
+    value = _path(f"lane.{key}", raw)
+    if _names_the_root(value, required=key == "artifact"):
+        raise ConfigError(f"lane {name!r}: {key} names the directory crapkit.toml sits in "
+                          f"(written {quoted_path(raw)}), not a file; set it to the report "
+                          "file the lane's command writes")
+    return value
 
 
-def _outside_root(entry: str) -> bool:
-    """An input git would read outside the root, or could not read at all.
-
-    Inputs become pathspecs read from the root with diff.relative on, and that
-    diff never reports a change above the root: a `../shared` input would be
-    trusted forever."""
-    path = entry.replace("\\", "/")
-    return not path or path.startswith("/") or bool(_DRIVE_PATH.match(path)) or ".." in path.split("/")
+def _names_the_root(value: str, required: bool) -> bool:
+    """Empty, `.` or `cov/..`. An optional output left empty is one the lane
+    does not declare."""
+    return (bool(value) or required) and posixpath.normpath(value or ".") == "."
 
 
-def _lane_inputs(row: dict) -> tuple[str, ...]:
-    return tuple(_lane_input(row.get("name"), entry) for entry in row.get("inputs", ()))
-
-
-def _lane_input(name, entry: str) -> str:
-    r"""One input spelled the way `git ls-files` spells a root-relative path.
-
-    git reads inputs with --literal-pathspecs, so `src/*.ts` would match no
-    file at all and the lane would be reused forever while its sources change.
-    `src\app.ts` matched on Windows git and named a file holding a backslash on
-    Linux; the scope-path spelling rule settles that before git sees it."""
-    if _outside_root(entry):
-        raise ConfigError(f"lane {name!r}: inputs entry {entry!r} is not a path "
-                          "inside the root; list paths relative to crapkit.toml, without '..'")
-    if "*" in entry or "?" in entry:
-        raise ConfigError(f"lane {name!r}: inputs entry {entry!r} is a glob; inputs are literal "
-                          "paths from the root, so list the directory or file itself")
-    return _unrooted(entry) or "."
+def _lane_inputs(row: dict, root: str | os.PathLike | None = None) -> tuple[str, ...]:
+    owner = f"lane {row.get('name')!r}: inputs entry "
+    return tuple(_path("lane.inputs", entry, root, owner) for entry in row.get("inputs", ()))
 
 
 def _reject_shared_artifacts(lanes: list, root=None) -> None:
@@ -771,22 +638,40 @@ def _reject_shared_artifacts(lanes: list, root=None) -> None:
             if key in seen_artifacts:
                 raise ConfigError(
                     f"lanes {seen_artifacts[key]!r} and {lane.name!r} share the artifact path "
-                    f"{artifact!r}; reused paths cross-attribute coverage under --reuse-artifacts")
+                    f"{quoted_path(artifact)}; reused paths cross-attribute coverage under --reuse-artifacts")
             seen_artifacts[key] = lane.name
 
 
 def _unique_lanes(rows, scope_names: set, root) -> list[Lane]:
+    """The lanes, keyed on the name as Windows and macOS compare file names,
+    which ignore case: `unit` and `Unit` would write one log file."""
     lanes: dict[str, Lane] = {}
     for row in rows:
         lane = _parse_lane(row, scope_names, root)
-        if lane.name in lanes:
-            raise ConfigError(f"duplicate lane name {lane.name!r}; each lane needs its own name")
-        lanes[lane.name] = lane
+        _refuse_second(lanes.get(lane.name.lower()), lane)
+        lanes[lane.name.lower()] = lane
     return list(lanes.values())
 
 
+def _refuse_second(earlier: Lane | None, lane: Lane) -> None:
+    if earlier is None:
+        return
+    if earlier.name == lane.name:
+        raise ConfigError(f"duplicate lane name {lane.name!r}; each lane needs its own name")
+    raise ConfigError(f"lanes {earlier.name!r} and {lane.name!r} differ only in case, and "
+                      "Windows and macOS ignore case in a file name, so both would write the "
+                      f"log .crapkit/lane-{lane.name}.log; rename one")
+
+
+def _scoped_tests(main: dict) -> tuple[tuple[str, str], ...]:
+    """Each scope's test-scoped template, by scope name, with its launcher
+    token expanded; `{files}` stays for test-scoped to fill in."""
+    return tuple(sorted((name, _expanded(template))
+                        for name, template in main.get("scoped_tests", {}).items()))
+
+
 def _build_config(raw: dict, root: str | os.PathLike | None = None) -> Config:
-    scopes, scope_notes = _parse_scopes(raw["scope"])
+    scopes, scope_notes = _parse_scopes(raw["scope"], root)
     scope_names = {s.name for s in scopes}
     main = raw.get("crapkit", {})
     lanes = [lane._replace(log_max_bytes=main.get("log_max_bytes", 16777216))
@@ -795,16 +680,17 @@ def _build_config(raw: dict, root: str | os.PathLike | None = None) -> Config:
     return Config(
         target=main.get("target", DEFAULT_TARGET),
         scopes=scopes,
-        exclude_globs=tuple(raw.get("exclude", {}).get("globs", ())),
+        exclude_globs=tuple(_path("exclude.globs", glob)
+                            for glob in raw.get("exclude", {}).get("globs", ())),
         max_file_bytes=raw.get("exclude", {}).get("max_file_bytes"),
         churn_window_months=main.get("churn_window_months", 12),
         worklist_floor=main.get("worklist_floor", 5),
         worklist_top=main.get("worklist_top", 50),
         lanes=tuple(lanes),
-        ratchet_file=main.get("ratchet_file", "crapkit-ratchet.tsv"),
+        ratchet_file=_path("crapkit.ratchet_file", main.get("ratchet_file", "crapkit-ratchet.tsv")),
         alert_command=main.get("alert_command", ""),
-        scoped_tests=tuple(sorted(main.get("scoped_tests", {}).items())),
-        mutation_command=main.get("mutation_command", ""),
+        scoped_tests=_scoped_tests(main),
+        mutation_command=_expanded(main.get("mutation_command", "")),
         mutation_timeout_seconds=main.get("mutation_timeout_seconds", 300),
         mutation_workers=main.get("mutation_workers", 1),
         diff_uncovered_max=main.get("diff_uncovered_max"),

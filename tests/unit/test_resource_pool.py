@@ -38,8 +38,12 @@ def test_serial_request_does_not_create_budget_files():
     assert not Path(resource_status()["budget_directory"]).exists()
 
 
-def test_a_smaller_overlapping_request_uses_remaining_slots():
+def test_a_smaller_overlapping_request_uses_remaining_slots(monkeypatch):
+    """The CPU count caps the budget, so on a three-CPU host the second pool
+    finds one slot and runs serial. The test pins four CPUs to hold four slots."""
+    from crapkit import resources
     from crapkit._analysis_pool import analysis_pool
+    monkeypatch.setattr(resources, "available_cpus", lambda: (4, "cpu_count"))
     with analysis_pool(workers=2, worker_budget=4) as first:
         assert first is not None
         with analysis_pool(workers=2, worker_budget=4) as second:
@@ -159,6 +163,19 @@ def test_registration_refusal_cannot_release_work_or_keep_slots(monkeypatch):
         with analysis_pool(workers=2, worker_budget=2) as pool:
             list(pool.map(abs, [-1], chunksize=1))
     assert len(_free_slots()) == 2
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fork workers; a Windows queue writes without a cross-process lock")
+def test_a_refused_worker_that_exits_holding_the_queue_lock_cannot_stop_cleanup(tmp_path):
+    """A refused worker exits at once, and its queue feeder can still hold the
+    registration queue's write lock then (a worker the broken pool kills
+    mid-put leaves it the same way). Cleanup that puts a stop message on that
+    queue waits on the lock forever: a linux 3.12 gate run hung in close()."""
+    process = _start_fixture(tmp_path, "refused")
+    output, error = communicate(process)
+    assert process.returncode == 0, output + error
+    assert "fixture registration refusal" in output, output + error
+    _wait_for(lambda: len(_free_slots()) == 2)
 
 
 def _stopped_linux(pid):

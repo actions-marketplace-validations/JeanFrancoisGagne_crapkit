@@ -8,6 +8,8 @@ import multiprocessing
 from multiprocessing.connection import wait
 import os
 from pathlib import Path
+import queue
+import sys
 import threading
 
 from .errors import ToolError
@@ -48,6 +50,27 @@ def _stop_with_parent(parent):
     os._exit(1)
 
 
+def _utf8_output() -> None:
+    """The parent's stream rule, in a worker: a pipe carries UTF-8 and a
+    terminal keeps its own encoding, and neither raises on a character it
+    cannot encode. A spawned worker builds its own sys.stderr and never ran the
+    parent's `_reconfigure_streams`, so lizard's `[skip] fail to process` line
+    reached a UTF-8 reader in the ANSI code page or PYTHONIOENCODING's codec."""
+    for stream in (sys.stdout, sys.stderr):
+        if not hasattr(stream, "reconfigure"):
+            continue
+        if stream.isatty():
+            stream.reconfigure(errors="replace")
+        else:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+def _worker_start(registrations, paths) -> None:
+    """The pool's initializer: the worker's output first, then its gate."""
+    _utf8_output()
+    _worker_gate(registrations, paths)
+
+
 def _worker_gate(registrations, paths) -> None:
     if os.name != "nt":
         os.setsid()
@@ -83,8 +106,20 @@ def _refuse_gate(gate):
         pass  # The worker can already have exited after its caller died.
 
 
-def _register_workers(owner, registrations, errors: list) -> None:
-    for entry in iter(registrations.get, None):
+_STOP_POLL_SECONDS = 0.05
+
+
+def _register_workers(owner, registrations, stopping, errors: list) -> None:
+    """Release each worker that registers until the pool closes. The stop is a
+    flag read between short waits, never a message on this queue: a worker
+    that exits inside its put (refused, or killed by a broken pool) keeps the
+    queue's write lock, and a stop message put behind that lock never
+    arrives."""
+    while not stopping.is_set():
+        try:
+            entry = registrations.get(timeout=_STOP_POLL_SECONDS)
+        except queue.Empty:
+            continue
         _release_worker(owner, *entry, errors)
 
 
@@ -96,11 +131,13 @@ class _OwnedPool:
         # Windows spawn writes this descriptor through a bounded bootstrap pipe.
         packed = (str(Path(paths[0]).parent), tuple(Path(path).name for path in paths))
         self.executor = ProcessPoolExecutor(max_workers=len(paths), mp_context=context,
-                                           initializer=_worker_gate,
+                                           initializer=_worker_start,
                                            initargs=(self.registrations, packed))
         self.errors = []
+        self.stopping = threading.Event()
         self.registrar = threading.Thread(target=_register_workers,
-                                          args=(owner, self.registrations, self.errors), daemon=True)
+                                          args=(owner, self.registrations, self.stopping, self.errors),
+                                          daemon=True)
         self.started = False
 
     def map(self, function, jobs, *, chunksize=1):
@@ -125,8 +162,8 @@ class _OwnedPool:
 
     def close(self):
         self.executor.shutdown(wait=True, cancel_futures=True)
+        self.stopping.set()
         if self.started:
-            self.registrations.put(None)
             self.registrar.join()
         self.registrations.close()
         self.registrations.join_thread()

@@ -14,10 +14,13 @@ from pathlib import Path
 
 import pytest
 
+from crapkit import invocation
 from crapkit.config import Config
+from crapkit.lane_command import python_token
 from crapkit.churn import parse_git_log
 from crapkit.cli.parser import build_parser
-from crapkit.scaffold import detect_lanes, gitignore_entries, live_lanes, starter_toml
+from crapkit.scaffold import (detect_lanes, gitignore_entries, live_lanes, npm_package,
+                              starter_toml)
 from crapkit.score import grade
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -25,14 +28,14 @@ PY_SCOPES = {"calc": ("python",)}
 JS_SCOPES = {"src": ("typescript",)}
 # The package.json the TypeScript quickstart's repo carries: a `test` script and
 # vitest in devDependencies is what makes it "a vitest repo".
-TS_PACKAGE = json.dumps({"scripts": {"test": "vitest run"},
-                         "devDependencies": {"vitest": "^2.0.0"}})
+TS_PACKAGE = npm_package({"scripts": {"test": "vitest run"},
+                          "devDependencies": {"vitest": "^2.0.0"}})
 # `N functions scored: 2 measured / 1 no-lane, 1 over ceiling 6, CRAP load 3.0, grade F`,
 # zero buckets dropped, the ceiling labelled one way or the other.
 _SUMMARY = re.compile(
     r"(\d+) functions scored(?:: ([^,]+))?, (\d+) over (?:ceiling \d+|their ceilings \([^)]*\)),"
     r" CRAP load [\d.]+, grade (\S+)")
-_BUCKET = re.compile(r"(\d+) (measured|untested|no-lane|cc-only)")
+_BUCKET = re.compile(r"(\d+) (measured|untested|excluded|no-lane|cc-only)")
 
 
 @lru_cache(maxsize=None)
@@ -101,7 +104,9 @@ def test_every_lane_example_in_the_docs_comes_back_from_doctor_clean():
 
 
 def _py_lanes():
-    return detect_lanes(frozenset({"pyproject.toml"}), "")
+    """The lane init writes where no venv in the tree carries pytest: the
+    `{python}` launcher token, which reads as this OS's python at load."""
+    return detect_lanes(frozenset({"pyproject.toml"}), None, interpreter=python_token())
 
 
 def _js_lanes():
@@ -167,8 +172,10 @@ DEMO_FILES = ("calc/__init__.py", "calc/grade.py", "calc/parse.py", "calc/report
 
 def test_the_python_quickstart_prints_the_config_init_writes():
     """Including the commented lane template, which is what the prose above the
-    block promises init leaves behind."""
-    assert starter_toml(PY_SCOPES, _py_lanes(), tracked=DEMO_FILES) in _doc("README.md")
+    block promises init leaves behind. The demo repo carries no venv, so init
+    names the interpreter with the launcher token wherever `{python}` resolves."""
+    assert starter_toml(PY_SCOPES, _py_lanes(), interpreter=python_token(),
+                        tracked=DEMO_FILES) in _doc("README.md")
 
 
 def test_the_typescript_quickstart_prints_the_gitignore_line_init_writes():
@@ -296,16 +303,91 @@ def _route_one() -> str:
 def test_route_one_carries_a_powershell_form_that_writes_no_byte_order_mark():
     """`Out-File` under PowerShell 5.1 writes UTF-16, and git answers `cannot spawn
     .git/hooks/pre-commit`. The form the page prints has to be the one that
-    writes plain bytes, with the interpreter quoted and forward-slashed so git's
-    sh can exec it."""
+    writes plain bytes, with the launcher's path quoted and forward-slashed so
+    git's sh can exec it. The launcher, not `python`: a pipx or uv tool install
+    has no python that imports crapkit."""
     block = _route_one()
     powershell = block[block.index("```powershell"):]
 
     assert "Set-Content" in powershell and "-Encoding ascii" in powershell, block
     assert "Out-File" not in powershell, "the form that writes the mark must not be the recipe"
-    assert "-replace '\\\\', '/'" in powershell, "the interpreter path is forward-slashed"
-    assert "exec '$python' -m crapkit hook-precommit" in powershell, "quoted, as sh reads it"
+    assert "-replace '\\\\', '/'" in powershell, "the launcher path is forward-slashed"
+    assert "exec '$crapkit' hook-precommit" in powershell, "quoted, as sh reads it"
     assert "cannot spawn" in block, "the failure the form avoids is named"
+
+
+def test_route_one_powershell_stops_when_no_crapkit_is_on_path():
+    """Without -ErrorAction Stop, Get-Command only writes an error: the block
+    goes on and writes `exec '' hook-precommit`, and every commit then fails on
+    a hook that names nothing."""
+    block = _route_one()
+    powershell = block[block.index("```powershell"):]
+
+    assert "(Get-Command crapkit -ErrorAction Stop).Source" in powershell
+
+
+def test_route_one_says_which_powershell_writes_the_mark():
+    """Measured: Windows PowerShell 5.1 writes UTF-16 behind a mark from `>` and
+    `Out-File`, and a UTF-8 mark from `Out-File -Encoding utf8`; PowerShell 7.6
+    writes no mark from any of the three. The page said `Out-File` and `>` write
+    one, which a pwsh 7 reader can check and find false."""
+    block = " ".join(_route_one().split())
+
+    assert "Windows PowerShell 5.1" in block and "PowerShell 7 writes no mark" in block, block
+
+
+def test_the_gate_section_says_a_set_hooks_path_moves_every_hook():
+    """A global `core.hooksPath`, or the one husky writes, makes git skip
+    `.git/hooks`: Route 1 then armed nothing, and husky set the path back over
+    Route 2's on the next `npm install`."""
+    section = " ".join(_section(_doc("README.md"), "## The gate").split())
+
+    assert "git config core.hooksPath" in section
+    assert "`.husky/pre-commit`" in section, "husky repos add the line to husky's own hook"
+
+
+# The lines README's hook body is made of, as a block writes each one. Decision
+# (f): the crapkit launcher first, then uvx, so a pipx, uv tool or uvx install
+# reaches the gate. `exec python -m crapkit` alone refused every commit on a
+# machine whose PATH has no `python` (Debian, Ubuntu) and on every pipx or uv
+# tool install, whose interpreter is not the one on PATH.
+HOOK_BODY = ("command -v crapkit >/dev/null 2>&1 && exec crapkit hook-precommit",
+             "command -v uvx >/dev/null 2>&1 && exec uvx crapkit hook-precommit",
+             "exec python -m crapkit hook-precommit")
+FENCE_NAMES = {"sh": "sh", "powershell": "PowerShell", "yaml": "YAML"}
+
+
+def _route_blocks() -> dict[str, list[tuple[str, bool]]]:
+    """Each README route's fenced blocks, by route number: the fence language,
+    and whether the block writes both lines of the hook body."""
+    gate = _section(_doc("README.md"), "## The gate")
+    return {number: [(lang, all(line in block for line in HOOK_BODY))
+                     for lang, block in re.findall(r"^```(\w+)\n(.*?)^```$", body, re.M | re.S)]
+            for number, body in re.findall(r"^### Route (\d):[^\n]*\n(.*?)(?=^### |\Z)", gate, re.M | re.S)}
+
+
+def _body_routes(routes: dict[str, list[tuple[str, bool]]]) -> set[str]:
+    return {number for number, blocks in routes.items() if any(writes for _, writes in blocks)}
+
+
+def _forms_without_the_body(routes: dict[str, list[tuple[str, bool]]]) -> set[str]:
+    """The blocks, in routes that write the hook body, that write something else."""
+    return {f"Route {number}'s {FENCE_NAMES[lang]} form"
+            for number in _body_routes(routes) for lang, writes in routes[number] if not writes}
+
+
+def test_the_gate_section_names_the_routes_that_write_the_hook_body():
+    """The section said every route below writes the same hook body. Route 1's
+    PowerShell form bakes in the launcher's path instead, Route 3 hands `crapkit
+    hook-precommit` to the pre-commit framework, and Route 4 gates in CI with no
+    hook: the sentence names the routes whose blocks write the body, and the
+    section names each form in them that does not."""
+    routes = _route_blocks()
+    intro = " ".join(_section(_doc("README.md"), "## The gate").split("\n### Route 1")[0].split())
+    claim = next((s for s in re.split(r"(?<=\.)\s+", intro) if "hook body" in s), "")
+
+    assert set(re.findall(r"Route (\d)", claim)) == _body_routes(routes), claim
+    assert _forms_without_the_body(routes) <= set(re.findall(r"Route \d's \w+ form", intro)), intro
 
 
 def test_route_one_says_git_refuses_the_commit_a_marked_hook_cannot_spawn():
@@ -347,7 +429,76 @@ def test_route_two_creates_the_directory_it_writes_into():
     block = _route_two()
     assert "mkdir -p githooks" in block
     assert block.index("mkdir -p githooks") < block.index("githooks/pre-commit <<")
-    assert "exec python -m crapkit hook-precommit" in block, "no script body to write"
+    assert all(line in block for line in HOOK_BODY), "no script body to write"
+
+
+# --- one hook body on every page that writes one ------------------------------
+
+def _handbook_hook() -> str:
+    """The script the handbook's printf writes, with printf's \\n expanded."""
+    import html
+
+    page = html.unescape(_doc("docs/handbook.html"))
+    (line,) = [ln for ln in page.splitlines() if ln.startswith("printf '#!/bin/sh")]
+    return line.split("'")[1].replace("\\n", "\n")
+
+
+@pytest.mark.parametrize("written", [
+    pytest.param(_route_one, id="route-1"),
+    pytest.param(_route_two, id="route-2"),
+    pytest.param(_handbook_hook, id="handbook"),
+])
+def test_every_printed_sh_hook_calls_the_crapkit_launcher_first(written):
+    assert "#!/bin/sh\n" + "".join(f"{line}\n" for line in HOOK_BODY) in written()
+
+
+def test_the_gate_section_names_the_order_the_hook_tries():
+    gate = " ".join(_section(_doc("README.md"), "## The gate").split())
+
+    assert "the `crapkit` command" in gate
+    assert "then `uvx crapkit`, then `python -m crapkit`" in gate
+
+
+# What each line of the hook body runs, as the prose names it.
+BODY_LAUNCHERS = {"crapkit hook-precommit": "`crapkit`", "uvx crapkit": "`uvx`", "python -m crapkit": "`python`"}
+
+
+def test_every_line_of_the_hook_body_has_a_launcher_the_prose_names():
+    assert all(any(run in line for run in BODY_LAUNCHERS) for line in HOOK_BODY)
+
+
+def test_the_gate_section_names_every_launcher_where_it_says_git_refuses_every_commit():
+    """With uv installed, the uvx line runs the gate, so a PATH with no
+    `crapkit` command and no `python` that imports it still commits through
+    the gate. The sentence that says git refuses every commit named only
+    those two."""
+    intro = " ".join(_section(_doc("README.md"), "## The gate").split("\n### Route 1")[0].split())
+    (refusal,) = [s for s in re.split(r"(?<=\.)\s+", intro) if "refuses every commit" in s]
+
+    assert [name for name in BODY_LAUNCHERS.values() if name not in refusal] == [], refusal
+
+
+def test_the_handbook_callout_names_every_line_the_hook_tries():
+    """The Enforcement callout told a reader the hook runs `crapkit`, then
+    `python -m crapkit`; the block above it writes a uvx line between them."""
+    import html
+
+    page = _doc("docs/handbook.html")
+    section = page.split("<h3>Enforcement: seed the ratchet, then arm the hook</h3>", 1)[1].split("<h3", 1)[0]
+    callout = " ".join(html.unescape(re.sub(r"<[^>]+>", "", section.split('class="callout', 1)[1])).split())
+
+    assert [run for run in BODY_LAUNCHERS if run.split(" hook")[0] not in callout] == [], callout
+
+
+def test_the_install_section_says_what_to_run_when_pip_refuses():
+    """PEP 668 Pythons (Debian 12, Ubuntu 23.04+, Homebrew, uv) refuse the
+    Install line with externally-managed-environment. The section names the
+    refusal and routes that need no --break-system-packages."""
+    refuses = _section(_doc("README.md"), "### When pip refuses")
+
+    assert "error: externally-managed-environment" in refuses
+    for line in ("pipx install crapkit", "uv tool install crapkit", "pipx ensurepath", "uv tool update-shell"):
+        assert line in refuses, line
 
 
 # --- the full-suite rule -----------------------------------------------------
@@ -421,20 +572,31 @@ def test_the_readme_prints_the_taint_warning_the_code_produces():
     assert f"warning: {_taint_note(pick)}" in _doc("README.md")
 
 
+def test_the_60_second_start_prints_the_first_commit_refusal_git_reads_raise():
+    """The start quotes what `coverage` says in a repo with no commit; before
+    this it said git's own "ambiguous argument 'HEAD'"."""
+    from crapkit.gitio import _NO_COMMIT
+
+    start = _section(_doc("README.md"), "## The 60-second start")
+
+    assert f"crapkit: {_NO_COMMIT.format(root='/repo')}\n" in start
+
+
 def test_the_ratchet_page_prints_the_refusal_seed_raises_on_an_untrusted_store(tmp_path,
                                                                               monkeypatch):
     """docs/ratchet.md quotes the refusal a store with no trusted run produces.
 
     The page's session is `$ crapkit ratchet seed`, so the refusal it quotes is
-    the one a console-script run prints. The message names the invocation the
-    process was started with, and pytest is not that one.
+    the one a console-script run prints. The message names `crapkit` only when
+    PATH resolves it to this interpreter's console script, which a checkout run
+    through PYTHONPATH has not got.
     """
     from crapkit.cli.ratchet_cmds import _latest_full_run
     from crapkit.errors import CrapkitError
     from crapkit.snapshot import InventoryRow
     from crapkit.store import SnapshotStore
 
-    monkeypatch.setattr(sys, "argv", ["/usr/local/bin/crapkit", "ratchet", "seed"])
+    monkeypatch.setattr(invocation, "_runs_here", lambda found: True)
     store = SnapshotStore(tmp_path / "crap.sqlite")
     store.write_run(commit="a" * 40, tool_versions={},
                     rows=[InventoryRow("src", "src/a.py", "f( )", 1, 9, 7, 5, 5, 8, 1, 2)],
@@ -553,11 +715,68 @@ def test_the_recover_skill_files_each_path_shape_under_the_verdict_it_gets():
     assert "will score untested" in err and "will score untested" in section,         "the warning's own words, so a reader can search for what they saw"
 
 
+def _stale_lane(root: Path, moved: tuple) -> tuple:
+    """(lane, scope paths, git, recorded blob ids) for the pages' `py` lane: its
+    run measured calc/grade.py and calc/hot.py at 525a3276065, and the files in
+    `moved` hold other bytes now. That commit is not in this repo, so only the
+    blob ids the stamp recorded are judged."""
+    from types import SimpleNamespace
+
+    from crapkit.config import Lane
+    from crapkit.lane_sources import record
+    from crapkit.lanes import write_stamps
+
+    lane = Lane(name="py", command="true", artifact=".crapkit/cov/py.json",
+                parser="coveragepy", scopes=("calc",))
+    (root / ".crapkit" / "cov").mkdir(parents=True)
+    (root / lane.artifact).write_text("{}", encoding="utf-8")
+    (root / "calc").mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    for name in ("calc/grade.py", "calc/hot.py"):
+        (root / name).write_text("def f():\n    return 1\n", encoding="utf-8")
+    recorded = {name: "0" * 40 if name in moved else blob
+                for name, blob in record(root, ["calc/grade.py", "calc/hot.py"]).items()}
+    write_stamps(root, {lane.artifact: {"commit": "525a3276065" + "0" * 29, "lane": "py",
+                                        "blobs": recorded}})
+    git = SimpleNamespace(root=root)
+    return lane, {"calc": ("calc",)}, git, recorded
+
+
+def test_the_lanes_page_prints_the_reuse_warning_the_lane_writes(tmp_path, capsys, monkeypatch):
+    """The `--reuse-artifacts` transcript is the lane's own warning. The page
+    quoted one that counted the changed files and named none of them."""
+    from crapkit.lanes import _warn_stale_artifact
+
+    monkeypatch.setattr(sys, "argv", ["crapkit"])
+    lane, scopes, git, _ = _stale_lane(tmp_path, ("calc/grade.py", "calc/hot.py"))
+    _warn_stale_artifact(git, lane, scopes)
+
+    warning = capsys.readouterr().err.strip()
+    assert warning and warning in _doc("docs/lanes.md")
+
+
+def test_the_agent_json_page_prints_the_stale_note_the_reader_writes(tmp_path, monkeypatch):
+    """The `measured` example of `uncovered_lines_note` is the note a file whose
+    bytes moved gets. It said "files in its scopes changed" whatever the cause
+    and named none."""
+    from crapkit.lane_freshness import Freshness
+    from crapkit.uncovered import MissingLines
+
+    monkeypatch.setattr(sys, "argv", ["crapkit"])
+    lane, scopes, _, _ = _stale_lane(tmp_path, ("calc/grade.py",))
+    lines = MissingLines({}, "", Freshness(tmp_path, (lane,), scopes))
+    note = lines.note_for("calc/grade.py")
+
+    assert note and json.dumps(note, ensure_ascii=False) in _doc("docs/agent-json.md")
+    assert lines.moved("calc/hot.py") == "", "a file whose bytes did not move keeps its lines"
+
+
 def test_the_lanes_page_quotes_the_drop_threshold_the_code_warns_at():
-    from crapkit.lanes import SUITE_DROP_FRACTION, suite_drops
+    from crapkit.lane_results import SUITE_DROP_FRACTION, suite_drops
 
     assert f"**{SUITE_DROP_FRACTION:.0%}**" in _doc("docs/lanes.md")
-    (note,) = suite_drops({"py": {"tests_total": 20}}, {"py": {"tests_total": 12}})
+    previous = [{"kind": "coverage", "lanes": {"py": {"tests_total": 20}}}]
+    (note,) = suite_drops(lambda: previous, {"py": {"tests_total": 12}})
     assert f"crapkit: {note}" in _doc("docs/lanes.md")
 
 
@@ -663,11 +882,12 @@ def _payload_splits(ccn: int) -> int:
 # --- the stale-artifact move -------------------------------------------------
 
 def test_no_page_says_committing_alone_clears_a_stale_artifact():
-    """It does not: nothing rereads the artifact until a run does. The runtime
-    note has always said so; the prose on both pages did not."""
+    """It does not: nothing rereads the artifact until a run does, and the
+    staleness is about the file's bytes, which a commit leaves as they are. The
+    runtime note has always said to rerun; the prose on both pages did not."""
     for page in ("AGENTS.md", "docs/agent-json.md"):
         text = " ".join(_doc(page).lower().split())
-        assert "commit or revert the edits, then rerun `crapkit coverage`" in text, \
+        assert "rerun `crapkit coverage`. committing changes nothing" in text, \
             f"{page} never names the working move"
         assert "committing (or the verify at the end of the loop) clears it" not in text
 
@@ -963,6 +1183,75 @@ def test_the_handbook_transcripts_use_the_ascii_separator():
     assert ") - 4 of 4 active (worklist_top 50), 0 dormant" in handbook
 
 
+# Workflow 3's repo: Python, TypeScript, Rust and shell, one top directory each.
+POLYGLOT_SCOPES = {"api": ("python",), "infra": ("rust",), "ops": ("shell",), "ui": ("typescript",)}
+
+
+def _handbook_pre(heading: str) -> str:
+    """The first <pre> under one of the handbook's h3 headings, as a reader sees it."""
+    import html
+
+    after = _doc("docs/handbook.html").split(f"<h3>{heading}</h3>", 1)[1]
+    return html.unescape(re.search(r"<pre><code>(.*?)</code></pre>", after, re.S).group(1))
+
+
+def _printed_under(transcript: str, command: str) -> list[str]:
+    """The lines a transcript prints under `$ command`, down to the next prompt."""
+    body = transcript.split(f"$ {command}\n", 1)[1]
+    return body.split("\n$ ", 1)[0].strip().splitlines()
+
+
+def test_the_polyglot_workflow_prints_the_doctor_verdict_init_leaves():
+    """Workflow 3 showed doctor FAILing `infra` and `ops` as scopes in no lane's
+    list, and told the reader to settle the fork. init writes `coverage_optional
+    = true` on a scope no coverage parser reads, so doctor has nothing to fail
+    and the reader went looking for two lines that never print. The same config
+    gets one WARN on every machine, a lane scope with no [crapkit.scoped_tests]
+    template, and doctor's closing line counts it."""
+    from crapkit.cli.admin import _doctor_uncovered, _doctor_verdict
+    from crapkit.config import load_config_text
+    from crapkit.doctor import scoped_test_gaps
+
+    lanes = live_lanes(detect_lanes(frozenset({"pyproject.toml"}), TS_PACKAGE), POLYGLOT_SCOPES)
+    cfg = load_config_text(starter_toml(POLYGLOT_SCOPES, lanes))
+    findings = _doctor_uncovered(cfg) + list(scoped_test_gaps(cfg.lanes, cfg.scoped_tests))
+    printed = _printed_under(_handbook_pre("3 · Day one on a polyglot repo"), "crapkit doctor")
+
+    assert ([line for line in printed if line.startswith(("FAIL", "WARN"))]
+            == [f"{finding.level} {finding.text}" for finding in findings])
+    assert printed[-1] == _doctor_verdict(findings)
+
+
+# "two FAILs", "The one <code>WARN</code>": a count of doctor lines in running prose.
+_COUNTED_LINES = re.compile(r"\b(one|two|three|four|five)\s+(FAIL|WARN)s?\b")
+_SMALL_COUNTS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
+
+
+def _handbook_prose_after_pre(heading: str) -> str:
+    """The paragraphs under one of the handbook's h3 headings, after its first
+    <pre> and before the next heading, with the markup taken out."""
+    import html
+
+    section = _doc("docs/handbook.html").split(f"<h3>{heading}</h3>", 1)[1].split("<h3>", 1)[0]
+    return html.unescape(re.sub(r"<[^>]+>", "", section.split("</code></pre>", 1)[1]))
+
+
+def test_the_polyglot_workflow_s_prose_counts_the_lines_its_doctor_prints():
+    """The paragraphs under workflow 3 count the FAIL and WARN lines its doctor
+    transcript prints. A merge that keeps an older paragraph beside a newer
+    transcript tells the reader to "read those two FAILs" under a doctor block
+    that prints none, and drops the paragraph on the WARN the block does print."""
+    from collections import Counter
+
+    heading = "3 · Day one on a polyglot repo"
+    printed = _printed_under(_handbook_pre(heading), "crapkit doctor")
+    shown = Counter(line.split()[0] for line in printed if line.startswith(("FAIL", "WARN")))
+    counted = {(level, _SMALL_COUNTS[word])
+               for word, level in _COUNTED_LINES.findall(_handbook_prose_after_pre(heading))}
+
+    assert counted == set(shown.items()), "the prose counts doctor lines the transcript does not print"
+
+
 # --- the README rows an agent picks a command from ---------------------------
 
 def test_the_brief_row_documents_the_packet_and_its_batch_form():
@@ -988,6 +1277,60 @@ def test_the_changelog_records_the_packet_release():
         assert token in unreleased, f"the packet entry never mentions {token!r}"
 
 
+# --- skills a Codex user loads -------------------------------------------------
+
+# Codex installs the same plugin and loads these two skills, and an agent runs a
+# skill's commands as written. A bare `claude plugin install` in one of them sent
+# a Codex agent to a CLI its user may not have. Every `claude` command now sits
+# in a paragraph, block or table row that says it is Claude Code's, beside the
+# Codex command that does the same.
+PLUGIN_SKILLS = ("plugin/skills/crapkit-onboard/SKILL.md", "plugin/skills/crapkit-recover/SKILL.md")
+CLAUDE_COMMAND = re.compile(r"(?:^|`)claude (?:plugin|mcp) ", re.M)
+
+
+def _units(text: str) -> list[str]:
+    """Paragraphs and fences, with each table row a unit of its own."""
+    units: list[str] = []
+    for block in re.split(r"\n\s*\n", text):
+        rows = block.splitlines()
+        units += rows if rows and all(row.startswith("|") for row in rows) else [block]
+    return units
+
+
+def unlabelled_claude_calls(text: str) -> list[str]:
+    """Units that show a `claude plugin` or `claude mcp` call with no 'Claude
+    Code' in them or in the unit just before them."""
+    units = _units(text)
+    return [unit for before, unit in zip(["", *units], units)
+            if CLAUDE_COMMAND.search(unit) and "Claude Code" not in before + unit]
+
+
+def test_the_label_check_flags_a_bare_claude_call_and_passes_a_labelled_one():
+    assert unlabelled_claude_calls("Install it:\n\n```\nclaude plugin install crapkit@crapkit\n```")
+    assert unlabelled_claude_calls("Wire it:\n\n```\nclaude mcp add crapkit -- crapkit mcp\n```")
+    assert not unlabelled_claude_calls("In Claude Code:\n\n```\nclaude plugin install crapkit@crapkit\n```")
+    assert not unlabelled_claude_calls("| x | in Claude Code `claude plugin install crapkit@crapkit` |")
+    assert not unlabelled_claude_calls("exit 2 from `crapkit claude-hook`")
+
+
+@pytest.mark.parametrize("page", PLUGIN_SKILLS)
+def test_no_skill_shows_a_codex_user_a_claude_command_as_theirs(page):
+    text = _doc(page)
+
+    assert unlabelled_claude_calls(text) == []
+    assert "codex plugin add crapkit@crapkit" in text, "the Codex equivalent sits beside it"
+
+
+# --- a Python older than the floor -------------------------------------------
+
+def test_readme_install_sends_an_older_python_to_uvx():
+    """pip on Python 3.10 finds no release; the line that says so names the way out."""
+    install = " ".join(_section(_doc("README.md"), "## Install").split())
+    sentences = [s for s in install.split(". ") if "3.11" in s and "uvx crapkit" in s]
+
+    assert sentences, "README Install never tells a Python 3.10 user that uvx runs crapkit"
+
+
 # --- one read per page -------------------------------------------------------
 
 def test_each_doc_page_is_read_from_disk_once(monkeypatch):
@@ -1005,3 +1348,17 @@ def test_each_doc_page_is_read_from_disk_once(monkeypatch):
 
     assert reads == ["README.md", "AGENTS.md"]
     _doc.cache_clear()
+
+
+def test_the_agent_json_page_prints_the_worklist_warnings_the_queue_writes(monkeypatch):
+    """The plain worklist's two content warnings, as the page quotes them, with
+    git's own words standing in for the error git gives."""
+    from crapkit.cli.queue import RunFreshness, _freshness_warnings
+
+    monkeypatch.setattr(sys, "argv", ["crapkit"])
+    latest = {"id": 4, "commit": "c" * 40}
+    changed = _freshness_warnings(RunFreshness(False, ["calc/grade.py", "calc/report.py"]), latest)
+    unread = _freshness_warnings(RunFreshness(False, None, "<git's error>"), latest)
+
+    for line in changed + unread:
+        assert f"\n{line}\n" in _doc("docs/agent-json.md"), line

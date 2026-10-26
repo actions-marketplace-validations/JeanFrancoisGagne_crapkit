@@ -8,6 +8,7 @@ row's command goes through the argument parser of the script it calls.
 """
 from collections import defaultdict
 import itertools
+import json
 from pathlib import Path
 import re
 import runpy
@@ -26,13 +27,32 @@ def workflow():
     return yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
 
 
-def matrix_rows(matrix):
-    """Every job a matrix expands to: the product of its axes less each row an exclude matches."""
+EVENTS = ("push", "pull_request", "schedule")
+
+
+def matrix_rows(matrix, events=EVENTS):
+    """Every job a matrix expands to on any of `events`: the product of its axes
+    less each row an exclude matches."""
     assert "include" not in matrix, "this expansion handles exclude rows only"
-    axes = dict(matrix)
-    rules = axes.pop("exclude", [])
+    rows = []
+    for event in events:
+        rows += [row for row in _expanded(matrix, event) if row not in rows]
+    return rows
+
+
+def _expanded(matrix, event):
+    axes = {name: _axis(values, event) for name, values in matrix.items() if name != "exclude"}
     rows = (dict(zip(axes, values)) for values in itertools.product(*axes.values()))
-    return [row for row in rows if not _excluded(row, rules)]
+    return [row for row in rows if not _excluded(row, matrix.get("exclude", []))]
+
+
+def _axis(values, event):
+    """An axis as listed, or the list its `${{ fromJSON(...) }}` gives on `event`."""
+    if not isinstance(values, str):
+        return values
+    expression = values.removeprefix("${{").removesuffix("}}").strip()
+    inner = expression.removeprefix("fromJSON(").removesuffix(")")
+    return json.loads(evaluate(inner, SimpleNamespace(event_name=event)))
 
 
 def _excluded(row, rules):
@@ -75,7 +95,7 @@ def test_each_windows_session_is_a_job_and_every_platform_runs_each_suite_once()
 def measurement_hand_offs(jobs):
     """Each measurement row's side and the artifact name and path it uploads."""
     job = jobs["verdict-measure"]
-    command = step(job, "run", "python tools/testing/ci.py")["run"]
+    command = step(job, "run", 'python tools/testing/ci.py --base "$BASE_REF" --measure')["run"]
     upload = step(job, "uses", "actions/upload-artifact@")
     assert upload["if"] == "always()", "a failed measurement still hands off what it has"
     assert upload["with"]["include-hidden-files"] is True
@@ -177,3 +197,14 @@ def test_a_pull_request_cancels_its_older_run_and_every_push_to_main_finishes():
     main, next_main = run_of("push", "refs/heads/main", 201), run_of("push", "refs/heads/main", 202)
     assert group(main)[0] != group(next_main)[0], "a queued main run would replace a pending one"
     assert group(main)[1] is False
+
+
+def test_every_workflow_job_ends_at_its_own_bound():
+    """A job with no timeout-minutes runs until GitHub's 6 h default. The 2026-10-01
+    gate audit found 553 machine-minutes spent that way: an Ubuntu test leg ran 360
+    min, the candidate measurement 121.7 and dogfood 71.6 before a cancel."""
+    unbounded = [f"{path.name}:{name}" for path in sorted((ROOT / ".github/workflows").glob("*.yml"))
+                 for name, job in yaml.safe_load(path.read_text(encoding="utf-8"))["jobs"].items()
+                 if "uses" not in job and "timeout-minutes" not in job]
+
+    assert unbounded == []

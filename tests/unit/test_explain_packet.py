@@ -58,7 +58,7 @@ def guarded_twin(a, b):
 
 NO_LANE = "none (no [[lane]] declared, so no artifact can say which lines are dark)"
 
-NO_CONTEXT = ("  tests: no context data — run the py lane with dynamic_context = "
+NO_CONTEXT = ("  tests: no context data - run the py lane with dynamic_context = "
               "test_function and a --show-contexts JSON report\n")
 
 # The four lines explain printed for each match before --json existed, captured
@@ -359,21 +359,138 @@ def test_a_blank_body_line_prints_blank_instead_of_bare_indentation(repo, capsys
             "      Co-Authored-By: t <t@t>\n") in out
 
 
-def test_a_span_git_refuses_to_log_reports_no_commits_rather_than_failing(tmp_path, capsys):
-    """`git log -L` on an unborn HEAD is a GitError. explain answers with an
-    empty list: a history git cannot produce is not a reason to fail the call."""
+# --- a message comes back as git stored it, whatever bytes it holds -----------
+# explain framed each record with a \x01 line and a \x02 line, read git's output in
+# text mode and split it with str.splitlines: a body could end its own record, open a
+# phantom one, crash the parse, or come back with \r, \x0c, \x1c and \x85 as newlines.
+
+def _commit_verbatim(repo: Path, message: bytes, edit: bytes = b"if a and b and a != b:") -> None:
+    """A commit in guarded's span whose message git stores byte for byte."""
+    path = repo / "pylib" / "mod.py"
+    path.write_bytes(path.read_bytes().replace(b"if a and b:", edit))
+    _run_git(repo, "add", "-A")
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
+                    "--cleanup=verbatim", "-F", "-"], cwd=repo, input=message, check=True,
+                   capture_output=True)
+
+
+def _messages(repo: Path, capsys) -> list[tuple[str, str]]:
+    commits = _named(_payload(repo, capsys, history=True), "guarded( ")["commits"]
+    return [(c["subject"], c["body"]) for c in commits]
+
+
+@pytest.mark.parametrize("body", ["line one\n\x02\nafter the stx line",
+                                  "first\n\x01zz 2025-01-01 fake subject\nlast",
+                                  "\x01only\nlast"],
+                         ids=["stx-line", "soh-line", "soh-word"])
+def test_a_body_line_holding_a_record_mark_stays_in_its_commit(repo, capsys, body):
+    _commit_verbatim(repo, f"odd body\n\n{body}\n".encode())
+
+    assert _messages(repo, capsys) == [("odd body", body), ("seed the module", "")]
+
+
+def test_line_separators_in_a_body_come_back_as_committed(repo, capsys):
+    body = "half\rway, before\x0cafter\nsep\x1crecord, split\x85here"
+    _commit_verbatim(repo, f"separators\n\n{body}\n".encode())
+
+    assert _messages(repo, capsys) == [("separators", body), ("seed the module", "")]
+
+
+def test_a_carriage_return_in_a_subject_stays_in_the_subject(repo, capsys):
+    _commit_verbatim(repo, b"half\rsubject\n\nbody\n")
+
+    assert _messages(repo, capsys)[0] == ("half\rsubject", "body")
+
+
+def test_a_carriage_return_in_a_subject_prints_the_rest_on_an_indented_line(repo, capsys):
+    """A raw \\r on the sha line would move the cursor back over the sha."""
+    _commit_verbatim(repo, b"half\rsubject\n\nbody\n")
+    sha, date = _head(repo)
+
+    out = _explain(repo, capsys, history=True, name="guarded")
+
+    assert out.startswith(GOLDEN_A + f"    {sha} {date} half\n      subject\n      body\n")
+
+
+def test_a_body_without_a_final_newline_keeps_its_text(repo, capsys):
+    _commit_verbatim(repo, b"subject\n\nbody without a final newline")
+
+    assert _messages(repo, capsys)[0] == ("subject", "body without a final newline")
+
+
+def test_a_span_holding_bytes_that_are_not_utf8_still_lists_its_commits(repo, capsys):
+    """git prints the span's hunks in the file's own bytes; none of them is a message."""
+    _commit_verbatim(repo, b"latin-1 comment\n", edit=b"if a and b:  # caf\xe9")
+
+    assert _messages(repo, capsys) == [("latin-1 comment", ""), ("seed the module", "")]
+
+
+def test_a_repo_logging_in_latin1_still_reads_its_messages_as_committed(repo, capsys):
+    """i18n.logOutputEncoding makes git re-encode every message it prints."""
+    _run_git(repo, "config", "i18n.logOutputEncoding", "ISO-8859-1")
+    _commit_verbatim(repo, "café subject\n\ncafé body\n".encode())
+
+    assert _messages(repo, capsys)[0] == ("café subject", "café body")
+
+
+def test_a_record_mark_in_a_body_prints_under_its_own_commit(repo, capsys):
+    _commit_verbatim(repo, b"soh body\n\nfirst\n\x01zz 2025-01-01 fake subject\nlast\n")
+    sha, date = _head(repo)
+    seed_sha, seed_date = _seed_commit(repo)
+
+    out = _explain(repo, capsys, history=True, name="guarded")
+
+    assert out == (GOLDEN_A
+                   + f"    {sha} {date} soh body\n"
+                   + "      first\n"
+                   + "      \x01zz 2025-01-01 fake subject\n"
+                   + "      last\n"
+                   + f"    {seed_sha} {seed_date} seed the module\n")
+
+
+UNBORN = "pylib/mod.py:1-4 holds only uncommitted lines, so no commit has touched it yet"
+
+
+def test_a_span_before_the_first_commit_reports_null_commits_and_says_why(tmp_path, capsys):
+    """Before the first commit every line is uncommitted. explain says so. It
+    used to answer an empty list, which read as a function no commit ever
+    touched and hid that git had refused the question."""
     repo = _make_repo(tmp_path, commit=False)
 
     entry = _named(_payload(repo, capsys, history=True), "guarded( ")
 
-    assert entry["commits"] == []
-    assert "commits_note" not in entry, "the span exists, git just had nothing to say"
+    assert entry["commits"] is None
+    assert entry["commits_note"] == UNBORN
 
 
-def test_a_span_git_refuses_to_log_prints_no_commit_lines(tmp_path, capsys):
+def test_a_span_before_the_first_commit_prints_the_note_in_place_of_commits(tmp_path, capsys):
     repo = _make_repo(tmp_path, commit=False)
 
-    assert _explain(repo, capsys, history=True) == GOLDEN_A + GOLDEN_B
+    out = _explain(repo, capsys, history=True)
+
+    assert out.startswith(GOLDEN_A + f"  commits: {UNBORN}\n"), out
+
+
+def test_a_span_git_refuses_to_log_names_git_s_error_instead_of_an_empty_list(
+        repo, capsys, monkeypatch):
+    """A git failure is not an empty history: the note quotes git's error."""
+    from crapkit import gitio
+    from crapkit.errors import GitError
+
+    real = gitio._git_bytes
+
+    def refuse_log(root, *args, **kw):
+        if args and args[0] == "log":
+            raise GitError("git log failed: fatal: bad object deadbeef")
+        return real(root, *args, **kw)
+
+    monkeypatch.setattr(gitio, "_git_bytes", refuse_log)
+    entry = _named(_payload(repo, capsys, history=True), "guarded( ")
+
+    assert entry["commits"] is None
+    assert entry["commits_note"] == ("git cannot read the history of pylib/mod.py:1-4 "
+                                     "(git log failed: fatal: bad object deadbeef); fix what "
+                                     "git reports, then run `crapkit explain --history` again")
 
 
 def test_a_function_the_latest_run_dropped_reports_null_commits(tmp_path, capsys):
@@ -410,15 +527,46 @@ def _with_contexts(tmp_path: Path, contexts: dict) -> Path:
     return repo
 
 
-def test_json_carries_the_covering_tests_sorted(tmp_path, capsys):
-    repo = _with_contexts(tmp_path, {"2": ["t/b.py::test_beta|run", ""],
-                                     "3": ["t/a.py::test_alpha|run"],
-                                     "40": ["t/z.py::test_far|run"]})
+CONTEXTS = {"2": ["t/b.py::test_beta|run", ""], "3": ["t/a.py::test_alpha|run"],
+            "40": ["t/z.py::test_far|run"]}
+
+
+def test_json_carries_the_covering_tests_sorted(tmp_path, capsys, monkeypatch):
+    repo = _with_contexts(tmp_path, CONTEXTS)
+    _answered(monkeypatch, set())
 
     entry = _named(_payload(repo, capsys, tests=True), "guarded( ")
 
     assert entry["tests"] == ["t/a.py::test_alpha", "t/b.py::test_beta"]
     assert "tests_note" not in entry
+
+
+def test_a_file_whose_dark_lines_are_withheld_has_its_tests_withheld_with_the_same_note(
+        tmp_path, capsys):
+    """The test ids sit on the same line numbers as the dark lines. An artifact
+    no stamp vouches for withholds the dark lines, so it withholds the ids too:
+    read off stale lines they credit a function with another one's tests."""
+    repo = _with_contexts(tmp_path, CONTEXTS)
+
+    entry = _named(_payload(repo, capsys, tests=True), "guarded( ")
+
+    assert entry["tests"] is None
+    assert entry["uncovered_lines"] is None
+    assert entry["tests_note"] == entry["uncovered_lines_note"] != ""
+
+
+def test_a_withheld_file_with_no_context_data_keeps_the_guidance_line(repo, capsys, monkeypatch):
+    """Rerunning a lane that records no contexts would not list a test either,
+    so the line that says how to record them stays."""
+    from crapkit.uncovered import MissingLines
+
+    monkeypatch.setattr(reports, "load_uncovered",
+                        lambda root, cfg: MissingLines({}, "lane 'py': stale"))
+
+    entry = _named(_payload(repo, capsys, tests=True), "guarded( ")
+
+    assert entry["tests"] is None
+    assert entry["tests_note"] == NO_CONTEXT.strip()[len("tests: "):]
 
 
 def test_json_carries_the_no_context_note_instead_of_an_empty_list(repo, capsys):

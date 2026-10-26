@@ -8,6 +8,7 @@ from __future__ import annotations
 from urllib.parse import quote, unquote
 
 from . import __version__
+from .score import over_ceiling
 
 _RULES = (
     {"id": "crapkit/over-target",
@@ -18,6 +19,8 @@ _RULES = (
      "shortDescription": {"text": "a recorded CRAP mark got worse"}},
     {"id": "crapkit/diff-uncovered",
      "shortDescription": {"text": "a changed line no lane ever ran"}},
+    {"id": "crapkit/unread",
+     "shortDescription": {"text": "a changed file no reader could read, so the gate judged none of it"}},
 )
 
 
@@ -36,7 +39,7 @@ def over_target_results(scored, scope_targets: dict, target: int) -> list[dict]:
     out = []
     for r in scored:
         ceiling = scope_targets.get(r.scope, target)
-        if r.crap <= ceiling:
+        if not over_ceiling(r.crap, ceiling):
             continue
         out.append(_result(
             "crapkit/over-target", "warning", r.path, r.start,
@@ -49,6 +52,14 @@ def gate_results(violations) -> list[dict]:
     return [_result("crapkit/gate", "error", v.path, v.start,
                     f"{v.long_name}: CRAP {v.crap:.1f} (ccn {v.ccn}, cov {v.cov:.0%}) -> {v.remedy}")
             for v in violations]
+
+
+def unread_results(unread_files) -> list[dict]:
+    # no function was read, so line 1 anchors the file-level finding
+    return [_result("crapkit/unread", "error", u.path, 1,
+                    f"no reader could read this file, so the gate judged none of its "
+                    f"functions: {u.reason}")
+            for u in unread_files]
 
 
 def regression_results(regressions) -> list[dict]:
@@ -71,10 +82,16 @@ def diff_uncovered_results(uncovered) -> list[dict]:
             for path, line in uncovered]
 
 
+# Where OASIS publishes the SARIF 2.1.0 schema, and the id the schema declares for
+# itself. SARIF 3.13.3 asks for a URI the schema can be obtained from; the
+# oasis-tcs/sarif-spec master/Schemata path crapkit printed before answers 404.
+SCHEMA_URI = ("https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/"
+              "sarif-schema-2.1.0.json")
+
+
 def sarif_document(results: list[dict]) -> dict:
     return {
-        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/"
-                   "master/Schemata/sarif-schema-2.1.0.json",
+        "$schema": SCHEMA_URI,
         "version": "2.1.0",
         "runs": [{
             "tool": {"driver": {

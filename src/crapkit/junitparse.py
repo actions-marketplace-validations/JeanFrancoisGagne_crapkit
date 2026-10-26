@@ -6,6 +6,12 @@ stdlib ElementTree is deliberate: the XML comes from the repo's own test
 runner, the same trust class as the lane commands themselves. That trust runs
 one way: the runner is believed about what it ran, including when it says it
 stopped.
+
+Every reader takes the report's bytes, so the XML declaration and a byte-order
+mark decide how it decodes, the way XML says they do. A report declared
+ISO-8859-1, or written as UTF-16, is a report; decoded as UTF-8 first, it ended
+coverage, verify and doctor --tune with a traceback. A str is still read as
+already decoded.
 """
 from __future__ import annotations
 
@@ -13,6 +19,7 @@ import re
 import xml.etree.ElementTree as ET
 
 from .errors import ToolError
+from .plaintext import strip_junit_escapes
 
 # pytest-xdist logs a dead worker as a session-level report, so pytest's junitxml
 # writes it as <error> rather than <failure>. The nodeid it names is the test the
@@ -29,9 +36,12 @@ def _case_id(case: ET.Element) -> str:
     return f"{classname}::{case.get('name', '?')}"
 
 
-def _root(xml_text: str) -> ET.Element:
+def _root(report: str | bytes) -> ET.Element:
+    """The report's root element. Bytes are parsed as the file holds them, so the
+    XML declaration picks the encoding and a byte the encoding cannot read is a
+    parse error naming its line and column, not a crash."""
     try:
-        return ET.fromstring(xml_text)
+        return ET.fromstring(report)
     except ET.ParseError as exc:
         raise ToolError(f"unparseable junit report: {exc}") from exc
 
@@ -50,9 +60,12 @@ def _walk(root: ET.Element) -> tuple[set[str], dict]:
 
 
 def _error_text(elem: ET.Element) -> str:
-    """An error's message and body together. A runner that supplies neither
-    still owes the reader a note, so the placeholder stands in for both."""
-    return f"{elem.get('message') or ''} {elem.text or ''}".strip() or "no message"
+    """An error's message and body together, as plain text. A runner that
+    supplies neither still owes the reader a note, so the placeholder stands in
+    for both. pytest writes a coloured traceback here with ESC spelled `#x1B`,
+    and the refusal quotes this text to stderr and the PR comment."""
+    text = strip_junit_escapes(f"{elem.get('message') or ''} {elem.text or ''}")
+    return text.strip() or "no message"
 
 
 def _crash_notes(root: ET.Element) -> list[str]:
@@ -93,7 +106,7 @@ def _refuse_unfinished(root: ET.Element) -> None:
     _refuse_partial(root)
 
 
-def suite_summary(xml_text: str) -> tuple[set[str], dict]:
+def suite_summary(report: str | bytes) -> tuple[set[str], dict]:
     """(failed ids, {tests, skipped}) from ONE DOM and ONE walk.
 
     A lane needs both, and the two helpers below each parsed the same text, so
@@ -105,28 +118,28 @@ def suite_summary(xml_text: str) -> tuple[set[str], dict]:
     testcases at all: both describe a suite that never ran, and a caller reading
     either as an answer records an untrustworthy lane as a measured one.
     """
-    root = _root(xml_text)
+    root = _root(report)
     _refuse_unfinished(root)
     failed, counts = _walk(root)
     if counts["tests"] == 0:
-        raise ToolError("junit report contains zero testcases — the suite crashed before collecting, not a pass")
+        raise ToolError("junit report contains zero testcases - the suite crashed before collecting, not a pass")
     return failed, counts
 
 
-def suite_counts(xml_text: str) -> dict:
+def suite_counts(report: str | bytes) -> dict:
     """Total and skipped testcase counts — suite decay (fewer tests, more skips)
     is invisible to a pass/fail check. Counts a zero-testcase report rather than
     rejecting it; the failed-id readers are the ones that must refuse it."""
-    return _walk(_root(xml_text))[1]
+    return _walk(_root(report))[1]
 
 
-def failed_test_ids(xml_text: str) -> set[str]:
-    return suite_summary(xml_text)[0]
+def failed_test_ids(report: str | bytes) -> set[str]:
+    return suite_summary(report)[0]
 
 
-def passed_test_ids(xml_text: str) -> set[str]:
+def passed_test_ids(report: str | bytes) -> set[str]:
     """Completed passing cases; any failure or skip of the same ID wins."""
-    root = _root(xml_text)
+    root = _root(report)
     _refuse_unfinished(root)
     passed, blocked = set(), set()
     for case in root.iter("testcase"):
@@ -192,23 +205,33 @@ def _admit_declared_count(declared: str | None, counts: set[int]) -> None:
         raise ToolError("junit test count does not match its cases; the report is incomplete")
 
 
-def _seconds(raw: str | None) -> float:
-    """A hand-edited or absent time attribute costs nothing, never a crash."""
+def _seconds(raw: str | None) -> float | None:
+    """A time attribute's seconds, or None when it is absent or hand-edited to
+    something that is not a number. Never a crash, and never a made-up 0."""
     try:
         return float(raw)
     except (TypeError, ValueError):
-        return 0.0
+        return None
 
 
-def _sum_times(elements) -> float:
-    return sum(_seconds(e.get("time")) for e in elements)
+def _sum_times(elements) -> float | None:
+    """What these elements claim together, or None when not one of them
+    carries a readable time."""
+    times = [seconds for seconds in (_seconds(e.get("time")) for e in elements)
+             if seconds is not None]
+    return sum(times) if times else None
 
 
-def suite_seconds(xml_text: str) -> float:
+def suite_seconds(report: str | bytes) -> float | None:
     """Wall seconds the report claims, for costing a lane that did not run here.
 
     Suite totals first; a runner that times only its cases is summed case by
-    case. Zero means the report carries no timing at all.
+    case, and so is one whose suite total reads zero. None means the report
+    carries no timing at all: an unknown cost, not a lane that costs nothing.
     """
-    root = _root(xml_text)
-    return _sum_times(root.iter("testsuite")) or _sum_times(root.iter("testcase"))
+    root = _root(report)
+    suites = _sum_times(root.iter("testsuite"))
+    if suites:
+        return suites
+    cases = _sum_times(root.iter("testcase"))
+    return suites if cases is None else cases

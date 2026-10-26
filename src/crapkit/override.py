@@ -8,15 +8,30 @@ No environment-variable or silent bypass exists anywhere in crapkit.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
 from .errors import ConfigError, ToolError
 from .keys import stated_key
+from .plaintext import printed_text
 from .ratchet import RatchetEntry
 from .ratchetfile import RatchetFile
+from .repotext import child_input, os_text
 from .store import SnapshotStore
 from .verify import GateViolation
+
+
+# One crapkit.toml line per shell that runs alert_command (subprocess with
+# shell=True): sh has `cat`; cmd.exe has none, and `findstr "^"` echoes every
+# line of its stdin. Both append the alert to .crapkit/alerts.log.
+POSIX_ALERT_EXAMPLE = 'alert_command = "cat >> .crapkit/alerts.log"'
+WINDOWS_ALERT_EXAMPLE = """alert_command = 'findstr "^" >> .crapkit/alerts.log'"""
+
+
+def alert_example() -> str:
+    """The alert_command line a refusal hands the user, for this platform's shell."""
+    return WINDOWS_ALERT_EXAMPLE if os.name == "nt" else POSIX_ALERT_EXAMPLE
 
 
 def record_override(
@@ -40,7 +55,12 @@ def record_override(
     an empty metric. The hook's grant (`raise_marks=False`) synthesizes its
     numbers from ccn alone and compares no mark, so it keeps the recorded
     stamps: a stale file stays stale and verify keeps refusing it. `metric`
-    then stamps only a file the grant creates."""
+    then stamps only a file the grant creates.
+
+    `reason` comes from argv or CRAPKIT_OVERRIDE_REASON, which can hold a byte
+    that is not UTF-8; the alert and the audit both carry it as U+FFFD, where
+    the store refused it after the alert had already gone out."""
+    reason = os_text(reason)
     saved = ratchet_input or RatchetFile.read(root / ratchet_file)
     text = _checked_grant_text(saved, violations, raise_marks=raise_marks, keys=key_version,
                                metric=metric)
@@ -100,8 +120,12 @@ def _require_auditable_override(reason: str, alert_command: str) -> None:
         raise ConfigError("an override requires a non-empty reason")
     if not alert_command.strip():
         raise ConfigError(
-            "no alert_command configured — the override requires a visible alert line; "
-            "set [crapkit] alert_command in crapkit.toml")
+            "no alert_command configured - the override requires a visible alert line; "
+            f"set [crapkit] alert_command in crapkit.toml, for example {alert_example()}")
+
+
+# What a refusal over a failed alert tells its reader to do.
+ALERT_FIX = "rerun once [crapkit] alert_command in crapkit.toml exits 0"
 
 
 def _alert_or_refuse(alert_command: str, root: Path, violations: list[GateViolation],
@@ -111,12 +135,38 @@ def _alert_or_refuse(alert_command: str, root: Path, violations: list[GateViolat
     line = f"crapkit OVERRIDE ({reason}): {summary}"
     # The line reaches the alert command on stdin, never interpolated into the
     # shell string: function names come from analyzed source and are not shell-safe.
-    proc = subprocess.run(alert_command, shell=True, cwd=root, input=line + "\n",
-                          capture_output=True, text=True, encoding="utf-8", errors="replace")
-    if proc.returncode != 0:
-        raise ToolError(
-            f"override alert command failed (exit {proc.returncode}): "
-            f"{(proc.stderr or proc.stdout).strip()[-300:]} — no alert, no override")
+    code, printed = send_alert(alert_command, root, line + "\n")
+    if code != 0:
+        raise ToolError(f"{alert_failed('override', code, printed)} - no alert, no override; {ALERT_FIX}")
+
+
+def alert_failed(what: str, code: int, printed: str) -> str:
+    """The head of a failed alert's refusal: the exit code, then what the
+    command printed, or that it printed nothing. An empty quote left the
+    reader a colon and two spaces where the reason belongs."""
+    said = f": {printed}" if printed else " and printed nothing"
+    return f"{what} alert command failed (exit {code}){said}"
+
+
+def send_alert(alert_command: str, root: Path, text: str) -> tuple[int, str]:
+    """Hand `text` to the alert command on stdin, and return its exit code and
+    the last 300 characters it printed as plain text with LF line ends: stderr
+    when it holds text once its escape codes are gone, else stdout.
+
+    The bytes are `repotext.child_input`'s: UTF-8 with LF line ends on every
+    OS. A text-mode pipe turned each LF into CR LF on Windows, so an alert log
+    fed by `cat >>` held CR LF from a Windows committer and LF from everyone
+    else."""
+    proc = subprocess.run(alert_command, shell=True, cwd=root,
+                          input=child_input(text), capture_output=True)
+    return proc.returncode, _message(proc.stderr, proc.stdout)
+
+
+def _message(stderr: bytes, stdout: bytes) -> str:
+    """The stream that says something, chosen after the escape codes are gone:
+    a stderr that held only a colour reset would otherwise hide stdout's message."""
+    said = printed_text(stderr).strip()
+    return (said or printed_text(stdout).strip())[-300:]
 
 
 def _granted_marks(prior: list[RatchetEntry], violations: list[GateViolation], *,

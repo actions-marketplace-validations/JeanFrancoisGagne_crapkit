@@ -8,10 +8,13 @@ import pytest
 
 from crapkit.config import load_config_text
 from crapkit.diffparse import changed_ranges
-from crapkit.gitio import diff_since, file_log_patches, staged_reads
+from crapkit.errors import ConfigError
+from crapkit.gitio import diff_since, staged_reads
+from crapkit.marks_history import marks_history
 from crapkit.hook import gate_staged
 from crapkit.ratchet_report import mark_events
 from crapkit.records import encode_record
+from crapkit.universe import assign_files
 
 
 CONFIG_TEXT = '''[crapkit]
@@ -129,7 +132,7 @@ def test_binary_marked_ratchet_history_is_text_at_its_exact_path(source_repo, ma
     (source_repo / rel).write_text(f"{marked_path}\twork()\t10\n", encoding="utf-8")
     git(source_repo, "add", ".")
     git(source_repo, "commit", "-qm", "tighten")
-    events = mark_events(file_log_patches(source_repo, rel))
+    events = mark_events(marks_history(source_repo, rel))
     assert [(key, kind, value) for _, key, kind, value in events] == [
         ((marked_path, "work()"), "added", 20), ((marked_path, "work()"), "updated", 10)]
 
@@ -141,16 +144,25 @@ def test_codec_produced_nul_name_is_not_a_git_history_record(source_repo):
     (source_repo / "marks.tsv").write_text(row + "\n", encoding="utf-8")
     git(source_repo.parent, "add", ".")
     git(source_repo.parent, "commit", "-qm", "NUL name")
-    events = mark_events(file_log_patches(source_repo, "marks.tsv"))
+    events = mark_events(marks_history(source_repo, "marks.tsv"))
     assert [(key, kind, value) for _, key, kind, value in events] == [
         (("src/app.py", name), "added", 20)]
 
 
-@pytest.mark.parametrize("path", ["bad\udcff.py", '"bad\\377.py"'])
-def test_opaque_patch_bodies_do_not_relax_path_identity(path):
-    with pytest.raises(UnicodeError):
-        changed_ranges(f"+++ b/{path}\n@@ -1 +1 @@\n-old\n+new\n" if not path.startswith('"')
-                       else f"+++ {path}\n@@ -1 +1 @@\n-old\n+new\n")
+@pytest.mark.parametrize("header", ["+++ b/src/bad\udcff.py", '+++ "b/src/bad\\377.py"'],
+                         ids=["raw-byte", "octal-escape"])
+def test_opaque_patch_bodies_do_not_relax_path_identity(header, capsys):
+    """A header naming a file in bytes that are not UTF-8 never becomes a keyed
+    path. Its ranges keep the bytes as surrogates, and the scope assignment the
+    gate runs next refuses the file by name with the rename, where it used to
+    end the gate with a traceback. The refusal is the one line: nothing names
+    the file left out beside it."""
+    ranges = changed_ranges(f"{header}\n@@ -1 +1 @@\n-old\n+new\n")
+
+    assert ranges == {"src/bad\udcff.py": [(1, 1)]}
+    with pytest.raises(ConfigError, match=r"^src/bad\\xff\.py is in scope 'src', .*\(git mv\)"):
+        assign_files(sorted(ranges), CONFIG)
+    assert capsys.readouterr().err == ""
 
 
 def test_opaque_source_body_cannot_introduce_a_header(source_repo):

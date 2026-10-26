@@ -6,14 +6,16 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 from typing import NamedTuple
 
 from ..errors import ConfigError, CrapkitError
 from ..invocation import _self
-from ..store import SnapshotStore
+from ..named import first_few
+from ..store import SnapshotStore, anywhere
 from ._shared import (_command_root, _load_ratchet_or_die, _load_repo_config, _open_store,
-                      _print_json, _ratchet_or_die, _repo_relative, _stand, repo_text)
+                      _print_json, _ratchet_or_die, _repo_relative, _stand, behind_head)
 
 
 def _is_failed_verify(run: dict) -> bool:
@@ -31,7 +33,7 @@ def _skipped_failed_verifies(runs: list[dict], chosen_id: int) -> list[dict]:
 
 
 def _no_trusted_run() -> str:
-    return (f"no trusted full run to work from — run `{_self()} coverage` first "
+    return (f"no trusted full run to work from - run `{_self()} coverage` first "
             "(failed verifies and hook runs never serve as baselines)")
 
 
@@ -46,11 +48,26 @@ def _no_full_run(pick, runs: list[dict]) -> str:
 
     blocker = pick.blocker or outstanding_failure(runs)
     if blocker is None:
-        return _no_trusted_run()
+        return _nothing_behind_head(runs)
     return (f"no run to work from: verify run {blocker['id']} FAILED with "
             f"{blocker['findings']} finding(s), nothing older is left to work from, "
-            f"and a fresh `{_self()} coverage` would only be refused the same way — "
+            f"and a fresh `{_self()} coverage` would only be refused the same way - "
             "fix the findings and let a verify pass")
+
+
+def _nothing_behind_head(runs: list[dict]) -> str:
+    """No trusted run at all, or none at or behind HEAD: every one there is was
+    measured on another branch, or on commits a rebase or an amend replaced."""
+    from ..store import is_trusted
+
+    trusted = [r for r in runs if is_trusted(r)]
+    if not trusted:
+        return _no_trusted_run()
+    newest = trusted[-1]
+    return (f"no trusted run at or behind HEAD to work from: the newest, run {newest['id']} @ "
+            f"{newest['commit'][:11]}, was measured on history HEAD does not contain (another "
+            f"branch, or commits a rebase or an amend replaced) - run `{_self()} coverage` "
+            "on this branch first")
 
 
 class _WorkRun(NamedTuple):
@@ -69,7 +86,8 @@ class _WorkRun(NamedTuple):
     blocker: dict | None
 
 
-def _latest_full_run(store: SnapshotStore, requested: int | None = None) -> _WorkRun:
+def _latest_full_run(store: SnapshotStore, requested: int | None = None, *,
+                     behind=anywhere) -> _WorkRun:
     """The run seed and prune work from, and the failed verifies passed over.
 
     `pick_baseline` — verify's own choice, not a weaker rule that agrees with it
@@ -77,6 +95,8 @@ def _latest_full_run(store: SnapshotStore, requested: int | None = None) -> _Wor
     a failed verify IS trusted, and seeding off it signs marks at values verify
     refuses as a comparison point, which is how the failure's findings stop
     being touched. Reading trust alone was that bug; reading neither was #16.
+    `behind` keeps it to runs at or behind HEAD, as verify's pick is: a run on
+    another branch signed marks for code this branch does not hold.
 
     `requested` is `--baseline ID`, admitted by the rule `verify --baseline`
     runs. Without it a failed verify in front of every newer run pinned seed
@@ -87,26 +107,27 @@ def _latest_full_run(store: SnapshotStore, requested: int | None = None) -> _Wor
     runs = store.list_runs()
     if requested is not None:
         run = admit_baseline(runs, requested, none_trusted=_no_trusted_run())
-        return _WorkRun(run, [], _newer_trusted(runs, run["id"]), True, None)
-    pick = _usable_pick(runs)
+        return _WorkRun(run, [], _newer_trusted(runs, run["id"], behind), True, None)
+    pick = _usable_pick(runs, behind)
     run = pick.run
     skipped = _skipped_failed_verifies(runs, run["id"])
-    return _WorkRun(run, skipped, _newer_trusted(runs, run["id"]), False,
+    return _WorkRun(run, skipped, _newer_trusted(runs, run["id"], behind), False,
                     _pinning_verify(pick, skipped))
 
 
-def _newer_trusted(runs: list[dict], run_id: int) -> dict | None:
-    """The newest trusted run above `run_id`, or None when `run_id` is the newest."""
+def _newer_trusted(runs: list[dict], run_id: int, behind) -> dict | None:
+    """The newest trusted run above `run_id` and behind HEAD, or None when there is none."""
     from ..store import is_trusted
 
-    return next((r for r in reversed(runs) if r["id"] > run_id and is_trusted(r)), None)
+    return next((r for r in reversed(runs)
+                 if r["id"] > run_id and is_trusted(r) and behind(r)), None)
 
 
-def _usable_pick(runs: list[dict]):
+def _usable_pick(runs: list[dict], behind):
     """verify's pick, refused when it holds no run to work from."""
     from ..store import pick_baseline
 
-    pick = pick_baseline(runs)
+    pick = pick_baseline(runs, behind)
     if pick.run is None:
         raise CrapkitError(_no_full_run(pick, runs))
     return pick
@@ -152,14 +173,30 @@ def _merge_stamp(texts: list[str]) -> None:
     Reconciling marks across metrics means picking a minimum between numbers
     produced by different rules, which is not a comparison at all.
     """
-    from ..ratchet import coverage_then_seed, read_stamp
+    from ..ratchet import read_stamp
 
     ours, theirs = read_stamp(texts[1]), read_stamp(texts[2])
     if ours != theirs:
         raise ConfigError(
             f"ratchet merge refused: ours is [{ours or 'unstamped'}] and theirs is "
-            f"[{theirs or 'unstamped'}] — marks from different metric versions cannot "
-            f"merge; {coverage_then_seed('re-baseline one side')}")
+            f"[{theirs or 'unstamped'}] - marks from different metric versions cannot "
+            f"merge; {_merge_remedy(ours, theirs)}")
+
+
+def _merge_remedy(ours: str, theirs: str) -> str:
+    """Re-seed under the newer side's metric. "re-baseline one side" said neither
+    which side nor under which crapkit, and a seed under the older release
+    stamps its own older metric, so the next merge refused again."""
+    from ..ratchet import coverage_then_seed, newer_tools
+
+    if newer_tools(theirs, ours):
+        side, stamp = "theirs", theirs
+    elif newer_tools(ours, theirs):
+        side, stamp = "ours", ours
+    else:
+        return coverage_then_seed("re-baseline one side")
+    return (f"{side} is newer, so with a crapkit that measures [{stamp}], "
+            f"{coverage_then_seed('re-baseline the merged marks')}")
 
 
 def _ratchet_merge(files: list) -> int:
@@ -169,21 +206,30 @@ def _ratchet_merge(files: list) -> int:
     if len(files) != 3:
         raise ConfigError("ratchet merge takes exactly three files: BASE OURS THEIRS (git %O %A %B)")
     # The one reader: OURS is the working copy a shell may have saved with a
-    # BOM, which read strictly hid its stamp (`ours is [unstamped]`, exit 3).
+    # BOM, which read strictly hid its stamp (`ours is [unstamped]`, exit 3),
+    # or as UTF-16, which OURS stays when it is written back.
     saved = [RatchetFile.read(Path(f), required=True) for f in files]
     texts = _mergeable_texts(saved)
     merged = merge_ratchets(*(_ratchet_or_die(t, f) for t, f in zip(texts, files)))
     # Merging adds no number: OURS keeps the stamps all three sides share.
-    saved[1].publish(saved[1].kept(merged))
+    # THEIRS's rows reach OURS, so a byte its read replaced refuses the write;
+    # BASE only tells the two changes apart, and a name it misread keys nothing.
+    saved[1].publish(saved[1].kept(merged, read_with=(saved[2],)))
     print(f"ratchet merge: {len(merged)} mark(s)")
     return 0
 
 
 def _mergeable_texts(saved: list) -> list[str]:
-    """The three sides' texts, once they share one metric stamp and one key format."""
+    """The three sides' texts, once they share one metric stamp and one key format.
+
+    A blank BASE is no common ancestor. Two branches that each created the file
+    (two first seeds) meet in an add/add merge, and git hands the driver an empty
+    %O. Read as a file, it had key version 0 and refused the merge as a legacy
+    mapping. Out of the checks, it merges OURS and THEIRS as a union, each shared
+    key at the lower mark."""
     texts = [side.text or "" for side in saved]
     _merge_stamp(texts)
-    _merge_key_version(texts)
+    _merge_key_version(texts[1:] if saved[0].blank else texts)
     return texts
 
 
@@ -231,34 +277,184 @@ def _ratchet_move(root: Path, cfg, files: list, cwd: Path | None) -> int:
     return 0
 
 
-def _prune_renames(root: Path, store: SnapshotStore) -> dict[str, str]:
+class _Renames(NamedTuple):
+    """The renames prune can see, and the run their diff starts from.
+
+    `missing` is the store's first run when this clone does not hold its
+    commit; `anchor` is then the oldest run whose commit it does hold, or None
+    when it holds none.
+    """
+    pairs: dict[str, str]
+    anchor: dict | None
+    missing: dict | None = None
+
+
+def _prune_renames(root: Path, runs: list[dict]) -> _Renames:
     """Renames a mark could have lived through, as one tree-to-tree diff.
 
     Anchored at the store's FIRST run: a mark can only have been seeded from a
     run, so no mark era starts before it, and rename detection compares two trees
     rather than walking history, so the widest window costs the same as a narrow
-    one and cannot invent a pairing. An anchor a rebase rewrote away yields no
-    renames and prune drops exactly as it did before.
+    one and cannot invent a pairing. A clone that lacks that commit (a rebase
+    and gc, a squash-merged branch gc collected, a depth-1 CI clone) diffs from
+    the oldest run it holds instead, and `_refuse_unseen_renames` refuses the
+    marks that window cannot answer for. Any other git failure is named: it used
+    to read as "no renames", and a renamed file's marks dropped as repaid debt.
     """
     from ..errors import GitError
     from ..gitio import renamed_paths
 
-    runs = store.list_runs()
-    if not runs:
-        return {}
+    first = runs[0]
     try:
-        return renamed_paths(root, runs[0]["commit"])
+        return _Renames(renamed_paths(root, first["commit"]), first)
     except GitError:
-        return {}
+        if not _git_work_tree(root):
+            print(f"note: {root} is not a git work tree, so prune followed no renames and dropped "
+                  "the marks of every file that left, renamed or not; to keep a renamed file's "
+                  f"marks, run `{_self()} ratchet prune` in the git checkout instead",
+                  file=sys.stderr)
+            return _Renames({}, None)
+        if _held(root, first):
+            raise
+    return _held_renames(root, runs)
+
+
+def _held(root: Path, run: dict) -> bool:
+    """Whether this clone holds the run's commit. When git cannot answer, prune
+    refuses: read as "not held", the failure sent the reader after a fetch."""
+    from ..errors import GitError
+    from ..gitio import has_commit
+
+    try:
+        return has_commit(root, run["commit"])
+    except GitError as exc:
+        raise GitError(f"ratchet prune: git cannot say whether run {run['id']}'s commit "
+                       f"{run['commit'][:11]} is in this clone ({exc}); fix what git reports, "
+                       f"then run `{_self()} ratchet prune` again; nothing was written") from exc
+
+
+def _git_work_tree(root: Path) -> bool:
+    """Whether git manages `root` at all. A directory outside every repository
+    holds no history a file could have been renamed in."""
+    from ..errors import GitError
+    from ..gitio import worktree_root
+
+    try:
+        worktree_root(root)
+    except GitError:
+        return False
+    return True
+
+
+def _held_renames(root: Path, runs: list[dict]) -> _Renames:
+    """The renames since the oldest run whose commit this clone holds."""
+    from ..gitio import renamed_paths
+
+    anchor = _oldest_held(root, runs)
+    if anchor is None:
+        return _Renames({}, None, runs[0])
+    return _Renames(renamed_paths(root, anchor["commit"]), anchor, runs[0])
+
+
+def _oldest_held(root: Path, runs: list[dict]) -> dict | None:
+    """The oldest of `runs` whose commit this clone holds, asking git once per
+    commit: runs share commits, and a shallow CI clone lacks most of them."""
+    asked: dict[str, bool] = {}
+    for run in runs:
+        commit = run["commit"]
+        if commit not in asked:
+            asked[commit] = _held(root, run)
+        if asked[commit]:
+            return run
+    return None
 
 
 def _pruned(root: Path, store: SnapshotStore, prior: list, fresh: list) -> tuple[list, str]:
     """Prune, renames first: a file git moved is a relocated mark, not repaid debt."""
     from ..ratchet import follow_renames, prune_ratchet
 
-    followed, moved = follow_renames(prior, fresh, _prune_renames(root, store))
+    renames = _prune_renames(root, store.list_runs())
+    followed, moved = follow_renames(prior, fresh, renames.pairs)
     entries, dropped = prune_ratchet(followed, fresh)
-    return entries, f"pruned {dropped}, followed {moved} rename(s)"
+    _refuse_unseen_renames(root, renames, _left_the_corpus(followed, entries, fresh))
+    _note_window(renames)
+    return entries, (f"pruned {dropped}, followed {moved} rename(s)"
+                     f"{_followed_names(prior, followed, renames.pairs)}")
+
+
+def _left_the_corpus(followed: list, kept: list, fresh: list) -> list[str]:
+    """The paths of dropped marks that hold no row in the run: only a file that
+    left could have been renamed. A path that still scores cannot be a rename's
+    source, so its dropped marks are code that left, whatever the anchor."""
+    scored, kept_marks = {row.path for row in fresh}, set(kept)
+    return sorted({e.path for e in followed if e not in kept_marks and e.path not in scored})
+
+
+def _refuse_unseen_renames(root: Path, renames: _Renames, left: list[str]) -> None:
+    """Exit 4, before anything is written, when the first run's commit is gone
+    and a dropped mark's file may have been renamed where no held commit shows.
+
+    A file still in the checkout was not renamed. A file the anchor's tree held
+    and HEAD's does not shows in the diff from the anchor, so its rename was
+    seen or there was none. What is left left before the oldest held run.
+    """
+    from ..errors import GitError
+
+    if renames.missing is None or not left:
+        return
+    unseen = _unseen(root, renames.anchor, left)
+    if unseen:
+        raise GitError(_unseen_refusal(root, renames.missing, unseen))
+
+
+def _unseen(root: Path, anchor: dict | None, left: list[str]) -> list[str]:
+    from ..gitio import diff_names_since, ls_files
+
+    known = set(ls_files(root))
+    if anchor is not None:
+        known.update(diff_names_since(root, anchor["commit"]))
+    return [path for path in left if path not in known]
+
+
+def _unseen_refusal(root: Path, missing: dict, unseen: list[str]) -> str:
+    commit = missing["commit"]
+    return (f"ratchet prune: run {missing['id']}'s commit {commit[:11]} is not in this clone, so "
+            f"git cannot say whether {first_few(unseen)} was renamed or deleted, and prune would "
+            f"drop the marks there as repaid debt; {_anchor_fetch(root, commit)}; nothing was written")
+
+
+def _anchor_fetch(root: Path, commit: str) -> str:
+    """The fetch that brings the anchor back, and the way on when none can."""
+    from ..gitio import is_shallow
+
+    if is_shallow(root):
+        return ("this shallow clone does not hold it: set fetch-depth: 0 on the checkout or run "
+                "git fetch --unshallow, then prune again")
+    return (f"fetch it with `git fetch origin {commit}` and prune again, or, when no remote holds "
+            f"it, move a renamed file's marks with `{_self()} ratchet move OLD NEW` and delete a "
+            "deleted file's marks from the marks file by hand")
+
+
+def _followed_names(prior: list, followed: list, pairs: dict[str, str]) -> str:
+    """` (a.py -> b.py, ...)`: the renames the marks followed, up to three."""
+    kept = set(followed)
+    moved = sorted({f"{e.path} -> {pairs[e.path]}" for e in prior if e not in kept})
+    return f" ({first_few(moved)})" if moved else ""
+
+
+def _note_window(renames: _Renames) -> None:
+    """One stderr line when the first run's commit is gone, naming the run the
+    renames were read from instead. stderr, so the prune line keeps its shape."""
+    if renames.missing is None:
+        return
+    gone = (f"note: run {renames.missing['id']}'s commit {renames.missing['commit'][:11]} "
+            "is not in this clone")
+    if renames.anchor is None:
+        print(f"{gone}, and no run's commit is, so no rename was followed", file=sys.stderr)
+        return
+    print(f"{gone}, so renames were followed from run {renames.anchor['id']} "
+          f"({renames.anchor['commit'][:11]}), the oldest run whose commit it holds",
+          file=sys.stderr)
 
 
 def _print_ratchet_report(report: dict, violations: list, ratchet_file: str) -> None:
@@ -281,6 +477,59 @@ def _working_marks(root: Path, ratchet_file: str) -> dict:
     return {(e.path, e.long_name): e.crap for e in entries}
 
 
+def _report_basis(root: Path, ratchet_file: str) -> tuple[list, dict | None]:
+    """The history the report replays and the marks it reads as open.
+
+    A marks file that is missing or holds only blank lines is not a repo that
+    repaid every mark: the report reads the marks the newest commit that held
+    any held as open (working None, the committed state), and the commit that
+    deleted or emptied the file repays none (held_history). verify reads the
+    same marks only while its baseline run comes from before that commit."""
+    from ..marks_history import held_history, marks_history
+    from ..ratchetfile import RatchetFile
+
+    if RatchetFile.read(root / ratchet_file).blank:
+        return held_history(root, ratchet_file), None
+    history = _with_head_revision(root, ratchet_file, marks_history(root, ratchet_file))
+    return history, _working_marks(root, ratchet_file)
+
+
+def _with_head_revision(root: Path, ratchet_file: str, history: list) -> list:
+    """The newest entry also carries the text HEAD's revision of the file holds,
+    read as a "held" event, so the report counts as uncommitted only the marks
+    the working tree and HEAD disagree on. The replay of the patches cannot
+    stand in for HEAD: `git log -p` prints no patch for a merge, and a mark a
+    conflicted merge repaid replays as open."""
+    from ..marks_history import head_revision
+
+    text = head_revision(root, ratchet_file) if history else None
+    return history if text is None else history[:-1] + [history[-1] + (text,)]
+
+
+def _warn_marks_stand_in(root: Path, ratchet_file: str, report: dict, working) -> None:
+    """One line when the open marks came from history, not from the file.
+
+    verify's stand-in searches from its baseline run's commit to HEAD, so a
+    coverage run on the deleting commit or a later one leaves verify no marks
+    while the report still reads them as open. The line says when verify
+    reads them; making the two agree is a change to verify, not to this line."""
+    if working is not None or not report["open"]:
+        return
+    state, act, done = (("empty", "emptying", "emptied") if (root / ratchet_file).exists()
+                        else ("missing", "deleting", "deleted"))
+    print(f"warning: {ratchet_file} is {state}, so the report reads the {report['open']} "
+          f"mark(s) its history last committed as open, and {act} the file repays none. "
+          "verify judges against them only while its baseline run measured a commit from "
+          f"before the file was {done}. `git log -- {ratchet_file}` shows the commits that "
+          "held them", file=sys.stderr)
+
+
+def _judges_policy(cfg, enforce: bool) -> bool:
+    """--enforce with a debt knob in [crapkit]: the one case the report judges."""
+    knobs = (cfg.debt_max_age_months, cfg.repayment_min_per_30d)
+    return enforce and any(k is not None for k in knobs)
+
+
 def _policy_findings(cfg, report: dict, enforce: bool) -> list | None:
     """The debt-policy findings, or None when no policy was evaluated.
 
@@ -290,21 +539,49 @@ def _policy_findings(cfg, report: dict, enforce: bool) -> list | None:
     """
     from ..ratchet_report import policy_violations
 
-    knobs = (cfg.debt_max_age_months, cfg.repayment_min_per_30d)
-    if not enforce or all(k is None for k in knobs):
+    if not _judges_policy(cfg, enforce):
         return None
-    return policy_violations(report, *knobs)
+    return policy_violations(report, cfg.debt_max_age_months, cfg.repayment_min_per_30d)
+
+
+def _refuse_a_cut_history(cfg, enforce: bool, shallow: bool) -> None:
+    """Exit 4 before judging the policy on a history the clone does not hold.
+
+    Every age and every repayment is read off the ratchet file's commits. A
+    depth-1 clone holds one, so every mark read 0 days old and nothing was ever
+    repaid: an age limit passed that a full clone fails, and a repayment quota
+    failed that a full clone passes.
+    """
+    from ..gitio import shallow_refusal
+
+    if shallow and _judges_policy(cfg, enforce):
+        raise shallow_refusal("ratchet report --enforce judges mark ages and repayments by "
+                              f"the git history of {cfg.ratchet_file}")
+
+
+def _warn_history(shallow: bool) -> None:
+    """One line when the history the ages count is not the file's whole
+    history: a shallow clone. A renamed marks file keeps its whole history
+    (marks_history follows the rename), so it needs no line."""
+    from ..gitio import shallow_warning
+
+    if shallow:
+        print(shallow_warning("mark ages and repayments"), file=sys.stderr)
 
 
 def _ratchet_report(root: Path, cfg, as_json: bool, enforce: bool) -> int:
-    from ..gitio import file_log_patches
+    from ..gitio import shallow_checkout
     from ..ratchet_report import mark_events, report_from_events
 
-    events = mark_events(file_log_patches(root, cfg.ratchet_file))
-    report = report_from_events(events, working=_working_marks(root, cfg.ratchet_file))
+    shallow = shallow_checkout(root)
+    _refuse_a_cut_history(cfg, enforce, shallow)
+    patches, working = _report_basis(root, cfg.ratchet_file)
+    report = report_from_events(mark_events(patches), working=working)
     violations = _policy_findings(cfg, report, enforce)
+    _warn_history(shallow)
+    _warn_marks_stand_in(root, cfg.ratchet_file, report, working)
     if as_json:
-        _print_json({**report, "policy_violations": violations})
+        _print_json({**report, "policy_violations": violations, "shallow": shallow})
     else:
         _print_ratchet_report(report, violations or [], cfg.ratchet_file)
     return 1 if violations else 0
@@ -343,17 +620,19 @@ def _ratchet_from_run(root: Path, cfg, action: str, requested: int | None) -> in
     prune creates holds no mark and takes the running metric, which relabels
     nothing.
     """
+    from ..gitio import GitFacts
     from ..keys import require_unambiguous
     from ..ratchet import metric_version
     from ..ratchetfile import RatchetFile
     from ._shared import _check_ratchet_identity
 
     store = _open_store(root)
-    work = _latest_full_run(store, requested)
+    work = _latest_full_run(store, requested, behind=behind_head(GitFacts(root)))
     latest = work.run
     fresh = store.read_scored(latest["id"])
     require_unambiguous(fresh, run_id=latest["id"], advice=_identity_advice(work, action))
     saved = RatchetFile.read(root / cfg.ratchet_file)
+    _refuse_newer_marks(saved, work, action)
     marks = saved.entries
     key_version = _check_ratchet_identity(saved.text or "", root, cfg.ratchet_file, fresh, store,
                                           entries=marks, moves_marks=True)
@@ -368,7 +647,56 @@ def _ratchet_from_run(root: Path, cfg, action: str, requested: int | None) -> in
     metric_note = _metric_note(work, action, created=saved.text is None)
     print(f"{cfg.ratchet_file}: {note} - {len(entries)} mark(s) vs run {latest['id']} "
           f"({latest['commit'][:11]}){_skip_note(work.skipped, work.newer)}{metric_note}")
+    _print_seed_next(action, cfg.ratchet_file, metric_note)
     return 0
+
+
+# What seed or prune would do to marks from a run an older metric measured.
+_BACKWARDS = {"seed": "this seed would restamp them under the older metric, and verify under the "
+                      "newer one would refuse them",
+              "prune": "this prune would drop every mark whose function the older reader names "
+                       "differently, as if its code were gone"}
+
+
+def _refuse_newer_marks(saved, work: _WorkRun, action: str) -> None:
+    """Refuse to rewrite marks a newer crapkit or lizard recorded than the one
+    that measured the run. seed restamped the file under the run's older metric,
+    and prune judged which marks were gone by the older reader's names. Two
+    ways to get there: this install is older than the marks (upgrade it), or a
+    failed verify pins seed and prune to a run an older release measured (read
+    a newer run)."""
+    from ..ratchet import metric_version, newer_tools, run_stamp
+
+    recorded = saved.metric_stamp
+    newer = newer_tools(recorded, metric_version())
+    if newer:
+        raise ConfigError(_newer_than_install(saved, action, newer))
+    measured = run_stamp(work.run["tool_versions"])
+    if newer_tools(recorded, measured):
+        raise ConfigError(f"ratchet {action} refused: {saved.path.name} was recorded under "
+                          f"[{recorded}] and run {work.run['id']} under the older [{measured}]; "
+                          f"{_BACKWARDS[action]}; {_way_off(work.newer)}")
+
+
+def _newer_than_install(saved, action: str, newer: list[str]) -> str:
+    from ..ratchet import metric_version, upgrade_remedy
+
+    return (f"ratchet {action} refused: {saved.path.name} was recorded under "
+            f"[{saved.metric_stamp}] and this crapkit measures [{metric_version()}] - "
+            f"{upgrade_remedy(newer)}; {_BACKWARDS[action]}. A team going back to this release "
+            f"on purpose restores the {saved.path.name} it last wrote from git history")
+
+
+def _print_seed_next(action: str, ratchet_file: str, metric_note: str) -> None:
+    """The README's two steps after a seed. seed printed none, so a user who
+    followed what crapkit printed never committed the marks or ran the verify
+    that makes the first passing verdict.
+
+    A seed that signed another crapkit's metric has already said verify refuses
+    those marks and named the run that restamps them, so it adds nothing.
+    """
+    if action == "seed" and not metric_note:
+        print(f"-> next: commit {ratchet_file}, then run `{_self()} verify`")
 
 
 def _identity_advice(work: _WorkRun, action: str) -> str:

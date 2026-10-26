@@ -1,6 +1,6 @@
 # Resource use and cleanup
 
-Crapkit starts work on demand. An idle MCP server waits on its input; it does not
+crapkit starts work on demand. An idle MCP server waits on its input; it does not
 scan repositories or run analysis in the background. A client can start one MCP
 session per task, so several processes with live client parents can be expected.
 Count active work, memory and CPU before treating every repeated process name as
@@ -27,6 +27,14 @@ The default coordination directory is under the user's cache, separated by host.
 `CRAPKIT_RESOURCE_DIR` selects another directory. Processes must use the same
 directory to share a budget; separate directories create independent budgets.
 
+The user's home comes from `USERPROFILE` on Windows and `HOME` on POSIX. A process
+started without it, such as an MCP server whose client builds the environment from
+an allowlist, a service or a scheduled task, reads the profile folder Windows reports
+for its user, or on POSIX the password database entry. Both name the home the user's
+other processes use, so the budget and the measurement locks below stay shared.
+`HOME` alone does not count on Windows. When nothing names a home, commands that need
+it exit 5 with `no home directory` and name the variable to set.
+
 `CRAPKIT_ANALYSIS_WORKERS` can lower the inherited per-call worker limit.
 `CRAPKIT_ANALYSIS_MEMORY_MB` also reduces the pool using an estimate of 35 MB per
 worker. It is a sizing hint, not a hard operating-system memory limit. Invalid
@@ -52,15 +60,16 @@ cannot start another mutant suite.
 Measurement locks coordinate commands for the same user and host, including
 different repositories that target one absolute artifact. Stable files under
 `~/.cache/crapkit/measurements/<host-id>` stay outside report directories that
-test runners delete and recreate. `TEMP`, `TMP` and `CRAPKIT_RESOURCE_DIR` do not
+test runners delete and recreate. `~` is the home described under
+[Analysis workers](#analysis-workers), found the same way without `USERPROFILE` or `HOME`. `TEMP`, `TMP` and `CRAPKIT_RESOURCE_DIR` do not
 change this domain. Keep these small lease files as coordination state, not idle
 test evidence.
 
-The old adjacent locks could coordinate other users or hosts through a shared
-filesystem. The new local domain does not preserve that behavior; those writers
-need external serialization or distinct artifacts. Do not overlap old-version
-and new-version measurements during an upgrade because their lock locations
-differ.
+Before 0.7.1 the lock sat beside the artifact, so users or hosts sharing a
+filesystem could coordinate through it. Since 0.7.1 it is local to one user and
+host, so writers on several hosts need their own serialization or distinct
+artifacts. When upgrading from a release before 0.7.1, do not run measurements
+from both versions at once.
 
 MCP keeps reading protocol input while a tool runs. Cancellation stops that
 request's CLI process tree. Input EOF closes the session and stops active work;
@@ -82,20 +91,10 @@ Small logs retain their bytes. Rotation keeps the newest output, including final
 failure details; no-progress timeouts count bytes received across rotations.
 Set `log_max_bytes = 0` when retaining the complete unbounded log is required.
 
-Crapkit's development runner, `tools/testing/run.py`, marks default
-`.crapkit/test-runs/run-*` directories and is the only command that removes them.
-At each default start it expires idle runs older than `--retention-days` (7) or
-beyond the `--retention-count` (10) most recent. Zero disables that limit; setting
-both to zero keeps all recognized runs. `--preview-retention` prints the runs the
-limits would remove, as JSON, and runs no suite. A run the filesystem will not
-fully delete, such as one holding a read-only file, keeps its receipt:
-`--preview-retention` still lists it and the next start tries again. Explicit
-`--output` destinations remain caller-managed. Explicitly selecting an existing
-retained run, or a directory inside it, removes its retention receipt under the
-same lease and makes that run caller-managed. Retention runs once at startup,
-outside individual tests and analysis calls. The `test_retention_days` and
-`test_retention_count` configuration keys are deprecated and ignored; `crapkit
-doctor` warns once for each key a config sets.
+The `test_retention_days` and `test_retention_count` keys are deprecated and
+ignored; `crapkit doctor` warns once for each key a config sets. Only crapkit's
+own development runner writes `.crapkit/test-runs`, and its `--retention-days`
+limit is a contributor's concern: [CONTRIBUTING.md](../CONTRIBUTING.md#tests).
 
 Mutation retains only the requested number of canonical pool workers on reuse.
 Concurrent temporary worktrees carry versioned ownership receipts. Recovery

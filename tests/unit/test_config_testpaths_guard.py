@@ -14,6 +14,7 @@ import pytest
 from crapkit import config as config_module
 from crapkit.config import load_config_text, pytest_testpaths_at
 from crapkit.errors import ConfigError
+from path_spellings import need_case_insensitive, need_case_sensitive
 
 PYPROJECT = '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n'
 
@@ -38,6 +39,20 @@ def test_a_positional_equal_to_a_configured_testpath_is_not_narrowing(tmp_path):
     cfg = load_config_text(_toml("python -m pytest tests --cov=app"), root=tmp_path)
 
     assert cfg.lanes[0].full_suite is True, "the lane stays a full-suite lane"
+
+
+@pytest.mark.parametrize("shell_is_cmd", [True, False])
+def test_a_redirection_touching_a_configured_testpath_leaves_the_testpath(tmp_path, monkeypatch,
+                                                                          shell_is_cmd):
+    """Both shells hand pytest `tests` for `tests>lane.log` (POSIX 2.3; verified
+    cmd.exe argv: ["tests"]). The guard read one word, `tests>lane.log`, named
+    no configured testpath, and refused a lane that runs the whole suite."""
+    monkeypatch.setattr(config_module, "SHELL_IS_CMD", shell_is_cmd)
+    _write(tmp_path, "pyproject.toml", PYPROJECT)
+
+    cfg = load_config_text(_toml("python -m pytest tests>lane.log --cov=app"), root=tmp_path)
+
+    assert cfg.lanes[0].full_suite is True
 
 
 def test_without_a_root_the_guard_reads_no_testpaths_and_refuses_as_before():
@@ -202,3 +217,71 @@ def test_a_file_that_does_not_parse_reads_as_no_section(tmp_path):
 def test_a_directory_with_no_pytest_configuration_names_no_testpaths(tmp_path):
     assert pytest_testpaths_at(tmp_path) == ()
     assert pytest_testpaths_at(tmp_path / "missing") == ()
+
+
+# --- a pyproject.toml pytest could not use, or reads the way crapkit does -----
+#
+# TOML has no null, so the shapes are other types, bytes that are not UTF-8 and
+# a file that does not parse. testpaths pytest can read lets `tests` through;
+# anything else names no testpaths, and the positional is refused as narrowing,
+# the guard's answer when it cannot tell. None of them raises past ConfigError.
+
+_INI = b'[tool.pytest.ini_options]\ntestpaths = ["tests"]\n'
+_READABLE = {
+    "testpaths-a-list": _INI,
+    "testpaths-a-string": b'[tool.pytest.ini_options]\ntestpaths = "tests"\n',
+    "a-latin1-byte-in-a-comment": b"# caf" + bytes([0xE9]) + b"\n" + _INI,
+}
+_UNREADABLE = {
+    "testpaths-a-number": b"[tool.pytest.ini_options]\ntestpaths = 5\n",
+    "testpaths-a-table": b"[tool.pytest.ini_options]\ntestpaths = {a = 1}\n",
+    "testpaths-a-list-of-numbers": b"[tool.pytest.ini_options]\ntestpaths = [1, 2]\n",
+    "ini_options-a-string": b'[tool.pytest]\nini_options = "x"\n',
+    "tool-pytest-an-array": b"[tool]\npytest = [1]\n",
+    "utf16-with-bom": bytes([0xFF, 0xFE]) + _INI.decode("ascii").encode("utf-16-le"),
+    "utf8-with-bom-which-pytest-refuses-too": bytes([0xEF, 0xBB, 0xBF]) + _INI,
+    "does-not-parse": b"[tool.pytest.ini_options\ntestpaths = \n",
+}
+
+
+@pytest.mark.parametrize("shape", list(_READABLE))
+def test_a_pyproject_pytest_can_read_lets_its_testpath_through(tmp_path, shape):
+    (tmp_path / "pyproject.toml").write_bytes(_READABLE[shape])
+
+    cfg = load_config_text(_toml("python -m pytest tests --cov=app"), root=tmp_path)
+
+    assert cfg.lanes[0].full_suite is True
+
+
+@pytest.mark.parametrize("shape", list(_UNREADABLE))
+def test_a_pyproject_naming_no_usable_testpaths_refuses_the_positional(tmp_path, shape):
+    (tmp_path / "pyproject.toml").write_bytes(_UNREADABLE[shape])
+
+    with pytest.raises(ConfigError, match="positional argument 'tests' narrows a full-suite"):
+        load_config_text(_toml("python -m pytest tests --cov=app"), root=tmp_path)
+
+
+# --- a positional in another letter case ------------------------------------------
+
+@pytest.mark.parametrize("positional, testpaths", [("Tests", "tests"), ("tests", "Tests"),
+                                                   ("TESTS", "tests")])
+def test_a_positional_naming_the_testpath_in_another_case_is_not_narrowing(tmp_path, positional,
+                                                                           testpaths):
+    """On NTFS `Tests` is the tests/ directory pytest collects; compared as
+    text, the lane that runs the whole suite was refused."""
+    need_case_insensitive(tmp_path)
+    (tmp_path / "tests").mkdir()
+    _write(tmp_path, "pyproject.toml", f'[tool.pytest.ini_options]\ntestpaths = ["{testpaths}"]\n')
+
+    cfg = load_config_text(_toml(f"python -m pytest {positional} --cov=app"), root=tmp_path)
+
+    assert cfg.lanes[0].name == "py"
+
+
+def test_a_case_sensitive_disk_reads_another_case_as_another_directory(tmp_path):
+    need_case_sensitive(tmp_path)
+    (tmp_path / "tests").mkdir()
+    _write(tmp_path, "pyproject.toml", PYPROJECT)
+
+    with pytest.raises(ConfigError, match="positional argument 'Tests' narrows"):
+        load_config_text(_toml("python -m pytest Tests --cov=app"), root=tmp_path)

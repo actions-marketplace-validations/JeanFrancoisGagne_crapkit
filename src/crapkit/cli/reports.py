@@ -5,6 +5,7 @@ function's trajectory, its ratchet mark, its dark lines, its commits and tests).
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 from typing import NamedTuple
@@ -13,8 +14,9 @@ from ..errors import ConfigError, CrapkitError, GitError, ToolError
 from ..invocation import _self
 from ..store import SnapshotStore
 from ..uncovered import MissingLines, load_uncovered
-from ._shared import (_command_root, _load_repo_config, _open_store, _print_json, _stand,
-                      _ratchet_entries, _repo_out_path, _repo_relative)
+from ._shared import (_command_root, _load_repo_config, _not_a_directory, _open_store,
+                      _print_json, _stand, _ratchet_entries, _repo_out_path, _repo_relative,
+                      behind_head)
 
 
 def _digest_pair(store):
@@ -44,21 +46,32 @@ def _warn_skipped_runs(scored_runs: list[dict], pair) -> None:
     if not skipped:
         return
     print(f"warning: digest compared runs {pair[0]['id']} -> {pair[1]['id']}, "
-          f"skipping run(s) {', '.join(str(r['id']) for r in skipped)} — "
+          f"skipping run(s) {', '.join(str(r['id']) for r in skipped)} - "
           "a run only pairs with one whose lane set is identical", file=sys.stderr)
 
 
 def _send_digest_alert(root: Path, cfg, prev: dict, cur: dict, lines: list[str]) -> None:
     """Hand the digest body to the configured alert command; a nonzero exit is fatal."""
-    import subprocess
+    from ..override import ALERT_FIX, alert_failed, send_alert
+
+    from ..override import alert_example
 
     if not cfg.alert_command.strip():
-        raise ConfigError("digest --alert needs [crapkit] alert_command")
+        raise ConfigError("digest --alert needs [crapkit] alert_command in crapkit.toml, "
+                          f"for example {alert_example()}")
     body = f"crapkit digest (runs {prev['id']} -> {cur['id']}):\n" + "\n".join(lines) + "\n"
-    proc = subprocess.run(cfg.alert_command, shell=True, cwd=root, input=body,
-                          capture_output=True, text=True, encoding="utf-8", errors="replace")
-    if proc.returncode != 0:
-        raise ToolError(f"digest alert command failed (exit {proc.returncode})")
+    code, printed = send_alert(cfg.alert_command, root, body)
+    if code != 0:
+        raise ToolError(f"{alert_failed('digest', code, printed)} - "
+                        f"the digest above was not alerted; {ALERT_FIX}")
+
+
+def _digest_store(root: Path) -> SnapshotStore:
+    """The repo's snapshot store; a repo never measured is told to run coverage."""
+    db_path = root / ".crapkit" / "crap.sqlite"
+    if not db_path.is_file():
+        raise CrapkitError(f"no snapshot in {root} - run `{_self()} coverage` first")
+    return SnapshotStore(db_path)
 
 
 def cmd_digest(args: argparse.Namespace) -> int:
@@ -66,10 +79,7 @@ def cmd_digest(args: argparse.Namespace) -> int:
 
     root = _command_root(args.repo)
     cfg = _load_repo_config(root)
-    db_path = root / ".crapkit" / "crap.sqlite"
-    if not db_path.is_file():
-        raise CrapkitError(f"no snapshot in {root} — run `{_self()} coverage` first")
-    store = SnapshotStore(db_path)
+    store = _digest_store(root)
     pair = _digest_pair(store)
     if pair is None:
         return 0
@@ -149,18 +159,20 @@ def _report_worklist(root: Path, cfg, store: SnapshotStore) -> dict:
     """
     from ..gitio import head_commit
     from ..report import report_top
-    from .queue import _worklist_for, _worklist_payload, _worklist_run
+    from .queue import _worklist_for, _worklist_payload, _worklist_run, run_freshness
 
     latest = _worklist_run(root, store)
     wl = _worklist_for(root, cfg, store, latest, top=report_top(cfg.worklist_top), scopes=[])
-    return _worklist_payload(wl, latest, cfg, latest["commit"] != head_commit(root), None)
+    fresh = run_freshness(root, store, latest, head_commit(root))
+    return _worklist_payload(wl, latest, cfg, fresh.stale, None, changed=fresh.changed)
 
 
 def _report_lanes(root: Path, cfg) -> list[dict]:
-    """Per-lane staleness, the detail the joined note throws away."""
-    from ..uncovered import lane_states
+    """Per-lane staleness, the detail the joined note throws away, and whether
+    each stale lane withholds every file's dark lines or only the ones it names."""
+    from ..uncovered import lane_views
 
-    return [{"name": name, "note": note} for name, note in lane_states(root, cfg)]
+    return lane_views(root, cfg)
 
 
 def _report_payload(root: Path, cfg, store: SnapshotStore) -> dict:
@@ -185,7 +197,7 @@ def _write_report(root: Path, out: str, page: str) -> Path:
     lands, so the destination changes nothing but who can open it. LF endings,
     because the page is an artifact people diff and publish.
     """
-    path = _repo_out_path(root, out)
+    path = _repo_out_path(root, out, "--out")
     path.write_text(page, encoding="utf-8", newline="\n")
     print(path)
     return path
@@ -205,22 +217,26 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 def cmd_runs(args: argparse.Namespace) -> int:
     """History without SQL: every run with kind, verdict, commit, lane set."""
-    store = _open_store(_command_root(args.repo))
+    root = _command_root(args.repo)
+    store = _open_store(root)
     if args.action == "prune":
         return _runs_prune(store, keep=args.keep, as_json=args.json)
-    return _runs_list(store, as_json=args.json)
+    return _runs_list(store, root, as_json=args.json)
 
 
-def _runs_list(store: SnapshotStore, *, as_json: bool) -> int:
+def _runs_list(store: SnapshotStore, root: Path, *, as_json: bool) -> int:
     """Every run, with the one `verify` compares against today marked.
 
     "Which run is my baseline" is the question the taint rule turns on, and this
-    is the command a reader reaches for to answer it.
+    is the command a reader reaches for to answer it. Asked with verify's own
+    rule, runs behind HEAD included: after a branch switch the newest run can
+    sit on the other branch, and marking it named a baseline verify never reads.
     """
+    from ..gitio import GitFacts
     from ..store import pick_baseline
 
     history = store.list_runs()
-    picked = pick_baseline(history).run
+    picked = pick_baseline(history, behind_head(GitFacts(root))).run
     baseline_id = picked["id"] if picked else None
     runs = [{"id": r["id"], "kind": r["kind"], "verdict_ok": r["verdict_ok"],
              "findings": r["findings"], "baseline": r["id"] == baseline_id,
@@ -289,13 +305,8 @@ def cmd_overrides(args: argparse.Namespace) -> int:
 
 _NO_SPAN = "function not in the latest run"
 
-_NO_CONTEXT = ("no context data — run the py lane with dynamic_context = "
+_NO_CONTEXT = ("no context data - run the py lane with dynamic_context = "
                "test_function and a --show-contexts JSON report")
-
-# %x01 opens a commit record and %x02 closes it, so a body of any shape stays
-# separable from the diff hunks `git log -L` prints between records.
-_LOG_FORMAT = "%x01%h %ad %s%n%b%x02"
-
 
 class _ExplainCtx(NamedTuple):
     """What explain looks up ONCE for the whole command and reuses per match.
@@ -323,7 +334,8 @@ def cmd_explain(args: argparse.Namespace) -> int:
     root = _command_root(args.repo)
     cfg = _load_repo_config(root)
     store = _open_store(root)
-    args.path = _repo_relative(args.path, root, _stand(args.repo))  # from where the user stands
+    # from where the user stands; a directory holds no function to explain
+    args.path = _not_a_directory(_repo_relative(args.path, root, _stand(args.repo)), root)
     runs = store.list_runs()
     selector = _selector_run(store, runs, args.path)
     matches = _explain_selection(store, selector, args.path, args.name)
@@ -392,7 +404,7 @@ def _explain_payload(ctx: _ExplainCtx, store: SnapshotStore, args, long_name: st
                      key: str) -> dict:
     """One function's whole packet. The span is looked up once and passed down:
     dark lines, --history and --tests all want the same line range."""
-    span = _latest_span(store, ctx.run_id, ctx.path, key)
+    span = _latest_place(store, ctx.run_id, ctx.path, key)
     out = {"long_name": long_name,
            "history": store.function_history(ctx.path, key),
            **_mark_fields(ctx.ratchet, ctx.path, key),
@@ -400,7 +412,7 @@ def _explain_payload(ctx: _ExplainCtx, store: SnapshotStore, args, long_name: st
     if args.history:
         out.update(_commits_fields(ctx.root, ctx.path, span))
     if args.tests:
-        out.update(_tests_fields(ctx.contexts, span))
+        out.update(_tests_fields(ctx.contexts, span, _withheld(ctx.uncovered, ctx.path)))
     return out
 
 
@@ -418,13 +430,14 @@ def _print_explain(args, payloads: list[dict]) -> None:
         _explain_extras(p)
 
 
-def _latest_span(store: SnapshotStore, run_id: int | None, path: str, long_name: str):
-    """The newest non-hook run's (start, end) for one function, or None.
+def _latest_place(store: SnapshotStore, run_id: int | None, path: str, long_name: str):
+    """The newest non-hook run's FunctionPlace for one function, or None: its
+    (start, end), scope and flag.
 
     A targeted lookup off the (run_id, path) index; this used to materialize
     every row of that run to find one.
     """
-    return None if run_id is None else store.function_span(run_id, path, long_name)
+    return None if run_id is None else store.function_place(run_id, path, long_name)
 
 
 def _mark_fields(ratchet: list | None, path: str, long_name: str) -> dict:
@@ -445,27 +458,124 @@ def _dark_fields(uncovered: MissingLines, path: str, span) -> dict:
     """The dark lines inside one span, or null and the reason there are none.
 
     null when no artifact could answer, never []: [] is what a function every
-    artifact ran reports, and it would read as nothing left to test.
+    artifact ran reports, and it would read as nothing left to test. The note
+    reads the row's flag and scope, as brief's does: a function in a scope no
+    lane covers gets that note, never another lane's.
     """
     if span is None:
         return {"uncovered_lines": None, "uncovered_lines_note": _NO_SPAN}
-    note = uncovered.note_for(path)
+    note = uncovered.note_for(path, span.flag or "", span.scope)
     if note:
         return {"uncovered_lines": None, "uncovered_lines_note": note}
     return {"uncovered_lines": uncovered.in_span(path, span[0], span[1])}
 
 
 def _commits_fields(root: Path, path: str, span) -> dict:
+    """The commits that touched the span, or null and why git had none to give.
+
+    A git failure is named, never read as a function nothing ever touched."""
     if span is None:
         return {"commits": None, "commits_note": _NO_SPAN}
-    return {"commits": _function_commits(root, path, span[0], span[1])}
+    try:
+        return _span_commits(root, path, span)
+    except GitError as exc:
+        return {"commits": None,
+                "commits_note": (f"git cannot read the history of {path}:{span[0]}-{span[1]} ({exc}); "
+                                 "fix what git reports, then run `crapkit explain --history` again")}
 
 
-def _tests_fields(contexts: dict, span) -> dict:
+def _span_commits(root: Path, path: str, span) -> dict:
+    """`git log -L` over HEAD's lines, which is what it reads. The run measured
+    the working tree, so its span moves through the uncommitted diff first: four
+    new lines above a function made git answer with the function below it, and
+    forty made it refuse a span past HEAD's last line. Before the first commit
+    every line is uncommitted. Raises GitError."""
+    from ..gitio import has_commit
+
+    head = _head_span(_worktree_hunks(root, path), span[0], span[1]) if has_commit(root, "HEAD") else None
+    if head is None:
+        return {"commits": None,
+                "commits_note": (f"{path}:{span[0]}-{span[1]} holds only uncommitted lines, "
+                                 "so no commit has touched it yet")}
+    return {"commits": _function_commits(root, path, *head)}
+
+
+_HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", re.MULTILINE)
+
+
+class _Hunk(NamedTuple):
+    """One `git diff -U0 HEAD` hunk: HEAD's `old_count` lines from `old` became
+    the working tree's `new_count` lines from `new`. With a count of 0 the
+    other side's number is the line the insertion or deletion sits after."""
+    old: int
+    old_count: int
+    new: int
+    new_count: int
+
+    def holds(self, line: int) -> bool:
+        """The working-tree LINE is one of this hunk's new lines."""
+        return self.new <= line < self.new + self.new_count
+
+    def before(self, line: int) -> bool:
+        """This hunk ends above the working-tree LINE."""
+        return self.new + max(self.new_count, 1) - 1 < line
+
+    def head_lines(self) -> tuple[int, int] | None:
+        """The HEAD lines this hunk replaced, or None for a pure insertion."""
+        return (self.old, self.old + self.old_count - 1) if self.old_count else None
+
+
+def _worktree_hunks(root: Path, rel_path: str) -> list[_Hunk]:
+    """How the working tree's copy of REL_PATH, staged edits included, differs
+    from HEAD's. Raises GitError."""
+    from ..gitio import _git
+
+    out = _git(root, "--literal-pathspecs", "diff", "-U0", "--no-color", "--no-ext-diff",
+               "--no-textconv", "HEAD", "--", rel_path)
+    return [_Hunk(int(old), int(old_count or 1), int(new), int(new_count or 1))
+            for old, old_count, new, new_count in _HUNK.findall(out)]
+
+
+def _head_line(hunks: list[_Hunk], line: int) -> tuple[int, int] | None:
+    """The HEAD lines behind one working-tree LINE: itself shifted past the
+    hunks above it, the lines an edit replaced, or None for a new line."""
+    shift = 0
+    for hunk in hunks:
+        if hunk.holds(line):
+            return hunk.head_lines()
+        if not hunk.before(line):
+            break
+        shift += hunk.old_count - hunk.new_count
+    return line + shift, line + shift
+
+
+def _head_span(hunks: list[_Hunk], start: int, end: int) -> tuple[int, int] | None:
+    """The HEAD lines a working-tree span came from, or None when every line in
+    it is new. The mapping never runs backwards, so the ends bound it."""
+    found = [pair for pair in (_head_line(hunks, n) for n in range(start, end + 1)) if pair]
+    if not found:
+        return None
+    return found[0][0], found[-1][1]
+
+
+def _withheld(uncovered: MissingLines, path: str) -> str:
+    """Why PATH's line numbers in the lane artifacts no longer point at its
+    code, or "": the verdict that withholds its dark lines."""
+    return uncovered.note or uncovered.moved(path)
+
+
+def _tests_fields(contexts: dict, span, withheld: str = "") -> dict:
     """No span means silence, not guidance: nothing is missing for a function
-    the latest run does not carry."""
+    the latest run does not carry.
+
+    The test ids sit on the same line numbers as the dark lines, so a file
+    whose dark lines are withheld has its tests withheld with the same note.
+    Read off a stale artifact they credited a function with the tests that ran
+    whatever used to sit on its lines."""
     if span is None:
         return {"tests": None}
+    if withheld and contexts:
+        return {"tests": None, "tests_note": withheld}
     tests = _contexts_for_span(contexts, span)
     return {"tests": tests} if tests else {"tests": None, "tests_note": _NO_CONTEXT}
 
@@ -497,41 +607,23 @@ def _contexts_for_span(contexts: dict, span) -> list[str]:
 
 def _function_commits(root: Path, rel_path: str, start: int, end: int,
                       limit: int = 10) -> list[dict]:
-    """Commits that touched one line span, subject AND body, from `git log -L`.
+    """Commits that touched HEAD's lines START to END, subject AND body, as git
+    stored them but for a CRLF, which ends a body line as LF does. Raises
+    GitError.
 
     The body is what says why a span keeps changing; a subject line rarely does.
+    The span is the reader's, and git numbers it in HEAD's copy of the file at LF
+    only, so HEAD's bytes place it first.
     """
-    from ..gitio import _git
+    from ..diffparse import git_span
+    from ..gitio import commit_messages, line_commits, start_read
 
-    try:
-        out = _git(root, "log", f"-L{start},{end}:{rel_path}", f"--format={_LOG_FORMAT}",
-                   "--date=short", f"--max-count={limit}")
-    except GitError:
-        return []
-    return _parse_log_records(out)
-
-
-def _parse_log_records(out: str) -> list[dict]:
-    """Records out of `git log -L`, dropping the diff hunks printed between them.
-
-    A line is body text only while a record is open, so a hunk that happens to
-    look like prose can never land in one.
-    """
-    records: list[dict] = []
-    body: list[str] | None = None
-    for line in out.splitlines():
-        if line.startswith("\x01"):
-            sha, date, subject = line[1:].split(" ", 2)
-            records.append({"sha": sha, "date": date, "subject": subject, "body": ""})
-            body = []
-        elif body is None:
-            continue
-        elif line == "\x02":
-            records[-1]["body"] = "\n".join(body).strip("\n")
-            body = None
-        else:
-            body.append(line)
-    return records
+    start, end = git_span(start_read(root, "cat-file", "blob", f"HEAD:./{rel_path}").result(),
+                          start, end)
+    messages = commit_messages(root, line_commits(root, rel_path, start, end, limit))
+    return [{"sha": sha, "date": date, "subject": subject,
+             "body": body.replace("\r\n", "\n").strip("\n")}
+            for sha, date, subject, body in messages]
 
 
 def _explain_extras(p: dict) -> None:
@@ -548,9 +640,16 @@ def _explain_commits(p: dict) -> None:
         print(f"  commits: {p['commits_note']}")
         return
     for c in p["commits"]:
-        print(f"    {c['sha']} {c['date']} {c['subject']}")
-        for line in c["body"].splitlines():
-            print(f"      {line}" if line else "")
+        print("\n".join(_commit_text(c)))
+
+
+def _commit_text(c: dict) -> list[str]:
+    """A commit's printed lines. Every break str.splitlines knows ends one, so a
+    \\r or a form feed in a message starts an indented line instead of moving the
+    cursor back over the sha or the indent. --json keeps them as committed."""
+    head, *rest = c["subject"].splitlines() or [""]
+    return [f"    {c['sha']} {c['date']} {head}"] + [
+        f"      {line}" if line else "" for line in rest + c["body"].splitlines()]
 
 
 def _explain_tests(p: dict) -> None:

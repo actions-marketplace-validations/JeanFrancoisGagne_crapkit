@@ -33,7 +33,7 @@ def counted(monkeypatch) -> dict:
     monkeypatch.setattr(gitio, "head_commit", bump("head", "c0ffee1234567890"))
     monkeypatch.setattr(gitio, "status_names", bump("status", []))
     monkeypatch.setattr(gitio, "diff_names_since", bump("diff", []))
-    monkeypatch.setattr(gitio, "is_ancestor", bump("ancestor", True))
+    monkeypatch.setattr(gitio, "ancestry", bump("ancestor", True))
     return calls
 
 
@@ -115,14 +115,29 @@ def test_line_display_withholds_unproved_artifact_locations(tmp_path, counted, m
         write_stamps(tmp_path, {lane.artifact: {"commit": "beef" * 10,
                      "refused_mtime_ns": (tmp_path / lane.artifact).stat().st_mtime_ns}})
     elif reason == "lost-history":
-        monkeypatch.setattr(gitio, "is_ancestor", lambda *_args: False)
+        # The clone holds the commit, and HEAD's history does not: a rewrite.
+        monkeypatch.setattr(gitio, "ancestry", lambda *_args: False)
+        monkeypatch.setattr(gitio, "has_commit", lambda *_args: True)
     else:
         def unavailable(*_args):
             raise GitError("git unavailable")
         monkeypatch.setattr(gitio, "diff_names_since", unavailable)
     cfg = SimpleNamespace(lanes=[lane], scope_paths={"src": ("src",)})
 
-    assert lane_states(tmp_path, cfg, GitFacts(tmp_path))[0][1]
+    note = lane_states(tmp_path, cfg, GitFacts(tmp_path))[0][1]
+
+    assert WITHHELD[reason] in note, note
+    assert "file(s) in its scopes changed since" not in note, note
+    assert "commit or revert" not in note, note
+
+
+# What the note names for each cause, in lane_freshness's words. None of them is
+# a changed file, so none counts changed files or asks for a commit or a revert.
+WITHHELD = {"missing-stamp": "no stamp records the commit a.json was built at",
+            "refused-write": "its last attempt wrote no artifact",
+            "lost-history": "its artifact was built at beefbeefbee, which is not behind HEAD",
+            "git-error": "git cannot say which files in its scopes changed since beefbeefbee "
+                         "(git unavailable)"}
 
 
 @pytest.mark.parametrize("changed, stale", [("src/a.py", True), ("src/b.py", False)])

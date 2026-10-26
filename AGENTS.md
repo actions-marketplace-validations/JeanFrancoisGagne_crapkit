@@ -15,7 +15,8 @@ Every command below runs as `crapkit <sub>` (console script) or
 `python -m crapkit <sub>`. Every subcommand takes `--repo PATH`; without it the root is the
 nearest `crapkit.toml` at or above the working directory
 (docs/adr/0002-configuration-is-found-upward-nearest-wins.md), except `claude-hook`, which
-reads its root from the hook payload on stdin.
+reads its root from the hook payload on stdin. A leading `~` in PATH is your home directory
+even where no shell expands it: cmd.exe, or an MCP client's `args`.
 
 ---
 
@@ -35,15 +36,17 @@ and `commands.verify` come back filled in for this file and this scope; run them
 given rather than retyping them, which is how a lane flag or a scope's own test template
 gets dropped. They are spelled as the console script (`crapkit rescore PATH --gate`),
 which is the spelling that resolves from an activated venv on Windows: bare `python`
-there can reach the WindowsApps stub or the base interpreter the venv wraps.
+there can reach the WindowsApps stub or the base interpreter the venv wraps. A packet
+built under uvx spells them `uvx crapkit ...`, because uvx puts no `crapkit` on PATH.
 
 `commands.refresh` is the fourth string: it creates a `coverage` run.
 Automatic reuse requires the same clean HEAD and unchanged configuration,
-environment and coverage/JUnit bytes, or, for a lane that lists its `inputs`, no
+environment, crapkit version and coverage/JUnit bytes, or, for a lane that lists its `inputs`, no
 change under those paths, its lane table or its `env` since the artifact's commit;
 every other lane reruns. That is what
-`stale: true` asks for. Nothing else clears it, because nothing else lands a run on the
-current commit. `commands.refresh_writes_run: true` marks that ledger write.
+`stale: true` and a `scored_changes` above `0` ask for. Nothing else answers them: `stale`
+clears only when a run lands on the current commit, and `scored_changes` falls to `0` only
+when a run records the content on disk now. `commands.refresh_writes_run: true` marks that ledger write.
 The other commands can still write caches or test artifacts; the field does not
 promise filesystem read-only execution.
 
@@ -51,7 +54,7 @@ promise filesystem read-only execution.
 `crapkit brief --batch N --json` an orchestrator already ran.
 
 Read commands need a run in the store and exit 1 with the command that makes one when
-there is none (`next-item` and `brief` say `no scored run in <root> — run \`crapkit
+there is none (`next-item` and `brief` say `no scored run in <root> - run \`crapkit
 coverage\` first`; `worklist` says `no run with rows`, and every one of them says
 `no snapshot` when `.crapkit/crap.sqlite` does not exist). Run what the message names,
 then retry.
@@ -78,11 +81,12 @@ do next.
 | `notes` | the repo's and the scope's house rules, carried in from crapkit.toml |
 | `gate_rule` | `ceiling` is the number step 3 judges ccn against; `binds` is the gate's scope rule as one fixed sentence: print it, do not branch on it |
 | `commands` | the literal strings for steps 3, 4 and 5, plus `refresh` and `refresh_writes_run` |
-| `stale` | `true` means the run predates HEAD: run `commands.refresh` before trusting `cov` |
+| `scored_changes` | how many files the run scored hold other content now, your own edits included. Anything but `0`, `null` included: run `commands.refresh` before trusting `cov` or `source` |
+| `stale` | `true` means HEAD moved past the run's commit; it says nothing about the files |
 | `file_functions`, `file_totals` | the siblings an extracted helper lands beside, and the file's rollup |
 | `regrowth` | `regrown: true` says an earlier decomposition of this function did not hold |
 | `attempts` | every claim already taken on it, oldest first. Not empty: read `regrowth.history` before repeating their split |
-| `coupling` | files that keep landing in the same commits: edit them in this session or not at all. `is_test: true` marks the ones outside the scored corpus |
+| `coupling` | files that keep landing in the same commits: edit them in this session or not at all. `is_test: true` marks a test file, by directory or by runner naming convention |
 | `duplication_twins` | near-duplicates. `contained: true` means one already fits inside the other, so one can call the other |
 | `uncovered_lines` | the exact lines to cover, same null-vs-`[]` contract as next-item |
 
@@ -97,7 +101,7 @@ do next.
 - the twin selector on a name one file gives to several functions (`"__post_init__#2"`)
 
 Exact first: a NAME that IS a function's long name or bare identifier resolves to that
-function alone, even when other names contain it — `route` is `route`, never
+function alone, even when other names contain it: `route` is `route`, never
 `route_chain`. A NAME that names no function falls back to a substring search, so a
 half-remembered fragment still finds what holds it. `brief` and `explain` run the same
 rule on the same string, and both read a start line or an `(anonymous)#N` handle off the
@@ -108,7 +112,7 @@ still holds it.
 A name that two functions answer to exits 1 and lists the candidates. Pass the long
 name or the start line instead:
 
-    crapkit: 'render' in calc/report.py is ambiguous — candidates: render( counts , width , header , sort_desc ), render( self , rows )
+    crapkit: 'render' in calc/report.py is ambiguous - candidates: render( counts , width , header , sort_desc ), render( self , rows )
 
 A function lizard could not name shows as `(anonymous)` in every payload, and every
 anonymous function in one file prints that same string. Its `handle` is the ordinal
@@ -119,23 +123,23 @@ something else, while `"(anonymous)#2"` still opens the callback you claimed. `b
 `explain` and `claims release` all take it. An ordinal past the end exits 1 and lists
 the handles the file does hold:
 
-    crapkit: no (anonymous)#5 in calc/report.py in the latest scored run — it holds: (anonymous)#1, (anonymous)#2
+    crapkit: no (anonymous)#5 in calc/report.py in the latest scored run - it holds: (anonymous)#1, (anonymous)#2
 
 One file can also give one name to several NAMED functions: several dataclasses each
 with a `__post_init__`, both arms of an `#ifdef` fork. A bare name resolves to the worst
 of them, which is the one the queue ranks, in `brief`, `explain` and
 `get_function_history` alike. `NAME#2` selects the second in file order and
-`NAME#3` the third — the same ordinals the ratchet keys their marks on, so the mark in a
+`NAME#3` the third, the same ordinals the ratchet keys their marks on, so the mark in a
 packet is the mark on the function that packet opened. An ordinal past the last twin
 exits 1:
 
-    crapkit: no __post_init__#5 in calc/iso_cost.py in the latest scored run — it holds 2 function(s) named '__post_init__'
+    crapkit: no __post_init__#5 in calc/iso_cost.py in the latest scored run - it holds 2 function(s) named '__post_init__'
 
 ### One call for a batch of packets
 
     crapkit brief --batch 5 --json
 
-`{"schema": 1, "run_id": ..., "commit": ..., "stale": ..., "packets": [...]}`: the top N
+`{"schema": 1, "run_id": ..., "commit": ..., "stale": ..., "scored_changes": ..., "commands": {"refresh": ...}, "packets": [...]}`: the top N
 of the queue as N packets, `crap` descending, built from one read of the store, the
 churn log and the ratchet file. Hand one packet to one session. A function another
 session holds under `next-item --claim` is skipped, as `next-item` skips it, and the
@@ -149,9 +153,14 @@ what you are editing, `gate_rule.ceiling` is the number to land under.
 - `remedy: decompose`: extract helpers until every piece sits at or under `target`.
   Comprehension `for`/`if`, ternaries, and `and`/`or` all count toward ccn. Exactly the
   target passes, one over does not. `file_functions` is what the file already holds, so
-  a new helper does not collide with a name that is there.
+  a new helper does not collide with a name that is there. Run the scope's tests before
+  the first extraction and after each one, and give each helper a decision of its own: a
+  helper that only forwards its arguments moves the number and leaves the risk where it
+  was.
 - `remedy: add-tests`: write the failing test first, at the public seam, then cover the
-  lines `uncovered_lines` names. `params` gives the call signature.
+  lines `uncovered_lines` names. `params` gives the call signature. Each test asserts
+  what the lines it runs decide; a test that only runs them raises coverage and catches
+  nothing.
 - `remedy: split-lines`: another function shares this one's source lines, so coverage
   cannot tell them apart and the score stays at uncovered whatever you test. Put each
   definition on its own lines, then `crapkit coverage`. The next run says whether tests
@@ -179,7 +188,7 @@ Three rules decide what it judges:
   legacy functions in the same file are not judged.
 - **Metric**: ccn against the file's scope ceiling, coverage ignored. Same question the
   pre-commit hook asks.
-- **Exemption**: a function carrying a ratchet mark it has not exceeded passes. Push it
+- **Pardon**: a function carrying a ratchet mark it has not exceeded passes. Push it
   past its mark and it fails here, ahead of verify's exit 6. Verify keeps exit 7 for a
   mark that rose in a function the diff never touched.
   The marks file is read only when a changed function is over its ceiling, so a clean
@@ -188,7 +197,7 @@ Three rules decide what it judges:
 | Exit | Meaning | Next action |
 |---|---|---|
 | 0 | every changed function is at or under its ceiling | go to step 4 |
-| 6 | the listed functions are over | decompose them, rerun |
+| 6 | the listed functions are over, or an `UNREAD` line names a changed file no reader could read | decompose them, or change what the unread file's reason names; rerun |
 
 Exit 0 is not a verify. `rescore` overlays fresh complexity on the last run's stale
 coverage and writes no run, so a new function at exactly the ceiling with no tests
@@ -225,14 +234,18 @@ and binds to the environment the repo pins:
 - crapkit routes each file you name to the scope whose `paths` entry matches deepest,
   substitutes `{files}` with that scope's files (each double-quoted, in the order you
   passed them), and runs one command per scope, scopes in name order.
-- A file only routes if it sits under a scope's `paths`. Keep test files inside a scope
-  path if you want to name them here; `[exclude] globs` still keeps them out of scoring.
+- A file only routes if it sits under a scope's `paths`, or in a test directory (next
+  section). Keep test files inside a scope path if you want to name them here;
+  `[exclude] globs` still keeps them out of scoring.
 
 ### Several scopes, tests in a top-level tests/
 
 A test file outside every scope routes to the single scope that declares a template. With
 two templated scopes there is no single owner and `crapkit test-scoped tests/test_stats.py`
-exits 3. Naming a source file routes fine, and then `{files}` hands pytest a source path to
+exits 3. A test file here is one under a `test`, `tests` or `__tests__` directory, in any
+case, the directories the scored corpus drops on its own. A test name is not enough:
+`tools/test_helper.py` outside every scope and every test directory is source no scope
+claims, and naming it exits 3. Naming a source file routes fine, and then `{files}` hands pytest a source path to
 collect tests from: no tests ran, runner exit 5, crapkit exit 1.
 
 Drop `{files}` for those scopes. A template without it runs exactly as written, so the
@@ -262,11 +275,16 @@ This is the slow step and the only authoritative one.
 | Exit | Verdict | Next action |
 |---|---|---|
 | 0 | pass | baseline advanced, ratchet tightened, finished claims released. Commit |
-| 5 | a lane produced no artifact, one that measured a different tree, or one that measured this tree and reported it in absolute paths | tooling, not your code. For the first two, read the lane log the message names and fix the lane command in crapkit.toml. The third names the runner's own switch instead, `relative_files = true` under `[tool.coverage.run]` for coverage.py or the reporter's `cwd`/`root` option for istanbul, because the lane command is fine and only the spelling of the paths is not |
-| 6 | gate: a touched function is over its ceiling on CRAP and above any ratchet mark it carries | decompose it, or cover it |
+| 5 | a lane produced no artifact, one that measured a different tree, or one that measured this tree and reported it in absolute paths; or, under `--reuse-artifacts`, a lane whose declared `results_artifact` is missing or unreadable | tooling, not your code. For the first two, read the lane log the message names and fix the lane command in crapkit.toml. The third names the runner's own switch instead, `relative_files = true` under `[tool.coverage.run]` for coverage.py or the reporter's `cwd`/`root` option for istanbul, because the lane command is fine and only the spelling of the paths is not. For the junit, rerun `commands.verify` as given: it runs the lanes and writes the file. No run was stored, so nothing passed |
+| 6 | gate: a touched function is over its ceiling on CRAP and above any ratchet mark it carries, or a changed file no reader could read (`UNREAD`) | decompose it, or cover it; for `UNREAD`, change what the reason names |
 | 7 | ratchet: a recorded score got worse | restore that function below its mark |
 | 8 | a test that passed in the baseline fails now | fix the test or the code |
 | 9 | more uncovered changed lines than `diff_uncovered_max` | cover the changed lines |
+
+Exit 8 with `warning: lane 'py': no trusted run at or behind the baseline recorded which
+of its tests failed` means the baseline cannot tell your failure from an old one: the lane
+declared no `results_artifact` when the baseline ran. verify counts it as new anyway. Check
+whether the test fails at the baseline commit before you change code for it.
 
 One verdict per run, in that order: 6 beats 7 beats 8, and 9 fires only when nothing
 else did. A run that exits non-zero never becomes a baseline and never tightens the
@@ -286,8 +304,10 @@ lane subset, or a lane that failed).
 The lines verify prints, one per finding kind, collected here from separate runs:
 
     verify OK @ f6e9bde18a7 vs baseline f6e9bde18a7 (1 changed files)
+      changed files: calc/grade.py
     crapkit: lane 'py' FAILED: lane 'py' produced no artifact at .crapkit/cov/py.json (command exit 4); lane log: /repo/.crapkit/lane-py.log; last output: ...
     verify FAILED @ 3a45b8a9b6c vs baseline 03d9cac1397 (1 changed files)
+      changed files: calc/report.py
       GATE  crap     42.0  ccn   6 cov 0%  calc/report.py:22  bucket( counts , low , high , invert , label )  -> add-tests  [dirty]
       RATCHET  calc/report.py  spread( counts , low , high , invert , label , pad ): 8.0 -> 72.0
       NEW FAILURE  tests.test_curve::test_normalized  [dirty]
@@ -303,23 +323,42 @@ summary line splits them. In a shared checkout, dirty findings may not be yours.
 ## The advisory hook
 
 With the Claude Code plugin installed, `crapkit claude-hook` runs after every edit you
-make and writes three lines to stderr when that edit pushed a function over its ceiling:
+make and writes three lines to stderr when that edit pushed a function over its ceiling.
+In Cursor, Copilot CLI and VS Code, which load the same plugin, the same three lines
+arrive as added context instead, and the hook exits 0:
 
     crapkit advisory: 1 function(s) over ceiling 6 in calc/grade.py (the edit landed; nothing was blocked)
       ccn 9  calc/grade.py:67  curve( scores , mode , floor , ceiling , skip_none )
     the commit gate enforces this; decompose there or mark the debt
 
-Nothing was blocked and nothing was written. Read it as the earliest warning that step 3
-will fail, not as a rejected edit. A function the committed ratchet already marks never
-triggers it, and a repo with no `crapkit.toml` never hears from the hook at all.
+Nothing was blocked and nothing in your tree was written. Read it as the earliest warning
+that step 3 will fail, not as a rejected edit. A function the committed ratchet already
+marks never triggers it, and a repo with no `crapkit.toml` never hears from the hook at
+all. Before the repo's first commit there is no HEAD to diff against, so every function in
+the edited file counts as changed.
+
+The same exit 2 comes with a different head line when the hook could not judge the edit.
+An edit that leaves a file no reader can read (a TypeScript arrow body the reader refuses,
+a Python def cut off at its signature) gets the same three-line shape, opening
+`crapkit advisory: src/a.ts could not be read, so no function in it was judged`, then an
+`UNREAD` line with the reader's reason and the fix: change what the reason names, or list
+the file under `[exclude] globs`. The commit gate refuses that file once staged, so fix it
+before you commit. `crapkit advisory: git could not report what changed in calc/grade.py,
+so no function in it was judged (the edit landed; nothing was blocked)` quotes git's error
+instead, a corrupt index for one. Neither is a clean verdict, and no function was checked.
 
 An edit event names its file. A `Bash` event names none, so the hook reads the working
 tree instead: the dirty or untracked `*.py` files whose mtime falls inside a 12-second
 window, 25 at most, each judged exactly the way an edited file is. Write source through a
-heredoc and you still get the advice. Three things make it silent: a clean tree, a file
-that was already dirty before this command ran, and a shell whose cwd is outside any git
-repo. It judges `*.py` and nothing else; every other language stays the commit gate's
-business.
+heredoc and you still get the advice. The hook records the bytes each judgement read, per
+session, under `.git/crapkit/claude-hook/`, and skips a file whose bytes it already
+judged, so a `touch`, a same-bytes rewrite or a test run after an edit does not repeat an
+advisory. Four things make it silent: a clean tree, a file whose mtime is older than the
+window, a file this session already judged at these bytes, and a shell whose cwd is
+outside any git repo. A file moved or copied in with its old mtime (`mv`, `cp -p`, an
+unpacked archive) is never judged here, and neither is one a long command wrote well
+before it returned. It judges `*.py` and nothing else; every other language stays the
+commit gate's business.
 
 That fallback fires only where a `Bash` matcher is registered, which the shipped plugin
 does not do; [README.md](README.md#the-claude-code-plugin) has the snippet and the cost.
@@ -332,7 +371,7 @@ run at all, and `crapkit doctor` answers it. doctor reads each lane command with
 shell that will run it, sh on POSIX and cmd.exe on Windows, and FAILs a lane whose first
 word will not start:
 
-    FAIL lane 'py': cmd.exe cannot run 'python' (exit 9009) — the lane cannot start, so its scopes can only ever score no-lane
+    FAIL lane 'py': cmd.exe cannot run 'python' (exit 9009) - the lane cannot start, so its scopes can only ever score no-lane
 
 9009 is cmd.exe saying it could not start that name. The usual cause is the Store
 `python.exe` alias a stock Windows PATH carries with no Store app behind it: it resolves,
@@ -386,7 +425,8 @@ not.
 
 A staged file above the crapkit root is outside the diff by design, and the gate does not
 name it. `.git` is found by walking up from the root, so the HEAD fast path fires down
-here too.
+here too. The commit hook needs no `--repo`: git runs it at the top, and with no
+`crapkit.toml` there the gate runs in each root below that owns a staged file.
 
 ## Which scope owns a file
 
@@ -410,7 +450,7 @@ Where a packet's `PATH` and `FUNCTION` come from when no orchestrator handed you
 `next-item` always prints one JSON object on stdout and has no `--json` flag. One real
 payload, one line, sorted keys:
 
-    {"commit": "f6e9bde18a7b4a4d4a0610c16b0526bd9aefc6c6", "empty": false, "item": {"authors": 1, "ccn": 11, "ccn_std": 11, "cognitive": 15, "commits": 6, "cov": 0.0, "crap": 132.0, "end": 84, "est_splits": 2, "est_uncovered_paths": 11, "flag": "measured", "function": "curve( scores , mode , floor , ceiling , skip_none )", "handle": "curve", "nesting": 3, "nloc": 17, "path": "calc/grade.py", "remedy": "decompose", "scope": "calc", "start": 67, "target": 6, "uncovered_lines": [69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]}, "run_id": 5, "schema": 1, "skipped_no_lane": 0, "stale": false}
+    {"commands": {"refresh": "crapkit coverage --reuse-unchanged"}, "commit": "f6e9bde18a7b4a4d4a0610c16b0526bd9aefc6c6", "empty": false, "item": {"authors": 1, "ccn": 11, "ccn_std": 11, "cognitive": 15, "commits": 6, "cov": 0.0, "crap": 132.0, "end": 84, "est_splits": 2, "est_uncovered_paths": 11, "flag": "measured", "function": "curve( scores , mode , floor , ceiling , skip_none )", "handle": "curve", "nesting": 3, "nloc": 17, "path": "calc/grade.py", "remedy": "decompose", "scope": "calc", "start": 67, "target": 6, "uncovered_lines": [69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84], "unmeasured": false}, "run_id": 5, "schema": 1, "scored_changes": 0, "shallow": false, "skipped_no_lane": 0, "stale": false}
 
 Act on these fields:
 
@@ -418,13 +458,16 @@ Act on these fields:
 |---|---|
 | `remedy` | `decompose` splits the function, `split-lines` moves it off a line it shares with another function or with its own `def`, `add-tests` covers it, `ok` needs nothing |
 | `est_splits` | pieces a decomposition needs: `0` when `ccn <= target`, else `ceil(ccn / target)` |
-| `est_uncovered_paths` | decision paths no test walks: `round((1 - cov) * ccn)` |
+| `est_uncovered_paths` | decision paths no test walks: `(1 - cov) * ccn` rounded half to even, so 2.5 reads 2 and 3.5 reads 4 |
 | `uncovered_lines` | the exact line numbers to cover |
 | `target` | the scope's ceiling; ccn above it cannot be saved by coverage |
 | `function` | pass verbatim to `brief` and `claims release` |
 | `handle` | the shorter name form, and the one to use on a function printed as `(anonymous)`: `(anonymous)#2` names a position in the file, so it outlives your own edit |
 | `start` | the other name form `brief` takes; a line number, so an edit above it invalidates it |
-| `stale` | `true` means the run predates HEAD; rerun `crapkit coverage` before acting on `cov` |
+| `scored_changes` | how many files the run scored hold other content now, your own uncommitted edits included. Anything but `0`, `null` included, means run `commands.refresh` before acting on `cov` or the span; `null` means the run recorded no content (crapkit 0.8.0 and older) or git could not read the tree to compare |
+| `stale` | `true` means HEAD moved past the run's commit. It judges the commit, not the files: an amend or an empty commit sets it with every number still true, and an uncommitted edit leaves it `false`, so read `scored_changes` for the content |
+| `unmeasured` | `true` means no measurement stands behind `cov` (`flag` `cc-only`, or `no-lane` on a `brief`), so `cov` 0.0 and `est_uncovered_paths` are stand-ins, and `brief`'s text prints `not measured`. A test does not move them: a `no-lane` scope needs a lane, and a `cc-only` scope has none by design |
+| `shallow` | on the envelope: `true` means the checkout is a shallow clone, so `commits`, `authors` and churn count only the commits it holds (one per file at depth 1), and stderr names the fix, `set fetch-depth: 0 on the checkout or run git fetch --unshallow` |
 
 `uncovered_lines: null` with a sibling `uncovered_lines_note` means no artifact could name
 line numbers for that file. The note names which case, and `flag` is the same answer in one
@@ -434,16 +477,19 @@ word:
   whole span is dark. The move is to write the first test at the public seam and rerun
   `crapkit coverage`; the lines then appear. Committing changes nothing here, and neither
   does verify. This is the common case on a clean tree.
-- `flag: "measured"`: a lane did measure this file, but its artifact no longer matches the
-  tree, usually because files in the lane's scopes carry uncommitted edits. Commit or
-  revert the edits, then rerun `crapkit coverage`. Committing alone does not bring the
-  lines back: nothing rereads the artifact until a run does.
+- `flag: "measured"`: a lane did measure this file, but the file's bytes changed since,
+  usually by your own edit. Rerun `crapkit coverage`. Committing changes nothing here,
+  and a touch, a mode bit, an amend or a rebase never withholds the lines: the lane's
+  stamp holds the git blob id of each file it measured, and only another blob counts. Every
+  other file keeps its lines.
 - `flag: "cc-only"`: the scope sets `coverage_optional = true`, so no artifact was ever
   going to name lines for it. Nothing clears this one, and nothing should: `crap` is `ccn`
   and the only remedy is `decompose`.
 
 `[]` means the artifact answered and nothing is dark. The note is prose and may be
-reworded; `flag` is the contract.
+reworded; `flag` is the contract. `flag: "excluded"` comes with `[]`: the lane's coverage
+tool was told to leave the function out (`# pragma: no cover`, `istanbul ignore next`), so
+`crap` is `ccn` and the only remedy is `decompose`.
 
 `--top N` replaces `item{}` with `items[]`. `--exclude FRAG` (repeatable) skips items whose
 path or function name contains FRAG. `--scope NAME` (repeatable) restricts to the named
@@ -451,22 +497,27 @@ configured scopes, matched exactly rather than as a substring.
 
 ## The termination rule
 
-**Stop looping when all three of these hold in one bare `crapkit next-item`, and not
+**Stop looping when all four of these hold in one bare `crapkit next-item`, and not
 before:**
 
     empty                        true
     skipped_claimed              0, or absent
     reasons.no_lane_over_target  0, or absent
+    scored_changes               0
 
-    {"commit": "8d10c13303dfd9ef4172d9f736582ff4ffa96e60", "empty": true, "reasons": {"all_remaining_at_or_under_target": 4, "below_floor": 1, "churn_window_months": 12, "excluded_by_flag": 0, "no_churn_in_window": 0, "no_lane": 0, "no_lane_over_target": 0}, "run_id": 3, "schema": 1, "skipped_no_lane": 0, "stale": false}
+    {"commands": {"refresh": "crapkit coverage --reuse-unchanged"}, "commit": "8d10c13303dfd9ef4172d9f736582ff4ffa96e60", "empty": true, "reasons": {"all_remaining_at_or_under_target": 4, "below_floor": 1, "churn_window_months": 12, "excluded_by_flag": 0, "no_churn_in_window": 0, "no_lane": 0, "no_lane_over_target": 0}, "run_id": 3, "schema": 1, "scored_changes": 0, "shallow": false, "skipped_no_lane": 0, "stale": false}
 
 That payload is a finished burn-down. `empty: true` on its own is not: it says the queue
-has nothing to hand out, and two things stop it handing out work that still exists. A
+has nothing to hand out, and three things stop it handing out work that still exists. A
 claim hides a row from every session, yours included. A `no-lane` row never reaches this
 queue, because its `cov = 0` is a tooling gap rather than a testing one, and
 `no_lane_over_target` counts how many of those rows are over their ceiling anyway. Either
 count non-zero means work is left somewhere the queue cannot reach. `crapkit worklist` does
-rank those rows, marked `no-lane`, so the gap stays visible somewhere.
+rank those rows, marked `no-lane`, so the gap stays visible somewhere. And the queue ranks
+the run, not the tree: `scored_changes` counts the files the run scored whose content
+changed since, your own last edit included. Anything but `0`, `null` included, means run
+`commands.refresh` and ask again. `stale` is not part of the rule: it says HEAD moved past
+the run's commit, which an amend does with no byte moved.
 
 The two read the same run, the newest trusted one, so where they disagree it is about
 ranking and never about which snapshot each is describing. `ratchet seed` and `prune` pick
@@ -563,7 +614,8 @@ marks instead of hand-resolving them, which is how a mark silently rises.
 
     crapkit mcp --repo /abs/path/to/repo
 
-Stdio JSON-RPC, newline-delimited, no SDK dependency. Client config:
+Stdio JSON-RPC, newline-delimited, no SDK dependency. Client config, in the `mcpServers`
+form Claude Code and Cursor read:
 
     {
       "mcpServers": {
@@ -574,11 +626,25 @@ Stdio JSON-RPC, newline-delimited, no SDK dependency. Client config:
       }
     }
 
+Other agents take other keys and fields: OpenCode, Amp and VS Code ignore this block
+without an error, and a headless Gemini CLI or Qwen Code calls none of the tools without
+`"trust": true`.
+[docs/harnesses.md](docs/harnesses.md) gives the block for each agent.
+
 `--repo` names an exact root, as on every subcommand; without it the server walks up from
 where it started, and a tool's optional `repo` argument overrides the root per call and is
-walked the same way (ADR 0002). `initialize` negotiates the protocol revision (a client's
-`2025-06-18`, `2025-03-26` or `2024-11-05` is echoed back; anything else is answered with
-`2025-06-18`) and reports server name `crapkit`.
+walked the same way (ADR 0002). A server started in its plugin's install directory (the
+client's `PLUGIN_ROOT`, `COPILOT_PLUGIN_ROOT` or `CLAUDE_PLUGIN_ROOT`) never walks up from
+there, and one whose start serves nothing asks a client that declares `roots` for its
+workspace folders and serves the first one a `crapkit.toml` claims: VS Code starts
+user-level servers in the home directory and plugin servers in the plugin directory.
+After those folders comes the `cwd` GitHub Copilot CLI records for the session in
+`$COPILOT_HOME/session-state/$COPILOT_AGENT_SESSION_ID/workspace.yaml`, since Copilot
+starts plugin servers in the install directory and declares no roots. A `--repo` start
+never asks and never falls back.
+`initialize` negotiates the protocol revision (a client's `2025-06-18`, `2025-03-26` or
+`2024-11-05` is echoed back; anything else is answered with `2025-06-18`) and reports
+server name `crapkit`.
 
 Twelve tools, every one the CLI command's `--json` form:
 
@@ -595,15 +661,34 @@ Twelve tools, every one the CLI command's `--json` form:
 | `list_duplicate_functions` | `similarity` | JSON |
 | `get_ratchet_report` | none | JSON |
 | `list_claims` | none | JSON (`claims list --json`) |
-| `check_gate` | `path` | JSON: `rescore PATH --gate --json`, whose `gate` block says whether the edited file clears `rescore --gate`, which is stricter than the commit hook: a ratchet mark pardons only while the function's CRAP is at or under it; `ok` false on a breach (exit 6), answered as a result, not a tool error |
+| `check_gate` | `path` | JSON: `rescore PATH --gate --json`, whose `gate` block says whether the edited file clears `rescore --gate`, which is stricter than the commit hook: a ratchet mark pardons only while the function's CRAP is at or under it; `ok` false on a breach or on a changed file no reader could read (`gate.unread_files`), exit 6, answered as a result, not a tool error |
 
 Arguments are checked against the served schema before the CLI spawns. `tools/list`
 carries `required` from each tool's positionals, and a missing positional, an undeclared
 key or a wrong type answers a tool result with `isError` true, naming the MCP tool rather
 than the CLI command behind it (`get_function_brief needs name (see inputSchema.required)`),
-not a `-32602` protocol error; ADR 0001 under `docs/adr/` says why. `ping` answers `{}`.
-An exception escaping the server answers `-32603` and the loop continues.
-`structuredContent` rides beside the text whenever the CLI exited 0; a `doctor` that finds
+not a `-32602` protocol error; ADR 0001 under `docs/adr/` says why. A string argument, or
+an array item, that holds U+0000 gets the same kind of answer
+(`path must not hold a NUL character (U+0000)`), since no file name or process argument
+can carry one. `arguments` sent as a
+list, a string or a number get the same kind of answer, naming the JSON type they came as
+(`arguments must be an object (got a number)`), since MCP takes them by name; only null
+or absent `arguments` read as `{}`. `params` that
+are not an object on `tools/call` or `initialize` name no tool, so they answer `-32602` with
+no result (`params must be an object naming the tool and its arguments (got an array)`) and
+the session reads on; null or absent `params` read as `{}`. `wait_for_previous`,
+which Gemini CLI adds to every call for its own scheduler, is dropped rather than refused.
+`ping` answers `{}`.
+An exception escaping the server answers `-32603` and the loop continues. A frame that is
+not one JSON object gets no reply, and the server reads the next line. After a
+`pip install -U` under a running server, every call answers a tool result that names both
+versions and says to restart the server, instead of loading the new files into the old
+process.
+`structuredContent` rides beside the text whenever the CLI exited 0 and the client
+negotiated `2025-06-18`; a client on an older revision gets the text alone. An answer over
+7,500 characters loses the end of its largest lists, then of its strings, then of its
+objects, at any depth (`gate.breaches` counts as a field), and carries `truncated` with
+what each kept and the CLI command that prints it whole. A `doctor` that finds
 a FAIL exits 1 and answers its JSON text with `isError: true` and no `structuredContent`.
 `check_gate` is the one tool whose non-zero exit is an answer: exit 6 (a breach) comes
 back with `isError: false`, `structuredContent` and `gate.ok` false; exits 3, 4 and 5 stay
@@ -625,15 +710,27 @@ run. The store fills missing per-run rollups when `trend` or `report` asks for t
 
 ## Setup
 
-    pip install -e ".[dev]"
+    pip install -e ".[dev,accuracy-push]"
+    npm ci --prefix tools/accuracy/node/push
     git config core.hooksPath git-hooks
+    git config merge.crapkit-ratchet.driver "python -m crapkit ratchet merge %O %A %B"
 
-The dev extra ships `pytest`, `pytest-cov`, `pytest-xdist` and `coverage`. None of the
-four is a convenience.
+The driver line makes git merge `crapkit-ratchet.tsv` through `crapkit ratchet merge`,
+so a land or a worktree merge combines the marks instead of leaving a conflict for a
+hand to resolve.
 
-`coverage>=7.10.6` is the floor `[tool.coverage.run] patch = ["subprocess"]` needs, and
-the key stays although tests/e2e now runs most CLI calls inside the pytest worker, where
-they are measured like any test. The files that bind `cli_runner(spawn=True)`, and every
+The Node tools under `tools/accuracy/node/push` are what the pre-push checks of a
+JavaScript or TypeScript calculation and `change_control.py declare` run.
+
+The dev extra ships `pytest`, `pytest-cov`, `pytest-xdist`, `coverage`, `PyYAML` and
+`Pillow`. None of them is a convenience: PyYAML reads the workflow files the CI tests
+check, and Pillow renders the demo the demo tests build.
+
+`coverage>=7.13.1` is the oldest coverage whose report the coverage.py reader takes (it
+writes `start_line`), and it clears 7.10.6, the floor the
+`[tool.coverage.run] patch = ["subprocess"]` key needs. The key stays although tests/e2e
+now runs most CLI calls inside the pytest worker, where they are measured like any test.
+The files that bind `cli_runner(spawn=True)`, and every
 Python child crapkit starts, run in processes of their own and are measured only through
 that patch. pytest-cov 7.0.0 dropped its own subprocess measurement, and without the
 patch what only they reach reads 0% with nothing said. An older coverage warns about the
@@ -645,11 +742,13 @@ xdist is not a convenience either. `tests/fixtures/mini_repo` declares a lane th
 out to `pytest ... -n 0`, and `tests/fixtures/mini_repo_xdist` keeps `pytest ... -n 2` for the one
 test in `test_inventory_e2e.py` about xdist fragments combining. pytest rejects `-n`
 without xdist, `-n 0` included, so either lane dies on an unrecognized `-n` and fails the
-e2e tests that assert it exited 0. CI installs this extra and nothing else, so a pytest
+e2e tests that assert it exited 0. CI's test jobs install this extra and nothing else, so a pytest
 plugin a committed fixture lane needs belongs in it.
 
-The second line arms the complexity gate. Without it your commits pass locally and get
-rejected in review.
+The second line arms the complexity gate on commits and change control on pushes.
+Without it your commits pass locally and get rejected in review. The `accuracy-push`
+extra holds the pinned oracles change control and the calculation-accuracy suite read
+(docs/accuracy.md); without it the pre-push hook stops and prints the install line.
 
 ## Tests
 
@@ -668,6 +767,39 @@ Use `--unit-workers 1` on the shared runner to reproduce a unit failure serially
 Use `--coverage` to combine both suites' branch coverage, test contexts and JUnit
 results. Either suite failing makes the runner fail. Use `--suite unit` or
 `--suite e2e` to run one session, the way each Windows CI job does.
+
+The deploy suite under `tests/deploy` installs crapkit the way a user does, through each
+channel and harness, fresh and upgraded. A bare `pytest` leaves it uncollected. It runs
+through one entry point, which builds the pinned images (or reuses them), exports this
+tree into them and runs the cells with no network:
+
+```sh
+python tools/deploy/run.py --packet deploy-kit          # the kit's own tests, in crapkit-deploy:core
+python tools/deploy/run.py --cell lin-pip-start-py311   # one cell
+python tools/deploy/run.py --cadence push               # what ci.yml's two deploy-linux parts run between them
+python tools/deploy/run.py --native --os windows        # Windows or macOS, after tools/deploy/toolchain.py
+```
+
+ci.yml runs the push set in `deploy-linux`, `deploy-linux-native`, `deploy-windows` and
+`deploy-action`. deploy.yml runs the nightly, weekly, release and published sets, and runs
+on a pull request only when it changes an install surface or carries the `deploy-full`
+label. Before a release, push HEAD (the commit stage 1 will bump), dispatch the release
+set with `gh workflow run deploy.yml --ref main -f cadence=release` and wait for it to
+pass: `python tools/release/release.py check VERSION` refuses until a release-cadence run
+at HEAD is green. `tests/deploy/MAP.toml` maps every documented install command, channel,
+harness and upgrade source to its cells, and `tests/unit/test_deploy_map.py` fails on a
+doc fence the map does not cover. A new `@cell` goes into the map with its packet, cadence, os and image,
+and into a run that selects it; `tests/unit/test_deploy_map.py` and
+`tests/unit/test_deploy_workflows.py` name each cell missing from either.
+`tools/deploy/README.md` is the full guide.
+
+A change to anything crapkit computes, a score, a label, a ranking or a pass/fail,
+also runs the calculation-accuracy suite: `python tools/accuracy/run.py --tier push -n 4`
+(docs/accuracy.md has every tier). A fix to a calculation needs the rows
+[docs/accuracy.md: past bugs](docs/accuracy.md#past-bugs) names; a change that moves a
+golden declares itself with
+`python tools/accuracy/change_control.py declare`, and the pre-push hook refuses the push
+until it does, printing the command.
 
 `tests/unit` covers pure seams, and that now includes `cli/verifying.py` and
 `cli/scoring.py`, driven in process rather than through a subprocess. `tests/e2e` drives
@@ -691,12 +823,19 @@ clears tempfile's cached directory for the call. These files do:
 | File | What needs the process |
 |---|---|
 | `test_encoding_e2e.py` | the child's stdio encoding under a legacy code page |
-| `test_mcp_e2e.py`, `test_mcp_no_config.py` | the MCP server as a stdio process; any `mcp` call spawns, since the server reads a real stdin descriptor |
+| `test_mcp_e2e.py`, `test_mcp_no_config.py`, `test_mcp_without_home_e2e.py` | the MCP server as a stdio process; any `mcp` call spawns, since the server reads a real stdin descriptor |
 | `test_claude_hook_e2e.py` | the hook as Claude Code starts it: stdin payload, start time, PYTHONPATH shims |
-| `test_inventory_e2e.py`, `test_hook_prefetch_e2e.py`, `test_init_doctor_e2e.py`, `test_init_scoped_tests_e2e.py`, `test_ratchet_stamp_e2e.py`, `test_advisory_gate_coherence_e2e.py` | PYTHONPATH set through `env_extra` |
+| `test_inventory_e2e.py`, `test_hook_prefetch_e2e.py`, `test_init_doctor_e2e.py`, `test_init_scoped_tests_e2e.py`, `test_ratchet_stamp_e2e.py`, `test_advisory_gate_coherence_e2e.py`, `test_absent_state_fixed_by_other_classes_e2e.py` | PYTHONPATH set through `env_extra` |
 | `test_claim_competition_e2e.py` | sessions racing for claims, three at once |
 | `test_cpp_family_admission_e2e.py`, `test_polyglot_admission_e2e.py` | repos big enough for the analysis pool, which forks its caller on Linux |
 | `test_verify_git_dedupe_e2e.py` | a counter patched onto `gitio` while `run_cli` builds the repo |
+| `test_latin1_locale_paths_e2e.py` | the locale the interpreter reads as it starts, and the `-X utf8` restart a Latin-1 one causes |
+| `test_outputs_hold_across_seed_and_tz.py` | PYTHONHASHSEED, PYTHONUTF8 and LANG, which the interpreter reads only as it starts |
+
+Two files start their processes without the runner.
+`test_verify_reads_stores_older_crapkits_wrote_e2e.py` runs older releases, taken from
+`git archive`, through PYTHONPATH, and `test_action_fork_point_without_results_e2e.py` runs
+the Action's step bodies under bash, whose steps start crapkit themselves.
 
 Every test-side wait on a child goes through `tests/hang_guard.py`, whose one bound,
 `HANG_SECONDS` (120), replaces a guess per call site: verify run 103 failed six tests on a
@@ -705,23 +844,16 @@ returns the moment its state appears, so the bound costs a passing test nothing,
 miss it kills the child and reports what the child printed. A child script written from a
 template spells `CHILD_WAIT` where it waits and `CHILD_HOLD` where it holds a lock until
 the test releases it. `run_cli` and `mcp_stdio.run` wait the bound unless a call names
-another. A product deadline under test keeps its own number, listed with its reason in
-`tests/unit/test_one_hang_bound.py`, which fails on any other wait bounded under the hang
-bound in any file under `tests/`.
+another. A hold outlasts the longest chain of waits a test starts after it.
+`tests/unit/test_one_hang_bound.py` refuses a wait bound spelled as a number, and
+`tests/unit/test_loaded_machine_waits.py` refuses a CLI, lane or mutation deadline under
+the bound unless a test is about it.
 
 A fixture that builds a measured repo builds it once per worker through
 `tests/e2e/repo_templates.py` and hands each test a copy. A test that asserts what a first
 run does gets a fresh build. A copy's lane artifacts still key files by the build's
 staging dir, which is gone, so a test that reads dark lines or reuses artifacts runs
 `coverage` in its copy first, or builds fresh.
-
-A test waits on a child through `tests/hang_guard.py`: one bound, `HANG_SECONDS`, that a
-passing wait never pays, and a miss that kills the child and fails with what it printed.
-A child script spells `CHILD_WAIT` for a state and `CHILD_HOLD` for a lock the test
-releases; a hold outlasts the longest chain of waits a test starts after it.
-`tests/unit/test_one_hang_bound.py` refuses a wait bound spelled as a number, and
-`tests/unit/test_loaded_machine_waits.py` refuses a CLI, lane or mutation deadline under
-the bound unless a test is about it.
 
 ## Where code goes
 
@@ -732,18 +864,33 @@ Shared rules belong to these modules:
 
 | Module | What it answers |
 |---|---|
-| `universe.py` | which scope owns a path. `owning_scope` is the only predicate, and the deepest declared `paths` entry wins |
-| `config.py` | what words a lane command holds. `shell_words` and `shell_segments` read it the way the shell that runs it reads it |
+| `universe.py` | which scope owns a path. `owning_scope` is the only predicate, and the deepest declared `paths` entry wins. `scan_files` judges an unreadable name: refused when a scope takes it, else listed in `Universe.unreadable` for the command to name once (`left_out_lines`) |
+| `languages.py` | which file types crapkit measures, as suffixes per language. It imports nothing, so `claude-hook` screens an edited file against it before reading any config |
 | `config_contract.py` | which configuration shapes, keys and enum values are valid. Runtime admission, doctor and the generated editor schema share this vocabulary |
 | `procs.py` | how an owned command starts, is waited on and is bounded. `run_owned` and `run_bounded` stop descendants before returning or releasing leases |
-| `_process_owner.py` | who holds registered command trees. `own_processes` yields the in-process or guardian owner; `prepare` names a command's registration before spawn and `register_then` takes it back unread |
+| `_process_owner.py` | who holds registered command trees. `own_processes` yields the in-process or guardian owner; `prepare` names a command's registration before spawn and `register_then` takes it back unread; the owner's stderr goes to the `owner.log` `_log_path` names; `helper_flags` starts crapkit's own helper interpreters (the owner, the POSIX start gate) in this process's UTF-8 mode, and a lane's command never gets it |
+| `_package.py` | whether the package on disk is still the one this process imported. `upgraded_to` names the version an upgrade left there; the MCP server and `watch` import it at start and ask before loading anything else |
 | `resources.py` | how cold analysis pools share a nonblocking worker budget; cached and small calls skip pool coordination |
+| `userhome.py` | where the user's home is. `user_home` reads the environment, then the profile folder Windows reports; every cache, lock or plugin path under the home starts from it |
 | `logs.py` | how active command output drains into bounded rotating logs without hiding progress |
 | `lanes.py` | which measurement outputs a command owns. `measurement_owner` holds resolved artifacts, logs and stamps through execution and parsing, with a helper process retaining locks until surviving commands stop |
-| `lane_command.py` | how a lane starts and how its command reads. `launch_spec` gives the cwd and merged env that the lane run, the flake retest and doctor's probes all start from; `pytest_python` names the python heading the pytest step, for the missing pytest-cov hint and doctor's probe alike |
+| `lane_command.py` | how a lane's command reads and how its child starts. `shell_words` and `shell_segments` read the line the way the shell that runs it reads it; `command_steps` also reads the script of a `bash -c` or `sh -c` step with sh's rules and marks one sh cannot split; `launch_spec` gives the cwd and merged env that the lane run, the flake retest and doctor's probes all start from; `pytest_python` names the python heading the pytest step, for the missing pytest-cov hint and doctor's probe alike; `child_environment` builds every lane, flake-retest and mutation child's environment; `expand_launchers` reads the launcher token (`{python}`, `{python:DIR}`) for this OS, and config calls it once as it builds the Lane |
+| `repopath.py` | which file git names by a path that did not come from git. One entry per source: `typed` and `typed_path` for a path a person or agent typed (arguments, `--repo`, writer flags, hook payloads), `declared` for one crapkit.toml holds, `Reported` for one a runner wrote, `fragment` for a piece to match; `inside` is the one placing rule for an absolute path |
+| `lane_results.py` | which run's record of a lane's test results a comparison reads. `read_results` parses a lane's record into `LaneResults`, where a lane with no junit this run has no count and no failure list (None), never 0 tests or no failures, and a list a verify older than 0.8.0 stored is not trusted; a comparison reads the run it compares against, else the newest run behind it that recorded one, else says it cannot compare. verify's baseline and coverage's `suite_drops` both walk it. No other module reads `failures`, `tests_total` or `tests_skipped` off a lane record, and `tests/unit/test_lane_results.py` fails on one that does |
+| `marks_history.py` | what the marks file held in the past: the history `ratchet report` and `brief` read mark ages off, followed back through every `git mv` of the marks file, and the newest committed marks verify judges a missing or emptied marks file against. A git read under it that fails raises `GitError`; none answers an empty history |
+| `agent_fields.py` | every field of every agent JSON payload (each `--json` command's, `next-item`'s, `brief --batch`'s, `--version --json` and the error object), declared once: its payload, key, JSON types (null among them only where it may be null) and meaning. `ADDED` names the fields a release adds. The MCP tools serve these declarations as their outputSchema, and `tests/unit/test_agent_fields.py` prints every payload and checks it, the MCP schemas and docs/agent-json.md against them. Add a field there first; JSON schema 1 never changes an existing field's meaning |
 | `ratchetfile.py` | which ratchet bytes a command admitted. Every writer publishes from that captured input under a short lock and refuses an intervening edit |
-| `gitpaths.py` | how Git path records become repository paths, preserving whitespace and Unicode separators |
-| `coupling_cache.py` | which files keep landing in the same commits. `coupling`, `brief` and `worklist --batches` all read this one door, and it caches the ranked pairs in `.crapkit/coupling-cache-v1.json` beside the churn caches |
+| `gitpaths.py` | how Git path records become repository paths, preserving whitespace and Unicode separators. A name that is not UTF-8 comes back in its surrogateescape spelling and `readable` tells it apart; each reader decides what it means, and nothing here prints |
+| `repotext.py` | how bytes crapkit did not write become text. One named kind per source: a file the repository owns (`repo_text`, refused by the byte), JSON (`repo_json`, and `JsonStream` for a coverage artifact read a chunk at a time), the marks file, git's free text and a runner's output (`lenient`), bytes handed back to git (`escaped`), a plugin's JSON as Claude Code reads it, source files and OS text. `tests/unit/test_decode_guard.py` fails on a decode policy spelled anywhere else |
+| `lane_sources.py` | the content record: the git blob id each file under a lane's scopes held when its artifact measured it. `record` is the one rule: git's index gives the id of a file git status calls unchanged, and `gitio.worktree_blobs` hashes the rest through the repo's filters with one `git hash-object --stdin-paths`, each name prefixed with the root's path below the checkout's top (`git rev-parse --show-prefix`), because git reads a `--stdin-paths` name from the top and not from the cwd. The stamp keeps it as `blobs` and every staleness reader compares it, so commit history never decides. The index fast path trusts git's stat cache, so a same-size edit under a restored modification time keeps the old id, a named limit. It holds on Windows, where the change time is the creation time, and under `core.trustctime=false`; on Linux and macOS git sees the edit once the change time moves a second past the one it recorded |
+| `lane_stamps.py` | what `.crapkit/artifacts.json` says, read once per command into explicit states (absent, unreadable, mangled, legacy, recorded). `read(root).refusal(artifact)` is the one refusal query: a reader that decides whether the artifact on disk may be scored asks it and nothing else, and quotes its `cause`. No other module parses the file. Writes replace the file in one step and copy each refusal into the snapshot store |
+| `lane_freshness.py` | whether a lane's measurement still describes the tree. `Freshness` reads the stamp file once per command and gives each lane one verdict: its line numbers, per file for a stamp with blob ids (`file_note`), and whether `--reuse-unchanged` may reuse it (`reuse`). The `--reuse-artifacts` warning, the dark-line note, the report banner and reuse render that verdict and decide nothing of their own. `proof_parts` is the one proof builder for both lane kinds |
+| `lane_outputs.py` | which declared files an attempt wrote. `owned` moves a lane's declared outputs under `.crapkit/aside/` before its attempts and puts a leftover back only where no attempt wrote one; its sha256 is what a refusal records. `put_back` returns what an attempt that never finished left there, and `lanes.measurement_owner` calls it once the lock is held |
+| `named.py` | how a message names a list of files or functions: `first_few` gives the first three in the caller's order and a count of the rest. The GitHub Action's comment builder (`tools/action/comment.py`) calls it too, for its verdict line and for the changed-files step's log line, and `tests/unit/test_named_lists.py` fails on a copy in src, tools or `action.yml` |
+| `sourcelines.py` | where a source's lines end: LF, CRLF and a lone CR, as the scores number them. Split source text with `source_lines`; `str.splitlines` also ends a line at a form feed and seven other characters. `line_starts` numbers a text by the reader's rule or by `LF_ONLY` and `ECMASCRIPT`, the rules git and the JavaScript coverage producers use |
+| `istanbul_lines.py` | which of the reader's lines an istanbul record's positions sit on. `on_reader_lines` runs on every record before attribution; a file with a lone CR, U+2028 or U+2029 is read and renumbered from the rule its producer used |
+| `diffparse.py` | which lines a diff changed, on the lines a function span or a coverage report numbers. git ends a line at LF only and the reader also ends one at a lone CR, so `worktree_ranges` (a diff against the working tree) and `reader_ranges` (any other new side, such as the staged blobs) place each range by the new side's bytes. `changed_ranges` alone answers in git's numbers, and `git_span` turns a function's span into git's numbers before it goes to git |
+| `coupling_cache.py` | which files keep landing in the same commits. `coupling`, `brief` and `worklist --batches` all read this one door, and it caches the ranked pairs in `.crapkit/coupling-cache-v2.json` beside the churn caches |
 
 `store.py` gained a `run_rollup` table: one row per run per scope, filled the first time
 something asks and pruned with its run. `trend` and `report` read it instead of
@@ -776,17 +923,25 @@ their owning modules; there is no second export registry to maintain.
 `claude_hook.py` carries two rules the other families do not, and both are load-bearing.
 Its module scope imports stdlib only, because every edit on the machine pays for it. And
 it never opens the snapshot store. Opening an older store can still migrate it, and
-a per-edit hook has no reason to read or change snapshot state.
+a per-edit hook has no reason to read or change snapshot state. The one thing it writes
+is its session memory under the git directory, so the working tree stays as the edit left
+it.
 
-Five reader modules sit beside the core, all registered in `analyze.py`'s
-`deferred_pygments()` block:
+Eleven reader modules sit beside the core. `analyze.py` imports each one, all but
+`lizardcognitive.py` inside its `deferred_pygments()` block:
 
 | Module | What it does |
 |---|---|
 | `lizardcognitive.py` | Sonar-spec cognitive complexity as a lizard token-stream extension, so every language pays the same rules with no second parse |
-| `lizardrust.py` | counts Rust `match` arms, which lizard does not (lizard #494) |
+| `lizardrust.py` | reads Rust where lizard's reader reads C: `match` arms (lizard #494), signatures, `\|\|` or `&&` with no operand, let-else, a `for` that is no loop, bodiless signatures, parameter commas and patterns, the nesting keyword set; it also ends a `//` comment at its line |
+| `lizardlinecomment.py` | ends a `//` comment at its line in lizard's Java, Swift and JavaScript-family readers, where lizard spliced the next line after a trailing backslash as only C does; Go, Zig and Rust take its `LINE_COMMENT` in their own tokenizers |
+| `lizardpython.py` | reads a Python def's signature to its body colon, where lizard ended some defs inside their signature (crapkit #72) |
+| `lizardgolike.py` | Go and Zig readers that end a signature where the language does, so a function type opens no function, a result type's braces are not the body, and a parameter's own type holds no parameters; `peek` sees each raw token before any counter (`analyze._ReaderLookahead`) |
+| `lizardclike.py` | C, C++ and Objective-C readers under lizard's own class names. They count every declared parameter, list the functions after a `<` comparison that lizard read as a template bracket, keep an attribute, a braced trailing return type or an instance-variable block from naming or inventing a function, list the members of a class defined inside a function, and respell the `&&` of a C++ reference so no counter reads it as a logical and |
+| `lizardjava.py` | a Java reader under lizard's own class name. It reads an annotation's arguments to their own `)`, keeps the token after a bare annotation, reads enum constant bodies, interface-field anonymous classes and annotation element defaults, counts every declared parameter, and names a method nested in a method once |
 | `lizardshell.py` | a shell reader, because lizard ships none and answers `.sh` with `CLikeReader` instead of an error |
 | `lizardpowershell.py` | a PowerShell reader, same reason, plus a cp1252 decode fallback |
+| `lizardswift.py` | reads a Swift name as a name: `super.init(...)`, `r.get()`, `Socket(protocol: p)`, `return type` and `#fileID` open no function and drop no brace, a failable `init?` is listed, a raw identifier (`` `a b` ``) is one name, and a closure after a comma keeps its brace |
 | `lizardtypescript.py` | separates JavaScript and TypeScript expression arrows at commas and preserves their source spans; refuses unresolved TypeScript angle syntax; blanks the template-literal characters lizard's tokenizer misreads, such as a nested template's backticks, before a JavaScript-family reader sees the file |
 
 Registration belongs at that module scope and nowhere else. A `ProcessPoolExecutor` child
@@ -802,20 +957,28 @@ not in the installed package.
 Six rules the suite cannot fully police. Break one and the failure surfaces somewhere
 else, usually later, usually as a plausible wrong number.
 
-- **Every function you add or edit sits at ccn 6 or below.** The pre-commit gate refuses
-  the rest; the section below says what a refusal means.
+- **Every function you add or edit sits at or under its scope's `target` in this repo's
+  own `crapkit.toml`: 6 for `src` and `tools`, 5 for `tools/accuracy`.** The pre-commit
+  gate refuses the rest; the section below says what a refusal means.
 - **Register a new command once, in the parser.** Import helpers directly from their
   owning family module. Keep `crapkit.cli.main` as the public process entry point.
 - **Change what a metric measures and bump `ANALYSIS_VERSION` in `analyze.py`.** The
   ratchet stamps every marks file with the version that produced it, and `verify` refuses
   to weigh fresh scores against marks another version signed. 0.4.5 bumped it to 8,
   because shell blocks now nest. Without the bump nothing refuses, and 40k marks are
-  quietly compared against numbers they never described.
-- **Read a lane command with `config.shell_words` or `config.shell_segments`, never
-  `str.split()`.** A whitespace split breaks a quoted interpreter path at its space and
-  reads `-k "not slow"` as three positionals. The full-suite guard, `doctor` and the
-  pytest-cov probe all go through those two, and they read the command the way the shell
-  that will run it reads it: sh on POSIX, cmd.exe on Windows.
+  quietly compared against numbers they never described. Then re-measure `GOLDEN_RECORDS`
+  in `tests/unit/test_analysis_cache_identity.py` on every Python the CI runs and set
+  `GOLDEN_ANALYSIS_VERSION` to the new version; a test fails until you do. Declare the
+  change too: `python tools/accuracy/change_control.py declare` appends the
+  `metric-digests.tsv` row for the new version, and the pre-push hook refuses the push
+  until it does.
+- **Read a lane command with `lane_command.command_steps`, `shell_words` or
+  `shell_segments`, never `str.split()`.** A whitespace split breaks a quoted interpreter
+  path at its space and reads `-k "not slow"` as three positionals. They read the command
+  the way the shell that will run it reads it, sh on POSIX and cmd.exe on Windows
+  (`config.SHELL_IS_CMD` says which), and `command_steps` then reads a `bash -c` or
+  `sh -c` payload with sh's rules. The full-suite guard, doctor's pytest-cov probe and
+  data-file check, and the lanes hint all read `command_steps`.
 - **Own commands that can time out or be cancelled through `procs.run_owned`.**
   `run_bounded` is the shell-command adapter. Windows Jobs and POSIX process groups
   cover descendants; guardians retain protected leases until cleanup finishes.
@@ -832,8 +995,9 @@ that fails on the parent commit. A bug fix lands with the test that reproduces i
 
 ## The cc <= 6 gate
 
-Every function you add or edit must sit at min-CCN 6 or below. The pre-commit hook runs
-`python -m crapkit hook-precommit` over the staged blobs:
+Every function you add or edit must sit at or under its scope's `target` in this repo's
+own `crapkit.toml`: 6 for `src` and `tools`, 5 for `tools/accuracy`. The pre-commit hook
+runs `python -m crapkit hook-precommit` over the staged blobs:
 
     crapkit gate: 1 staged function(s) exceed the complexity ceiling of 6:
       ccn   7  calc/report.py:39  tally( rows , low , high , invert , label , pad , strict )
@@ -842,14 +1006,14 @@ Every function you add or edit must sit at min-CCN 6 or below. The pre-commit ho
 Exit 6 blocks the commit. Decompose until every touched function passes. A refusal is
 design feedback, not a threshold to widen.
 
-A function the committed ratchet already carries a mark for is exempt, and the hook
+The hook pardons a function the committed ratchet already carries a mark for, and
 reports the count on stderr. Touching signed debt does not refuse the commit; `crapkit
 verify` is what fails a mark that rises.
 
-Two gates, two exemptions, and the difference is on purpose. The pre-commit hook exempts
+Two gates, two pardons, and the difference is on purpose. The pre-commit hook pardons
 a marked function whatever its fresh score, because it reads staged blobs and a staged
 blob has no coverage behind it: the hook cannot tell a mark that held from one that
-rose. `crapkit rescore --gate` and `crapkit verify` exempt only a touched function whose
+rose. `crapkit rescore --gate` and `crapkit verify` pardon only a touched function whose
 fresh CRAP sits at or under its mark. So an edit that pushes signed debt past its mark
 still commits, and verify then refuses it with exit 6. Exit 7 stays for a mark that rose
 in a function the diff never touched.
@@ -861,9 +1025,18 @@ snapshot record, all three or nothing). Leave it alone.
 
 - Marks only fall. `ratchet seed` admits new debt, `prune` drops gone code, `merge` is
   the git driver. None of them raises a mark.
-- No wall clock in scoring paths. Churn weights and burn-down ages anchor on the newest
-  commit in the log, so a fixed tree reports byte-identically.
+- No wall clock in scoring paths. The churn window ends at HEAD's commit date, and churn
+  weights and burn-down ages anchor on the newest commit in the log, so a fixed tree
+  reports byte-identically. `git log --since=N.months.ago` reads today's date: cut a
+  window with `--since=@<seconds> +0000` at a cutoff computed from a commit's date
+  (git 2.43 for Windows wraps a `--max-age` past 2038).
 - JSON is sorted-keys and carries no timestamps in rows.
+- The same bytes on every OS and Python. `tests/goldens/machine_outputs/` holds the 17
+  outputs a program reads (`tests/e2e/test_machine_outputs_match_on_every_os.py`), and
+  `tests/goldens/help_words.txt` the words of every help screen
+  (`tests/unit/test_suite_pins_colour_and_width.py`); every CI leg reads the same copies.
+  Rewrite them with `CRAPKIT_WRITE_GOLDENS=1` for a change every OS makes, and commit the
+  diff with it. A row that fails on one OS only is the bug the copies exist to catch.
 
 ## The docs are pinned to the code
 

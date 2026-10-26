@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import cli_runner
+from conftest import cli_runner, install_for_pytest_cov, repo_warns
 
 # PYTHONPATH shims reach only a new interpreter, so this file keeps the child.
 run_cli = cli_runner(spawn=True)
@@ -64,19 +64,25 @@ def _bare_git_repo(tmp_path: Path, name: str) -> Path:
     return repo
 
 
-def test_init_blames_untracked_source_instead_of_the_working_directory(tmp_path: Path):
+@pytest.mark.parametrize("names, named", [
+    (["app/m.py", "app/n.py"], "2 untracked source file(s) found: app/m.py, app/n.py"),
+    (["lib/e.ts", "app/b.py", "app/a.py", "lib/d.ts", "app/c.py"],
+     "5 untracked source file(s) found: app/a.py, app/b.py, app/c.py and 2 more"),
+], ids=["two", "five"])
+def test_init_blames_untracked_source_and_names_it(tmp_path: Path, names, named):
     """crapkit reads `git ls-files`, so source nobody added is source it cannot
-    see. Blaming the directory sends a first-time user to the wrong place."""
+    see. Blaming the directory sends a first-time user to the wrong place, and
+    a count alone leaves them to find the files git has not been told about."""
     repo = _bare_git_repo(tmp_path, "untracked")
-    (repo / "app").mkdir()
-    (repo / "app" / "m.py").write_text("def g(x):\n    return x or 0\n", encoding="utf-8")
-    (repo / "app" / "n.py").write_text("def h(x):\n    return x and 1\n", encoding="utf-8")
+    for name in names:
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (repo / name).write_text("def g(x):\n    return x or 0\n", encoding="utf-8")
 
     res = run_cli(repo, "init")
 
     assert res.returncode == 3
     assert "git-tracked" in res.stderr and "git add" in res.stderr
-    assert "2 untracked source file(s)" in res.stderr
+    assert f"({named})" in res.stderr
     assert "is this the repo root" not in res.stderr
 
 
@@ -131,7 +137,8 @@ def test_init_warns_when_the_lanes_python_lacks_pytest_cov(pytest_repo: Path, tm
     dependency on crapkit itself could never guarantee."""
     res = run_cli(pytest_repo, "init", env_extra=_without_pytest_cov(tmp_path))
     assert res.returncode == 0, res.stderr
-    assert "pytest_cov" in res.stderr and "pip install pytest-cov" in res.stderr
+    (note,) = [line for line in res.stderr.splitlines() if "pytest_cov" in line]
+    assert install_for_pytest_cov(note) in note, note
     assert '"crapkit[py]"' in res.stderr, (
         "the extra is the same-venv shortcut, and double quotes are the one form "
         "cmd.exe, PowerShell, bash and zsh all read the same way")
@@ -155,6 +162,9 @@ def test_init_does_not_probe_a_lane_it_did_not_write(tmp_path: Path):
 
 
 _DEAD_EXIT = 9009 if os.name == "nt" else 127
+# The name init's `{python}` token reads as on this OS, and so the word the
+# lane starts: `python` on Windows, `python3` elsewhere.
+_DEAD_WORD = "python" if os.name == "nt" else "python3"
 
 
 def _with_a_python_that_will_not_run(tmp_path: Path) -> dict:
@@ -167,7 +177,7 @@ def _with_a_python_that_will_not_run(tmp_path: Path) -> dict:
     if os.name == "nt":
         (shim_dir / "python.bat").write_text(f"@exit /b {_DEAD_EXIT}\n", encoding="utf-8")
     else:
-        shim = shim_dir / "python"
+        shim = shim_dir / _DEAD_WORD
         shim.write_text(f"#!/bin/sh\nexit {_DEAD_EXIT}\n", encoding="utf-8")
         shim.chmod(0o755)
     return {"PATH": os.pathsep.join([str(shim_dir), os.environ["PATH"]])}
@@ -183,7 +193,7 @@ def test_init_says_when_the_shell_cannot_run_the_lanes_interpreter(
 
     assert res.returncode == 0, res.stderr
     assert "cannot run it" in res.stderr and str(_DEAD_EXIT) in res.stderr
-    assert "`python`" in res.stderr, "the note has to name the word the lane starts with"
+    assert f"`{_DEAD_WORD}`" in res.stderr, "the note has to name the word the lane starts with"
     assert "pytest_cov" not in res.stderr, "nothing ran: pytest-cov is not the gap"
     assert (pytest_repo / "crapkit.toml").is_file(), "a note must not stop the scaffold"
 
@@ -200,7 +210,7 @@ def test_doctor_fails_a_lane_whose_first_word_will_not_run(
 
     assert res.returncode == 1, res.stdout
     assert "cannot run" in res.stdout and str(_DEAD_EXIT) in res.stdout
-    assert "'python'" in res.stdout, "name the word that has to change"
+    assert f"'{_DEAD_WORD}'" in res.stdout, "name the word that has to change"
     assert "no problems found" not in res.stdout
 
 
@@ -336,7 +346,7 @@ def test_init_on_a_vitest_repo_writes_a_lane_doctor_does_not_warn_about(vitest_r
 
     assert res.returncode == 0, res.stdout + res.stderr
     assert "results_artifact" not in res.stdout, res.stdout
-    assert [line for line in res.stdout.splitlines() if line.startswith("WARN")] == [
+    assert repo_warns(res.stdout) == [
         line for line in res.stdout.splitlines() if "scoped_tests" in line]
 
 
@@ -397,6 +407,59 @@ def test_doctor_flags_a_lane_whose_cwd_is_missing(bare_repo: Path):
     res = run_cli(bare_repo, "doctor")
     assert res.returncode == 1, res.stdout + res.stderr
     assert "nowhere" in res.stdout
+
+
+def _add_globs(repo: Path, *globs: str) -> None:
+    """Append globs to the [exclude] list init wrote, in TOML literal strings,
+    so a backslash reaches the loader as typed."""
+    path = repo / "crapkit.toml"
+    added = "".join(f"  '{glob}',\n" for glob in globs)
+    path.write_text(path.read_text(encoding="utf-8").replace("globs = [\n", f"globs = [\n{added}", 1),
+                    encoding="utf-8")
+
+
+def test_doctor_warns_on_an_exclude_glob_that_matches_no_tracked_file(bare_repo: Path):
+    """A typo in a glob excluded nothing, silently: the generated files stayed
+    scored and doctor printed `no problems found`. The glob is quoted as the
+    file holds it; a backslash glob that matches is read as git's spelling and
+    says nothing, and neither do init's own defaults."""
+    (bare_repo / "src" / "gen").mkdir()
+    (bare_repo / "src" / "gen" / "client.ts").write_text("export const c = 1;\n", encoding="utf-8")
+    _git_commit_all(bare_repo, "generated client")
+    assert run_cli(bare_repo, "init").returncode == 0
+    _add_globs(bare_repo, "src\\gen\\**", "src/gne/**", "pylib\\gen\\")
+
+    res = run_cli(bare_repo, "doctor")
+    report = json.loads(run_cli(bare_repo, "doctor", "--json").stdout)
+
+    assert res.returncode == 0, res.stdout + res.stderr
+    warned = _starting(res.stdout.splitlines(), "WARN [exclude] glob")
+    assert warned == [
+        "WARN [exclude] glob 'src/gne/**' matches no tracked file, so it excludes nothing; "
+        "fix the path or delete the glob",
+        "WARN [exclude] glob 'pylib\\\\gen\\\\' matches no tracked file (read as 'pylib/gen/**'), "
+        "so it excludes nothing; fix the path or delete the glob"], res.stdout
+    assert "doctor: no problems found" in res.stdout, "a WARN never fails doctor"
+    assert _starting(report["warnings"], "[exclude]") == [line[5:] for line in warned]
+
+
+def _starting(lines: list[str], prefix: str) -> list[str]:
+    return [line for line in lines if line.startswith(prefix)]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a Windows checkout cannot hold a name with \\")
+def test_doctor_names_a_tracked_file_whose_name_holds_a_backslash(bare_repo: Path):
+    """Legal on POSIX, and read as a directory separator by every file crapkit
+    reads a path out of, so the file cannot be measured."""
+    (bare_repo / "pylib" / "we\\ird.py").write_text("def w():\n    return 1\n", encoding="utf-8")
+    _git_commit_all(bare_repo, "a backslash name")
+    assert run_cli(bare_repo, "init").returncode == 0
+
+    res = run_cli(bare_repo, "doctor")
+
+    (line,) = [ln for ln in res.stdout.splitlines() if "hold \\ in their name" in ln]
+    assert line.startswith("WARN 1 tracked file(s) hold \\ in their name"), line
+    assert line.endswith(": pylib/we\\ird.py; rename each without the \\"), line
 
 
 def test_doctor_show_files_lists_scope_members(bare_repo: Path):
@@ -593,7 +656,7 @@ def test_without_a_lockfile_the_commented_template_keeps_the_bare_interpreter(
 
     text = (unmarked_locked_repo / "crapkit.toml").read_text(encoding="utf-8")
 
-    assert re.search(r'# command = "(python3?|py) -m pytest --cov', text), text
+    assert re.search(r'# command = "(\{python\}|python3?|py) -m pytest --cov', text), text
 
 
 # --- the virtualenv the repo carries ------------------------------------------
@@ -780,3 +843,167 @@ def test_init_writes_the_per_testpath_lanes_a_suite_that_cannot_collect_needs(tm
     assert '# name = "py-pylib"' in text
     assert text.count("# full_suite = false") == 2
     assert run_cli(repo, "doctor").returncode == 0, "the config init wrote still checks out"
+
+
+# --- files and settings init and doctor did not write -------------------------
+
+_PS1 = "function Get-A {\n  param($x)\n  if ($x) { 1 } else { 2 }\n}\n"
+_CONFIG = ('[crapkit]\ntarget = 6\n\n[[scope]]\nname = "src"\npaths = ["src"]\n'
+           'languages = ["powershell"]\ncoverage_optional = true\n')
+
+
+def _doctor_repo(tmp_path: Path, name: str, source: bytes) -> Path:
+    repo = _bare_git_repo(tmp_path, name)
+    (repo / "src").mkdir()
+    (repo / "src" / "a.ps1").write_bytes(source)
+    (repo / "src" / "b.ps1").write_bytes(_PS1.replace("Get-A", "Get-B").encode())
+    (repo / "crapkit.toml").write_text(_CONFIG, encoding="utf-8")
+    _git_commit_all(repo, "init")
+    return repo
+
+
+def _notes(stdout: str) -> list[str]:
+    return [line for line in stdout.splitlines() if line.startswith("note ")]
+
+
+SOURCES = [
+    # id, the bytes of src/a.ps1, how doctor's UTF-16 note names the mark (None: no note).
+    # Out-File writes the little-endian mark, never the big-endian one.
+    ("utf16-le", _PS1.encode("utf-16"), "the PowerShell 5.1 Out-File default"),
+    ("utf16-be", b"\xfe\xff" + _PS1.encode("utf-16-be"), "big-endian"),
+    ("utf8", _PS1.encode(), None),
+    ("utf8-bom", b"\xef\xbb\xbf" + _PS1.encode(), None),
+    ("cp1252", _PS1.replace("Get-A", "Get-Caf\xe9").encode("cp1252"), None),
+]
+
+
+@pytest.mark.parametrize("source, noted", [row[1:] for row in SOURCES], ids=[row[0] for row in SOURCES])
+def test_doctor_notes_a_utf16_source_and_keeps_its_exit_code(tmp_path: Path, source, noted):
+    """crapkit scores a UTF-16 source, and git diffs it as binary. doctor says
+    so once, as a note, which never moves the exit code."""
+    control = run_cli(_doctor_repo(tmp_path, "control", _PS1.encode()), "doctor")
+
+    res = run_cli(_doctor_repo(tmp_path, "subject", source), "doctor")
+
+    assert res.returncode == control.returncode == 0, res.stdout + res.stderr
+    utf16 = [note for note in _notes(res.stdout) if "UTF-16" in note]
+    assert utf16 == ([f"note 1 source file(s) open with a UTF-16 byte-order mark, {noted}: "
+                      "src/a.ps1. crapkit scores them, but git diffs them as binary; save them "
+                      "as UTF-8 (PowerShell: Set-Content -Encoding utf8) to diff them as text"]
+                     if noted else [])
+
+
+ENCODINGS = [
+    # id, i18n.commitEncoding, whether doctor notes it
+    ("unset", None, False),
+    ("utf-8", "UTF-8", False),
+    ("utf8-lower", "utf8", False),
+    ("iso-8859-1", "ISO-8859-1", True),
+    ("gbk", "gbk", True),
+]
+
+
+@pytest.mark.parametrize("value, noted", [row[1:] for row in ENCODINGS], ids=[row[0] for row in ENCODINGS])
+def test_doctor_notes_a_commit_encoding_that_is_not_utf8(tmp_path: Path, value, noted):
+    """Git for Windows passes a message and a name as UTF-8, and under
+    i18n.commitEncoding=ISO-8859-1 git stores those bytes labelled Latin-1,
+    so every reader that asks for UTF-8, crapkit included, gets José back as
+    JosÃ©."""
+    repo = _doctor_repo(tmp_path, "repo", _PS1.encode())
+    if value:
+        subprocess.run(["git", "config", "i18n.commitEncoding", value], cwd=repo, check=True)
+
+    res = run_cli(repo, "doctor")
+
+    assert res.returncode == 0, res.stdout + res.stderr
+    encoding = [note for note in _notes(res.stdout) if "i18n.commitEncoding" in note]
+    assert encoding == ([f"note i18n.commitEncoding is {value}: git labels each new commit "
+                         f"{value} and crapkit reads commits back as UTF-8, so a name or "
+                         "subject a client wrote in UTF-8 (Git for Windows does) comes out "
+                         f"garbled, its accented letters read as {value} characters, in "
+                         "churn and history; unset it (git config --unset "
+                         f"i18n.commitEncoding) unless this repo's clients write {value}"]
+                        if noted else [])
+
+
+INIT_FILES = [
+    # id, file, bytes, env, the exit code and the stderr line init must end with
+    ("utf16-package-json", "package.json", '{"name": "d"}\n'.encode("utf-16"), {}, 3,
+     "crapkit: init wrote no file: package.json is not UTF-8 (first bytes ff fe = UTF-16, "
+     "the PowerShell 5.1 Out-File default); save it as UTF-8"),
+    ("utf16-package-json-force-color", "package.json", '{"name": "d"}\n'.encode("utf-16"),
+     {"FORCE_COLOR": "1"}, 3,
+     "crapkit: init wrote no file: package.json is not UTF-8 (first bytes ff fe = UTF-16, "
+     "the PowerShell 5.1 Out-File default); save it as UTF-8"),
+    ("utf16-gitignore-force-color", ".gitignore", "build/\n".encode("utf-16"),
+     {"FORCE_COLOR": "1"}, 0,
+     "crapkit: left .gitignore as it was: it is UTF-16 (first bytes ff fe, the PowerShell 5.1 "
+     "Out-File default), which git cannot read; save it as UTF-8 and add .crapkit/"),
+    ("utf8-bom-gitignore-force-color", ".gitignore", b"\xef\xbb\xbfbuild/\n",
+     {"FORCE_COLOR": "1"}, 0, ""),
+    ("utf8-gitignore", ".gitignore", b"build/\n", {}, 0, ""),
+]
+
+
+@pytest.mark.parametrize("name, body, env, code, last", [row[1:] for row in INIT_FILES],
+                         ids=[row[0] for row in INIT_FILES])
+def test_init_ends_in_a_sentence_never_a_traceback(tmp_path: Path, name, body, env, code, last):
+    """A UTF-16 .gitignore or package.json ended init in a traceback at exit 1,
+    which Python 3.13 and later colour under FORCE_COLOR, and the .gitignore
+    one came after crapkit.toml was written. Spawned, so the interpreter reads
+    FORCE_COLOR as it starts."""
+    repo = _bare_git_repo(tmp_path, "repo")
+    (repo / "src").mkdir()
+    (repo / "src" / "app.ts").write_text("export function f(a: number) { return a ? 1 : 2; }\n",
+                                         encoding="utf-8")
+    (repo / name).write_bytes(body)
+    _git_commit_all(repo, "init")
+
+    res = run_cli(repo, "init", env_extra=env)
+
+    assert res.returncode == code, res.stderr
+    assert "Traceback" not in res.stderr and "\x1b[" not in res.stderr, res.stderr
+    assert (res.stderr.splitlines() or [""])[-1] == last
+    assert (repo / "crapkit.toml").is_file() is (code == 0)
+
+
+# init on a package.json whose fields are null: npm reads such a file, and init
+# ended in a TypeError before it wrote crapkit.toml.
+
+_NULL_FIELDS = {
+    "scripts-null": ({"package.json": {"scripts": None, "devDependencies": {"vitest": "^2"}}},
+                     "npx vitest run --coverage ", ""),
+    "devDependencies-null": ({"package.json": {"scripts": {"test": "vitest run"},
+                                               "devDependencies": None}},
+                             "npm run test -- --coverage", ""),
+    "workspace-devDependencies-null": (
+        {"package.json": {"scripts": {"test": "npm run --workspaces test"}},
+         "web/package.json": {"devDependencies": None}},
+        "npm run test -- --coverage", ""),
+    # Not a null: the control that a UTF-8 file with non-ASCII text reads as it did.
+    "utf8-non-ascii-description": ({"package.json": {"description": "café 世界",
+                                                     "scripts": {"test": "vitest run"}}},
+                                   "npm run test -- --coverage", ""),
+}
+
+
+@pytest.mark.parametrize("shape", list(_NULL_FIELDS))
+def test_init_reads_a_package_json_whose_fields_are_null(tmp_path: Path, shape: str):
+    from crapkit.config import load_config_text
+
+    files, command, cwd = _NULL_FIELDS[shape]
+    repo = _bare_git_repo(tmp_path, "nulls")
+    (repo / "src").mkdir()
+    (repo / "src" / "app.ts").write_text("export function f(a: number) { return a ? 1 : 2; }\n",
+                                         encoding="utf-8")
+    for name, payload in files.items():
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (repo / name).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    _git_commit_all(repo, "init")
+
+    res = run_cli(repo, "init")
+
+    assert res.returncode == 0, res.stdout + res.stderr
+    (lane,) = load_config_text((repo / "crapkit.toml").read_text(encoding="utf-8")).lanes
+    assert lane.command.startswith(command), lane.command
+    assert lane.cwd == cwd

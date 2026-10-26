@@ -12,8 +12,9 @@ from crapkit.coupling import change_coupling_lines
 from crapkit.diffparse import changed_ranges
 from crapkit.errors import GitError
 from crapkit.mutate import file_mutants
-from crapkit.mutate_pool import drop_pool, run_mutants
+from crapkit.mutate_pool import MutantVerdict, drop_pool, run_mutants
 from hang_guard import HANG_SECONDS
+from name_bytes import NOT_UTF8_NAMES
 
 
 def git(root, *args):
@@ -65,6 +66,63 @@ def test_dirty_history_and_diff_keys_equal_tracked_paths(repository, name, neste
     assert gitio.renamed_paths(root, before_rename) == {name: moved}
 
 
+@pytest.mark.parametrize("name", NAMES)
+@pytest.mark.parametrize("nested", [False, True])
+def test_the_index_blob_reader_keys_each_name_as_the_mode_reader_does(repository, name, nested):
+    """A lane's stamp keys each file's blob id by the path index_blobs splits
+    out of an `ls-files -s -z` record, and the hook check reads index_modes from
+    the same records: a name holding a tab, a line break or a leading space
+    keeps one spelling in both, and its id is the one `git add` gave the bytes."""
+    root = repository / "app" if nested else repository
+    root.mkdir(exist_ok=True)
+    (root / name).write_text("def f():\n    return 1\n", encoding="utf-8")
+    git(repository, "add", ".")
+
+    blobs = gitio.index_blobs(root)
+
+    assert set(blobs) == set(gitio.index_modes(root, ".")) == {name}
+    assert blobs == gitio.worktree_blobs(root, [name])
+
+
+@pytest.mark.skipif(os.name == "nt", reason="needs a file name that is not UTF-8, which only a "
+                    "POSIX filesystem holds; runs on the ubuntu CI jobs")
+@pytest.mark.parametrize("nested", [False, True])
+@NOT_UTF8_NAMES
+def test_a_name_that_is_not_utf8_is_hashed_by_its_own_bytes(repository, nested):
+    """A name that is not UTF-8 reaches the content record in its surrogateescape
+    spelling once git's records decode that way. The hash-object request encoded
+    each name as strict UTF-8 and raised UnicodeEncodeError, a crash where a
+    lane read should have answered; the request now carries the name's own bytes."""
+    root = repository / "app" if nested else repository
+    root.mkdir(exist_ok=True)
+    name = os.fsdecode(b"caf\xe9.py")
+    (root / name).write_bytes(b"x = 1\n")
+
+    wanted = git(root, "hash-object", "--", name).decode("ascii").strip()
+
+    assert gitio.worktree_blobs(root, [name]) == {name: wanted}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="needs a file name holding a double quote, which only a "
+                    "POSIX filesystem holds; runs on the ubuntu CI jobs")
+@pytest.mark.parametrize("name", ['"a".ts', '"d', '"'])
+@pytest.mark.parametrize("nested", [False, True])
+def test_a_name_that_starts_with_a_double_quote_is_hashed_by_its_own_name(repository, name, nested):
+    """hash-object --stdin-paths C-unquotes a line that starts with a double
+    quote. At the checkout top `"a".ts` went out as that line and came back as
+    the blob of the file `a`, so an edit to `"a".ts` left its stamp fresh; `"d`
+    made git fail with "line is badly quoted" and every lane read "git cannot
+    say". Such a name is hashed as a file argument, which git reads as written."""
+    root = repository / "app" if nested else repository
+    root.mkdir(exist_ok=True)
+    (root / "a").write_bytes(b"unrelated\n")
+    (root / name).write_bytes(b"x = 1\n")
+
+    wanted = {path: git(root, "hash-object", "--", path).decode("ascii").strip() for path in (name, "a")}
+
+    assert gitio.worktree_blobs(root, [name, "a"]) == wanted
+
+
 @pytest.mark.parametrize("workers", [1, 2])
 def test_mutation_workers_receive_dirty_leading_space_dependency(repository, workers):
     source = "def enabled():\n    return True\n"
@@ -81,7 +139,8 @@ def test_mutation_workers_receive_dirty_leading_space_dependency(repository, wor
     cfg = SimpleNamespace(mutation_workers=workers, mutation_timeout_seconds=HANG_SECONDS,
                           mutation_command=f'"{sys.executable}" runner.py')
     try:
-        assert run_mutants(repository, cfg, [mutant, mutant], lambda *args: None) == [True, True]
+        assert run_mutants(repository, cfg, [mutant, mutant],
+                           lambda *args: None) == [MutantVerdict.KILLED] * 2
     finally:
         drop_pool(repository)
 
@@ -92,6 +151,13 @@ def test_path_reads_report_a_missing_git_executable(tmp_path, monkeypatch):
         gitio.ls_files(tmp_path)
 
 
-def test_path_reads_preserve_git_command_errors(tmp_path):
-    with pytest.raises(GitError, match="git ls-files.*failed"):
-        gitio.ls_files(tmp_path)
+def test_path_reads_preserve_git_command_errors(repository):
+    """A read that fails in a repository git can use keeps its command and git's
+    reason; outside one the refusal names the missing repository instead
+    (test_gitio_repository_state.py)."""
+    (repository / "a.py").write_text("x = 1\n", encoding="utf-8")
+    git(repository, "add", "-A")
+    git(repository, "commit", "-q", "-m", "a")
+
+    with pytest.raises(GitError, match=r"git ls-files -s -z -- \.\./outside failed.*outside repository"):
+        gitio.index_modes(repository, "../outside")

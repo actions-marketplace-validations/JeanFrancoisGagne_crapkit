@@ -16,11 +16,13 @@ comparable, and without the stamp that reads as a clean run.
 from __future__ import annotations
 
 import math
+import re
 from typing import NamedTuple
 
+from .invariants import check_dump, check_marks_kept
 from .invocation import _self
 from .keys import split_ordinal
-from .score import ScoredRow
+from .score import ScoredRow, over_ceiling
 from .records import decode_record, encode_record, record_lines
 
 _HEADER = "path\tlong_name\tcrap"
@@ -171,22 +173,66 @@ def stamp_conflict(recorded: str, current: str) -> str | None:
     """The refusal when marks and the running metric disagree; None when they compare.
 
     An unstamped file has nothing to disagree with — the caller warns instead.
+    Marks a newer crapkit or lizard wrote are sent to an upgrade: the stock
+    coverage-then-seed would restamp them under this older metric, and every
+    teammate on the newer release would then be refused.
     """
     if not recorded or recorded == current:
         return None
-    return (f"ratchet marks were recorded under [{recorded}] but this run measures "
-            f"[{current}] — CRAP scores are not comparable across metric versions; "
+    head = f"ratchet marks were recorded under [{recorded}] but this run measures [{current}]"
+    newer = newer_tools(recorded, current)
+    if newer:
+        return (f"{head} - {upgrade_remedy(newer)} rather than re-seed, which would restamp the "
+                "team's marks backwards and make every upgraded teammate's verify refuse them")
+    return (f"{head} - CRAP scores are not comparable across metric versions; "
             f"{coverage_then_seed()}")
 
 
+def upgrade_remedy(tools: list[str]) -> str:
+    """What to do about marks a newer install measured: upgrade this one. Every
+    caller says what its own write would have done to them instead."""
+    where = (" (the CLI, the Action's `uses:` pin and the pre-commit `rev` alike)"
+             if "crapkit" in tools else "")
+    return (f"the marks come from a newer {' and a newer '.join(tools)} than this install; "
+            f"upgrade {'both' if len(tools) > 1 else 'it'} to the version that wrote them{where}")
+
+
+# The stamp's fields, and the tool each one is the version of.
+_STAMP_TOOLS = (("crapkit-analysis", "crapkit"), ("lizard", "lizard"))
+
+
+def newer_tools(recorded: str, current: str) -> list[str]:
+    """The tools `recorded` names at a newer version than `current` does: `crapkit`
+    for the analysis version, `lizard` for lizard's. [] when neither is newer, or
+    when a stamp does not read as `crapkit-analysis=N lizard=X.Y.Z`."""
+    then, now = _stamp_versions(recorded), _stamp_versions(current)
+    return [tool for field, tool in _STAMP_TOOLS if _is_newer(then.get(field), now.get(field))]
+
+
+def _is_newer(then: tuple | None, now: tuple | None) -> bool:
+    return bool(then and now) and then > now
+
+
+def _stamp_versions(stamp: str) -> dict[str, tuple[int, ...]]:
+    """`crapkit-analysis=11 lizard=1.24.0` as {field: (11,), ...}: numbers compare
+    as numbers, so lizard 1.9.0 is older than 1.24.0. A word with no `=` is left out."""
+    fields = (word.partition("=") for word in stamp.split())
+    return {name: tuple(int(n) for n in re.findall(r"\d+", value))
+            for name, sep, value in fields if sep}
+
+
 def coverage_then_seed(rebaseline: str = "re-baseline") -> str:
-    """The remedy every stamp refusal prints: a fresh run, then the seed.
+    """The remedy every stamp refusal prints: a fresh run, a prune, then the seed.
 
     Seed stamps the metric of the run it reads. Right after an upgrade the
     newest run is the older crapkit's, so seed alone kept the old stamp and
-    verify refused again.
+    verify refused again. A new metric can also move a function's key (a
+    UTF-16 source, a name holding a byte cp1252 leaves undefined), and seed
+    never drops a mark, so prune goes between them to drop the mark left under
+    the old key, as the upgrade guide says.
     """
-    return f"run `{_self()} coverage`, then {rebaseline} with `{_self()} ratchet seed`"
+    return (f"run `{_self()} coverage`, then `{_self()} ratchet prune`, then {rebaseline} "
+            f"with `{_self()} ratchet seed`")
 
 
 def comment_line(line: str) -> bool:
@@ -205,10 +251,13 @@ def _is_skippable(line: str) -> bool:
 
 
 def _finite_mark(text: str) -> float:
+    """The mark as the file holds it, at four decimals: a hand-typed mark with more
+    reads as the number the next write gives it (a tie rounds as round() rounds
+    the double), so every mark in memory is one `dump_ratchet` writes unchanged."""
     mark = float(text)
     if not math.isfinite(mark):
         raise ValueError("ratchet mark must be finite")
-    return mark
+    return float(f"{mark:.4f}")
 
 
 def _read_mark(line: str, number: int) -> RatchetEntry:
@@ -274,7 +323,9 @@ def mark_for(entries: list[RatchetEntry], path: str, long_name: str) -> float | 
 def dump_ratchet(entries: list[RatchetEntry], *, stamp: str, key_version: int = 0) -> str:
     """`stamp` is written verbatim, and "" writes none. No default: a writer that
     stamped by omission relabeled marks another metric recorded, so the choice
-    belongs to `ratchetfile.RatchetFile`'s stamp rules."""
+    belongs to `ratchetfile.RatchetFile`'s stamp rules. Every mark must read back
+    as the number it is (`invariants.check_dump`): the file holds four decimals."""
+    check_dump(entries)
     lines = [f"# {stamp}"] if stamp else []
     if key_version:
         lines.append(f"{_KEY_STAMP}{key_version}")
@@ -320,12 +371,14 @@ def seed_ratchet(prior: list[RatchetEntry], fresh: list[ScoredRow], *, target: i
     marks = {(e.path, e.long_name): e for e in prior}
     added = tightened = 0
     for key, row in rows_by_key(fresh).items():
-        if row.crap <= ceilings.get(row.scope, target):
+        if not over_ceiling(row.crap, ceilings.get(row.scope, target)):
             continue
         a, t = _seed_mark(marks, key, row.crap)
         added += a
         tightened += t
-    return sorted(marks.values(), key=lambda e: (e.path, e.long_name)), added, tightened
+    seeded = sorted(marks.values(), key=lambda e: (e.path, e.long_name))
+    check_marks_kept(prior, seeded, adds=True)
+    return seeded, added, tightened
 
 
 def _seed_mark(marks: dict, key: tuple, crap: float) -> tuple[int, int]:
@@ -443,26 +496,39 @@ def update_ratchet(prior: list[RatchetEntry], fresh: list[ScoredRow], *, target:
                    hold: frozenset[tuple[str, str]] = frozenset()) -> list[RatchetEntry]:
     """`hold` names keys whose mark this run may not move — `unstable_marks`
     picks them. A held mark keeps its recorded value, drop included: leaving the
-    file is the deepest tighten there is."""
+    file is the deepest tighten there is. No mark rises and none is added
+    (`invariants.check_marks_kept`)."""
     from .verify import rows_by_key
 
     fresh_by_key = rows_by_key(fresh)
+    ceilings = scope_targets or {}
     updated = []
     for entry in prior:
-        row = fresh_by_key.get((entry.path, entry.long_name))
-        if row is None or (entry.path, entry.long_name) in hold:
-            # Two ways a mark passes through untouched. Absent from the scored
-            # rows is NOT proof the code is gone — an exclude glob or a lane
-            # outage also removes it, and dropping the entry would erase an
-            # audited override's only diff-visible record; stale entries are
-            # inert (verify checks only present functions). Held is a
-            # measurement this run cannot vouch for.
-            updated.append(entry)
-            continue
-        if row.crap <= (scope_targets or {}).get(row.scope, target):
-            continue  # fixed for real: below the scope's ceiling needs no mark
-        updated.append(RatchetEntry(entry.path, entry.long_name, min(entry.crap, round(row.crap, 4))))
-    return sorted(updated, key=lambda e: (e.path, e.long_name))
+        key = (entry.path, entry.long_name)
+        kept = _updated_mark(entry, fresh_by_key.get(key), key in hold,
+                             lambda scope: ceilings.get(scope, target))
+        if kept is not None:
+            updated.append(kept)
+    updated.sort(key=lambda e: (e.path, e.long_name))
+    check_marks_kept(prior, updated, adds=False)
+    return updated
+
+
+def _updated_mark(entry: RatchetEntry, row: ScoredRow | None, held: bool,
+                  ceiling_of) -> RatchetEntry | None:
+    """One mark after the update, or None when the function now sits at or
+    under its scope's ceiling and needs no mark."""
+    if row is None or held:
+        # Two ways a mark passes through untouched. Absent from the scored
+        # rows is NOT proof the code is gone — an exclude glob or a lane
+        # outage also removes it, and dropping the entry would erase an
+        # audited override's only diff-visible record; stale entries are
+        # inert (verify checks only present functions). Held is a
+        # measurement this run cannot vouch for.
+        return entry
+    if not over_ceiling(row.crap, ceiling_of(row.scope)):
+        return None  # fixed for real: below the scope's ceiling needs no mark
+    return RatchetEntry(entry.path, entry.long_name, min(entry.crap, round(row.crap, 4)))
 
 
 class RatchetDelta(NamedTuple):

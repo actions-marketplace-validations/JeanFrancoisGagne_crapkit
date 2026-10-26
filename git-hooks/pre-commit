@@ -1,12 +1,41 @@
 #!/bin/sh
 # crapkit gates its own development: hard cc <= 6 on any staged function.
 # CRAPKIT_OVERRIDE_REASON grants only through the full three-record audit.
-if python -c "import crapkit" 2>/dev/null; then
-    if ! python -m crapkit hook-precommit; then
-        echo "crapkit: commit blocked by the complexity gate."
-        exit 1
-    fi
-else
+#
+# The committing tree's own src/crapkit judges the commit, never the crapkit the
+# python on PATH has installed (a release wheel, or an editable install of
+# another checkout): a linked worktree runs its own gate, and a change to the
+# gate gates its own commit. The gate runs the working tree's src, unstaged
+# edits included, and judges the staged blobs.
+#
+# The first probe checks that this python has crapkit's dependency lizard. The
+# second puts the tree's src first on sys.path, imports crapkit from there, and
+# prints the separator this python reads PYTHONPATH with (";" on Windows, ":"
+# elsewhere). Its traceback stays on screen: pip install cannot fix a tree whose
+# own crapkit does not import.
+#
+# The gate refuses a commit with exit 6. Any other failure (a traceback from a
+# module the probe never imported, a missing analysis tool, a bad config) stops
+# it before a verdict: the commit is refused all the same, and the hook says the
+# gate stopped, not that it blocked the commit.
+src="$(git rev-parse --show-toplevel)/src" || exit 1
+if ! python -c "import lizard" 2>/dev/null; then
     echo "crapkit: NOT INSTALLED - the complexity gate cannot run; install with 'pip install -e .'" >&2
+    exit 1
+fi
+if ! sep=$(python -c "import os, sys; sys.path.insert(0, sys.argv[1]); import crapkit; print(os.pathsep)" "$src"); then
+    echo "crapkit: $src/crapkit does not import, so the complexity gate cannot run; fix the error above" >&2
+    exit 1
+fi
+PYTHONPATH="$src${PYTHONPATH:+$sep$PYTHONPATH}"
+export PYTHONPATH
+python -m crapkit hook-precommit
+code=$?
+if [ "$code" -eq 6 ]; then
+    echo "crapkit: commit blocked by the complexity gate."
+    exit 1
+fi
+if [ "$code" -ne 0 ]; then
+    echo "crapkit: the complexity gate stopped with exit $code before it judged the commit, so the commit is refused; the lines above say why" >&2
     exit 1
 fi

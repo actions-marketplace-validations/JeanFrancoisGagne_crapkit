@@ -214,6 +214,20 @@ def test_a_run_behind_head_is_its_own_stale_banner():
     assert "HEAD has moved on" in page
 
 
+@pytest.mark.parametrize("count,loud", [(None, False), (0, False), (2, True)],
+                         ids=["unrecorded", "unchanged", "changed"])
+def test_files_the_run_scored_that_changed_since_are_their_own_stale_banner(count, loud):
+    """An uncommitted edit leaves `stale` false and, in a coverage_optional
+    scope, every lane note empty, while the page shows the pre-edit numbers."""
+    data = payload()
+    data["worklist"]["scored_changes"] = count
+
+    page = render_report(data)
+
+    assert ('2 file(s) the run scored changed since' in page) is loud
+    assert ('class="banner stale"' in page) is loud
+
+
 # --- the row ceiling ---------------------------------------------------------
 
 def test_report_top_takes_the_configured_worklist_top():
@@ -276,6 +290,14 @@ def test_the_page_no_longer_claims_the_score_is_absent():
     assert "not on this page" not in page
 
 
+def test_the_footer_says_the_churn_window_ends_at_head_s_commit_date():
+    """README "Risk": the window counts back from HEAD's commit date, so a page
+    rendered a year after the last commit still ranks that year's churn."""
+    footer = re.search(r"<footer>(.*?)</footer>", rendered(), re.S).group(1)
+
+    assert "over the 12 months before HEAD's commit date" in footer
+
+
 def test_a_row_no_run_scored_leaves_the_score_cells_empty():
     """An inventory-only run scored nothing: null, rendered as nothing rather
     than as a number the page invented."""
@@ -285,3 +307,18 @@ def test_a_row_no_run_scored_leaves_the_score_cells_empty():
     first = _rows(render_report(data))[0]
 
     assert "None" not in first
+
+
+@pytest.mark.parametrize("function, path, shown", [
+    ("gräde_世( n )", "pkg/mod.py", "gräde_世( n )"),
+    ("grade( n )", "pkg/a&b'c.py", "pkg/a&amp;b&#x27;c.py"),
+], ids=["a-non-ascii-name", "a-path-with-an-ampersand-and-a-quote"])
+def test_a_name_or_path_reaches_the_page_as_text_the_browser_shows_as_written(function, path, shown):
+    data = payload()
+    data["worklist"]["active"][0].update(function=function, path=path)
+
+    page = render_report(data)
+
+    assert shown in page
+    assert page.encode("utf-8").decode("utf-8") == page
+    assert '<meta charset="utf-8">' in page

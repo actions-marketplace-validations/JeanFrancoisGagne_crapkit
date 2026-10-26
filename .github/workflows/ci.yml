@@ -3,6 +3,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The Windows legs on Python 3.12 and 3.13 and the macOS leg on 3.11, which
+  # no push runs (see `test`).
+  schedule:
+    - cron: "41 4 * * *"
 
 # A newer push to a pull request cancels the run it replaces: three pushes in
 # four minutes used to keep three full sets of jobs busy. A push to main takes a
@@ -13,11 +17,17 @@ concurrency:
 
 jobs:
   test:
+    # Required checks match a leg by name, so the cadence stays out of it.
+    name: test (${{ matrix.os }}, ${{ matrix.python }}, ${{ matrix.suite }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        python: ["3.11", "3.12", "3.13"]
+        # A push or pull request runs the push legs, the nightly schedule the rest.
+        cadence: ${{ fromJSON(github.event_name == 'schedule' && '["nightly"]' || '["push"]') }}
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        # Every version pyproject's classifiers name. 3.14 is where argparse
+        # colours help, so its legs are the ones that run the colour tests.
+        python: ["3.11", "3.12", "3.13", "3.14"]
         # Windows runs the unit and e2e sessions four to five times slower than
         # Ubuntu, so each Windows session is a job of its own and the two run
         # side by side. Ubuntu keeps both sessions in one job.
@@ -32,14 +42,73 @@ jobs:
             suite: e2e
           - os: windows-latest
             suite: unit e2e
+          # Windows on 3.12 and 3.13 showed no failure of its own in 3 weeks
+          # (gate audit 2026-10-01) and cost 91.7 machine-min per push. 3.11
+          # and 3.14, the ends of the classified range, stay on every push;
+          # the middle two run nightly.
+          - cadence: push
+            os: windows-latest
+            python: "3.12"
+          - cadence: push
+            os: windows-latest
+            python: "3.13"
+          - cadence: nightly
+            os: ubuntu-latest
+          - cadence: nightly
+            os: windows-latest
+            python: "3.11"
+          - cadence: nightly
+            os: windows-latest
+            python: "3.14"
+          # macOS is here for the letter-case rows: APFS opens SRC/a.py for a
+          # tracked src/a.py under POSIX path rules, a pairing no other job
+          # has. The rows read paths, not the interpreter, so one job holding
+          # both suites runs them all: 3.13 on every push. The nightly runs
+          # macOS on 3.11, which has no os.waitid there (3.13 added it): 0.8.0
+          # crashed every lane on such a Python, and no leg ran one. A Python
+          # added above needs its own macOS exclude here.
+          - cadence: push
+            os: macos-latest
+            python: "3.11"
+          - cadence: nightly
+            os: macos-latest
+            python: "3.13"
+          - os: macos-latest
+            python: "3.12"
+          - os: macos-latest
+            python: "3.14"
+          - os: macos-latest
+            suite: unit
+          - os: macos-latest
+            suite: e2e
     runs-on: ${{ matrix.os }}
+    # Twice the slowest leg measured on 2026-10-01: Windows unit 27.5 min, macOS 16.7, Ubuntu 8.7.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 55 || matrix.os == 'macos-latest' && 40 || 25 }}
+    # The Latin-1 locale rows build en_US.ISO-8859-1 and fr_FR.UTF-8 with
+    # localedef into a temp directory. Where a host cannot, they skip; here a
+    # skip would leave every Linux Latin-1 row unguarded, so they fail instead.
+    # Windows and macOS skip those rows by platform before they look.
+    env:
+      CRAPKIT_REQUIRE_LOCALES: "1"
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: git starts no maintenance writer while tests copy repositories
+        shell: bash
+        run: |
+          # git 2.47+ detaches `git maintenance run --auto` after a commit, and the
+          # writer holds .git/objects/maintenance.lock while a test copies the repo.
+          # System config, because a test may swap HOME or drop the GIT_* variables.
+          as_admin=""; [ "$RUNNER_OS" = Windows ] || as_admin=sudo
+          $as_admin git config --system maintenance.auto false
+          $as_admin git config --system gc.auto 0
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - name: the locale sources localedef reads are there
+        if: runner.os == 'Linux'
+        run: test -f /usr/share/i18n/charmaps/ISO-8859-1.gz || { sudo apt-get update -q && sudo apt-get install -y -q locales; }
       # The dev extra is the whole install: the suite's fixture lanes shell out
       # to pytest with plugin flags, so anything they spell has to arrive here.
       # Quoted because zsh globs the bare `.[dev]` and pip never sees the extra.
@@ -52,7 +121,29 @@ jobs:
       # all four with no test failure, so this line is the test.
       - name: the console script resolves
         run: crapkit --version
+      # The Action's comment lookup is a jq filter that gh runs in its own gojq.
+      # test_the_lookup_filter_holds_under_every_jq_engine also holds it to
+      # jq 1.6 and a standalone gojq, beside the runner's jq 1.7.1, and skips
+      # an engine that is not on PATH; these two put both on it here.
+      - name: jq 1.6 and gojq for the lookup filter's engine test
+        if: runner.os == 'Linux'
+        run: |
+          engines="$RUNNER_TEMP/jq-engines"
+          mkdir -p "$engines"
+          curl -fsSL -o "$engines/jq-1.6" https://github.com/jqlang/jq/releases/download/jq-1.6/jq-linux64
+          curl -fsSL -o "$engines/gojq.tar.gz" https://github.com/itchyny/gojq/releases/download/v0.12.17/gojq_v0.12.17_linux_amd64.tar.gz
+          (cd "$engines" && sha256sum -c - <<'SUMS'
+          af986793a515d500ab2d35f8d2aecd656e764504b789b66d7e1a0b727a124c44  jq-1.6
+          cd876631b9b3368dd98ad1ccb361474387de03e0925ea26d73539dd054aa39cb  gojq.tar.gz
+          SUMS
+          )
+          tar -xzf "$engines/gojq.tar.gz" -C "$engines" --strip-components=1 gojq_v0.12.17_linux_amd64/gojq
+          chmod +x "$engines/jq-1.6" "$engines/gojq"
+          echo "$engines" >> "$GITHUB_PATH"
       - run: python tools/testing/run.py --suite ${{ matrix.suite }}
+
+  # On the nightly schedule only the test legs run: a schedule has no event
+  # base for the verdict or dogfood, and nothing pushed to judge.
 
   # The verdict compares installed base and candidate wheels. Each side builds,
   # installs and measures its own wheel in a job of its own, the two side by
@@ -60,7 +151,9 @@ jobs:
   # failing suite still hands off; the join decides what it means. A measurement
   # that stops hands off failure.json instead, with the phase and the error.
   verdict-measure:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 40  # the candidate measured 19.7 min on 2026-10-01
     permissions:
       contents: read
     strategy:
@@ -71,15 +164,62 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: git starts no maintenance writer while tests copy repositories
+        shell: bash
+        run: |
+          # git 2.47+ detaches `git maintenance run --auto` after a commit, and the
+          # writer holds .git/objects/maintenance.lock while a test copies the repo.
+          # System config, because a test may swap HOME or drop the GIT_* variables.
+          as_admin=""; [ "$RUNNER_OS" = Windows ] || as_admin=sudo
+          $as_admin git config --system maintenance.auto false
+          $as_admin git config --system gc.auto 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: python -m pip install build
-      - name: measure one installed wheel
+      # A push's base is the commit the previous push measured as its candidate,
+      # so the base job measured that tree again: 16.4 machine-min per push. A
+      # measurement is kept under its inputs: the side's git tree id (every
+      # tracked path, mode and blob; the tree key below), plus the sha256 of
+      # ci.py and _ci_linux.py in this checkout, the Python, the runner image
+      # (ImageOS, ImageVersion) and the measuring venv's pip freeze, which
+      # ci.py compares once it has built the venv. The
+      # candidate stores its measurement under its own tree, the next push's
+      # base. The base hands off a kept measurement of equal inputs and runs no
+      # suite; the candidate always measures, since the join judges its suite
+      # exit.
+      - name: the tree key of this side's measurement inputs
+        id: tree
         shell: bash
         env:
           BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: python tools/testing/ci.py --base "$BASE_REF" --measure ${{ matrix.side }}
+        run: python tools/testing/ci.py --base "$BASE_REF" --tree-key ${{ matrix.side }} >> "$GITHUB_OUTPUT"
+      - if: matrix.side == 'base'
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: .crapkit/measure-cache
+          key: verdict-measure-${{ steps.tree.outputs.key }}
+          restore-keys: verdict-measure-${{ steps.tree.outputs.key }}-
+      # A tree key step that failed must not skip the hand-off: the verdict job
+      # reads failure.json for the phase and the error.
+      - name: measure one installed wheel
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python tools/testing/ci.py --base "$BASE_REF" --measure ${{ matrix.side }} --cache .crapkit/measure-cache
+      # ci.py keeps only a passing measurement with its coverage report. A
+      # reused one leaves the restored proof as it was, so its key is the one
+      # restored and there is nothing new to save.
+      - if: >-
+          hashFiles('.crapkit/measure-cache/proof.json') != '' &&
+          steps.restore.outputs.cache-matched-key != format('verdict-measure-{0}-{1}',
+          steps.tree.outputs.key, hashFiles('.crapkit/measure-cache/proof.json'))
+        uses: actions/cache/save@v4
+        with:
+          path: .crapkit/measure-cache
+          key: verdict-measure-${{ steps.tree.outputs.key }}-${{ hashFiles('.crapkit/measure-cache/proof.json') }}
       - name: hand the measurement to the verdict
         if: always()
         uses: actions/upload-artifact@v4
@@ -98,12 +238,22 @@ jobs:
   verdict:
     needs: verdict-measure
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: git starts no maintenance writer while tests copy repositories
+        shell: bash
+        run: |
+          # git 2.47+ detaches `git maintenance run --auto` after a commit, and the
+          # writer holds .git/objects/maintenance.lock while a test copies the repo.
+          # System config, because a test may swap HOME or drop the GIT_* variables.
+          as_admin=""; [ "$RUNNER_OS" = Windows ] || as_admin=sudo
+          $as_admin git config --system maintenance.auto false
+          $as_admin git config --system gc.auto 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -120,6 +270,42 @@ jobs:
         env:
           BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: python tools/testing/ci.py --base "$BASE_REF" --join
+      # Calculation accuracy over the same two wheels (docs/accuracy.md), whatever
+      # the join decided: change control judges the diff against the last main
+      # commit whose verdict was green, so a push that skipped CI is still judged;
+      # the wheel diff names every value the candidate moves on the small corpus;
+      # the floor proves the candidate's own lane measured every CLI entry point.
+      # A side that handed off failure.json makes the first two print one skip line.
+      - name: install the accuracy push tier's pinned tools
+        if: ${{ !cancelled() }}
+        run: python -m pip install --require-hashes --no-deps -r tools/accuracy/requirements-push.txt
+      - name: change control against the last green main commit
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if git fetch --quiet origin "+refs/accuracy/green:refs/accuracy/green"; then
+            base=refs/accuracy/green
+          else
+            base="$BASE_REF"
+            echo "no refs/accuracy/green yet: change control judges against the event base"
+          fi
+          python tools/accuracy/change_control.py --base "$base" --measured .crapkit/ci-measure
+      - name: the two wheels on the small corpus
+        if: ${{ !cancelled() }}
+        run: >-
+          python tools/accuracy/wheel_diff.py diff --corpus small
+          --base-wheel .crapkit/ci-measure/base --candidate-wheel .crapkit/ci-measure/candidate
+      - name: the candidate's lane measured every CLI entry point
+        if: ${{ !cancelled() && hashFiles('.crapkit/ci-measure/candidate/cov/py.json') != '' }}
+        env:
+          CRAPKIT_SELF_MEASURE: .crapkit/ci-measure/candidate/cov/py.json
+          CRAPKIT_ACCURACY_TIER: release
+          PYTHONPATH: tests
+        run: >-
+          python -m pytest -q -p no:cacheprovider -p no:randomly
+          tests/accuracy/suite_strength/test_self_measure_floor.py::test_cli_entry_points_measured
       - name: retain the verdict and wheel provenance
         if: always()
         uses: actions/upload-artifact@v4
@@ -131,6 +317,129 @@ jobs:
           if-no-files-found: warn
           overwrite: true
 
+  # The calculation-accuracy push tier (docs/accuracy.md): every number, label,
+  # ranking and pass/fail crapkit computes, checked against an outside oracle,
+  # a hand table or a clean-room model. Ubuntu runs every push check; Windows
+  # runs only the checks whose answer can change with the OS (`os_sensitive` in
+  # tools/accuracy/checks): byte decoding, PowerShell's parser, path spellings,
+  # the gates in a temporary repo, argv splitting, printed commands and the
+  # small-corpus exports. Both hand their receipt to accuracy-xplat.
+  accuracy-push:
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, select: "", minutes: 10}
+          - {os: windows-latest, select: "--os-sensitive", minutes: 8}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.minutes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: git starts no maintenance writer while tests copy repositories
+        shell: bash
+        run: |
+          # git 2.47+ detaches `git maintenance run --auto` after a commit, and the
+          # writer holds .git/objects/maintenance.lock while a test copies the repo.
+          # System config, because a test may swap HOME or drop the GIT_* variables.
+          as_admin=""; [ "$RUNNER_OS" = Windows ] || as_admin=sudo
+          $as_admin git config --system maintenance.auto false
+          $as_admin git config --system gc.auto 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # The hash-locked tier, then crapkit from this checkout without its
+      # dependencies: the lock already pins lizard and everything else.
+      - run: python -m pip install --require-hashes --no-deps -r tools/accuracy/requirements-push.txt
+      - run: python -m pip install --no-deps -e .
+      - id: node
+        uses: actions/cache@v4
+        with:
+          path: tools/accuracy/node/push/node_modules
+          key: node-push-${{ runner.os }}-${{ hashFiles('tools/accuracy/node/push/package-lock.json') }}
+      - if: steps.node.outputs.cache-hit != 'true'
+        run: npm ci --prefix tools/accuracy/node/push --ignore-scripts --no-audit --no-fund
+      - name: the push tier
+        shell: bash
+        run: >-
+          python tools/accuracy/run.py --tier push -n 4 ${{ matrix.select }}
+          --receipt .crapkit/accuracy/receipts/push-${{ runner.os }}.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: accuracy-push-${{ runner.os }}
+          path: .crapkit/accuracy/receipts/
+          retention-days: 1
+
+  # The small corpus's exports as each OS printed them: ints and labels exactly,
+  # four-decimal floats by their text, full-precision floats within 2 ulp. A
+  # difference names the export, the row and the column.
+  accuracy-xplat:
+    needs: accuracy-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --require-hashes --no-deps -r tools/accuracy/requirements-push.txt
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: accuracy-push-*
+          path: receipts
+          merge-multiple: true
+      - run: python tools/accuracy/wheel_diff.py xplat receipts/push-Linux.json receipts/push-Windows.json
+
+  # A push to main whose verdict and accuracy jobs all passed becomes
+  # refs/accuracy/green, the base the next change-control run judges against;
+  # the ref only moves forward along main. A red one opens or updates the one
+  # open `accuracy-red` issue.
+  accuracy-green:
+    needs: [verdict, accuracy-push, accuracy-xplat]
+    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: move refs/accuracy/green to this commit
+        if: ${{ needs.verdict.result == 'success' && needs.accuracy-push.result == 'success' && needs.accuracy-xplat.result == 'success' }}
+        shell: bash
+        run: |
+          if git fetch --quiet origin "+refs/accuracy/green:refs/accuracy/green" &&
+             ! git merge-base --is-ancestor refs/accuracy/green "$GITHUB_SHA"; then
+            echo "refs/accuracy/green is already past $GITHUB_SHA; it stays"
+            exit 0
+          fi
+          git push --force origin "$GITHUB_SHA:refs/accuracy/green"
+      - name: file the red run under accuracy-red
+        if: ${{ needs.verdict.result != 'success' || needs.accuracy-push.result != 'success' || needs.accuracy-xplat.result != 'success' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RESULTS: verdict ${{ needs.verdict.result }}, accuracy-push ${{ needs.accuracy-push.result }}, accuracy-xplat ${{ needs.accuracy-xplat.result }}
+        run: |
+          body="main at $GITHUB_SHA: $RESULTS. Run: $RUN_URL"
+          # GitHub refuses an issue under a label the repository lacks; --force also rewrites an existing one to these same values.
+          gh label create accuracy-red --force --color B60205 --description "A push to main failed its accuracy verdict"
+          number=$(gh issue list --label accuracy-red --state open --json number --jq '.[0].number // empty')
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body "$body"
+          else
+            gh issue create --title "accuracy-red: a push to main failed its accuracy verdict" --label accuracy-red --body "$body"
+          fi
+
   # `plugin validate` reads hooks.json and the skill frontmatter, which no Python
   # test can schema-check: a malformed handler fails here with exit 1. The two
   # calls read two different files. `validate plugin` reads
@@ -138,9 +447,20 @@ jobs:
   # .claude-plugin/marketplace.json, which is what a `claude plugin marketplace
   # add JeanFrancoisGagne/crapkit` fetches, and nothing else checks it.
   plugin:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: git starts no maintenance writer while tests copy repositories
+        shell: bash
+        run: |
+          # git 2.47+ detaches `git maintenance run --auto` after a commit, and the
+          # writer holds .git/objects/maintenance.lock while a test copies the repo.
+          # System config, because a test may swap HOME or drop the GIT_* variables.
+          as_admin=""; [ "$RUNNER_OS" = Windows ] || as_admin=sudo
+          $as_admin git config --system maintenance.auto false
+          $as_admin git config --system gc.auto 0
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -149,6 +469,19 @@ jobs:
         run: claude plugin validate plugin --strict
       - name: the marketplace manifest validates
         run: claude plugin validate .
+      # doctor --plugin-root passes only a manifest every Claude Code release
+      # loads: a byte that is not UTF-8 reads as U+FFFD, and a byte-order mark,
+      # which 2.1.238 refused, is refused. The test asks the newest Claude Code
+      # to load every manifest doctor passes, so a release that refuses one fails here.
+      # CRAPKIT_REQUIRE_CLAUDE turns a missing binary into a failure, not a skip.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - name: this Claude Code loads every plugin manifest doctor passes
+        env:
+          CRAPKIT_REQUIRE_CLAUDE: "1"
+        run: python -m pytest tests/unit/test_r2_interface_paths.py -k claude_code_loads -p no:randomly
 
   # The composite action at the repo root is the one surface no Python test can
   # execute: `action.yml` is read by the runner, never imported. So crapkit runs
@@ -166,16 +499,32 @@ jobs:
   # the composite action and owns Ubuntu/Python 3.12 source tests. The explicit
   # JUnit check below rejects failures even though the action stays advisory.
   dogfood:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 40  # 18.1 min measured on 2026-10-01
     permissions:
       pull-requests: write
+    # As in `test`: the Latin-1 locale rows fail here rather than skip.
+    env:
+      CRAPKIT_REQUIRE_LOCALES: "1"
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: git starts no maintenance writer while tests copy repositories
+        shell: bash
+        run: |
+          # git 2.47+ detaches `git maintenance run --auto` after a commit, and the
+          # writer holds .git/objects/maintenance.lock while a test copies the repo.
+          # System config, because a test may swap HOME or drop the GIT_* variables.
+          as_admin=""; [ "$RUNNER_OS" = Windows ] || as_admin=sudo
+          $as_admin git config --system maintenance.auto false
+          $as_admin git config --system gc.auto 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: the locale sources localedef reads are there
+        run: test -f /usr/share/i18n/charmaps/ISO-8859-1.gz || { sudo apt-get update -q && sudo apt-get install -y -q locales; }
       - run: pip install -e ".[dev]"
       - name: the console script resolves
         run: crapkit --version
@@ -200,7 +549,10 @@ jobs:
           python -c "from pathlib import Path; from crapkit.junitparse import failed_test_ids;
           failed = sorted(failed_test_ids(Path('.crapkit/cov/junit.xml').read_text(encoding='utf-8')));
           print('\n'.join(failed)); raise SystemExit(bool(failed))"
+      # The gate reads the checkout and the event base, not the suite's
+      # evidence, so a red suite step above does not skip it.
       - name: gate changed functions against the event base
+        if: ${{ !cancelled() }}
         shell: bash
         env:
           BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -217,3 +569,278 @@ jobs:
             .crapkit/lane-*.log
           include-hidden-files: true
           if-no-files-found: warn
+
+  # The deploy suite's push set (tests/deploy): crapkit installed the way a
+  # user installs it, through each channel and harness the push cadence names,
+  # fresh and upgraded. tools/deploy/run.py is the one entry point, here and on
+  # a laptop. deploy.yml runs the nightly, weekly, release and published sets;
+  # tests/deploy/MAP.toml says which cell covers what.
+  #
+  # deploy-linux builds crapkit-deploy:core, or reuses it from the GitHub
+  # Actions cache, and runs every Linux push cell in it with no network. The
+  # timeout covers a cold build on this 4-core runner: a job that times out
+  # mid-build writes no cache, and every later run would start cold again.
+  # Two parts run side by side, each half of the push set (run.py --shard):
+  # on one machine the whole set's tests took 6 to 9 minutes at -n 4, and
+  # restoring and loading the image adds 3 to 4, past the 10 minutes a push
+  # may take. Each part restores the image on its own runner.
+  deploy-linux:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: pull Docker Hub images through mirror.gcr.io
+        run: |
+          conf=/etc/docker/daemon.json
+          { sudo cat "$conf" 2>/dev/null || echo '{}'; } | jq '. + {"registry-mirrors": ["https://mirror.gcr.io"]}' > /tmp/daemon.json
+          sudo mv /tmp/daemon.json "$conf"
+          sudo systemctl restart docker
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+        with:
+          version: v0.37.1
+          name: crapkit-deploy
+          driver: docker-container
+          driver-opts: image=moby/buildkit:v0.33.0@sha256:6c2fa84a6b61ccd72899dde4239f8d5717f05f9a8ca6f3cad185fb1a95a94de3
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487  # v4.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: run the Linux push cells in crapkit-deploy:core
+        run: python tools/deploy/run.py --cadence push --os linux --image core --cache gha -n 4 --shard ${{ matrix.part }}/2
+      - name: per-cell durations
+        if: always()
+        shell: python
+        run: |
+          import glob
+          import os
+          import xml.etree.ElementTree as ElementTree
+
+          OUT = ".crapkit/deploy-out"
+          rows = []
+          for path in sorted(glob.glob(f"{OUT}/**/junit-*.xml", recursive=True)):
+              for case in ElementTree.parse(path).iter("testcase"):
+                  props = {prop.get("name"): prop.get("value") for prop in case.iter("property")}
+                  kinds = {child.tag for child in case} & {"failure", "error", "skipped"}
+                  verdict = "failed" if kinds & {"failure", "error"} else ("skipped" if kinds else "passed")
+                  rows.append((float(case.get("time") or 0), props.get("cell_id", "kit"),
+                               case.get("name", "").replace("|", "/"), verdict, os.path.relpath(path, OUT)))
+          rows.sort(key=lambda row: -row[0])
+          lines = [f"### Deploy cells: {len(rows)} tests, {sum(row[0] for row in rows):.0f} s", "",
+                   "| seconds | cell | test | verdict | run |", "|---:|---|---|---|---|"]
+          lines += [f"| {seconds:.1f} | {cell} | `{name}` | {verdict} | {run} |"
+                    for seconds, cell, name, verdict, run in rows]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("\n".join(lines if rows else ["### Deploy cells: no JUnit was written"]) + "\n")
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: deploy-linux-${{ matrix.part }}
+          path: |
+            .crapkit/deploy-out
+            !.crapkit/deploy-out/**/in
+            !.crapkit/deploy-out/**/native-*
+          retention-days: 7
+          include-hidden-files: true
+          if-no-files-found: warn
+
+  # lin-native-start on the bare runner: the same start and Route 1 commit a
+  # container cell runs, with no container guard in the way.
+  deploy-linux-native:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/crapkit-deploy
+          key: deploy-toolchain-${{ runner.os }}-none-${{ hashFiles('tools/deploy/pins.toml', 'tools/deploy/wheelhouse.lock', 'tools/deploy/toolchain.py', 'tests/deploy/docker/*/package-lock.json', 'tests/deploy/docker/runner-requirements.txt') }}
+      - name: install the pinned toolchain
+        run: python tools/deploy/toolchain.py --harness none
+      - name: run lin-native-start
+        run: python tools/deploy/run.py --native --os linux --cadence push --cell lin-native-start
+      - name: per-cell durations
+        if: always()
+        shell: python
+        run: |
+          import glob
+          import os
+          import xml.etree.ElementTree as ElementTree
+
+          OUT = ".crapkit/deploy-out"
+          rows = []
+          for path in sorted(glob.glob(f"{OUT}/**/junit-*.xml", recursive=True)):
+              for case in ElementTree.parse(path).iter("testcase"):
+                  props = {prop.get("name"): prop.get("value") for prop in case.iter("property")}
+                  kinds = {child.tag for child in case} & {"failure", "error", "skipped"}
+                  verdict = "failed" if kinds & {"failure", "error"} else ("skipped" if kinds else "passed")
+                  rows.append((float(case.get("time") or 0), props.get("cell_id", "kit"),
+                               case.get("name", "").replace("|", "/"), verdict, os.path.relpath(path, OUT)))
+          rows.sort(key=lambda row: -row[0])
+          lines = [f"### Deploy cells: {len(rows)} tests, {sum(row[0] for row in rows):.0f} s", "",
+                   "| seconds | cell | test | verdict | run |", "|---:|---|---|---|---|"]
+          lines += [f"| {seconds:.1f} | {cell} | `{name}` | {verdict} | {run} |"
+                    for seconds, cell, name, verdict, run in rows]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("\n".join(lines if rows else ["### Deploy cells: no JUnit was written"]) + "\n")
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: deploy-linux-native
+          path: |
+            .crapkit/deploy-out
+            !.crapkit/deploy-out/**/in
+            !.crapkit/deploy-out/**/native-*
+          retention-days: 7
+          include-hidden-files: true
+          if-no-files-found: warn
+
+  # The Windows push cells, natively: cmd.exe, PowerShell 5.1 and pwsh,
+  # PortableGit, the cp1252 console. The timeout holds until a first run is
+  # measured; then it is 1.5 times that run (tests/deploy/MAP.toml [budget]).
+  deploy-windows:
+    if: github.event_name != 'schedule'
+    runs-on: windows-2025
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/AppData/Local/crapkit-deploy
+          key: deploy-toolchain-${{ runner.os }}-core-${{ hashFiles('tools/deploy/pins.toml', 'tools/deploy/wheelhouse.lock', 'tools/deploy/toolchain.py', 'tests/deploy/docker/*/package-lock.json', 'tests/deploy/docker/runner-requirements.txt') }}
+      - name: install the pinned toolchain
+        run: python tools/deploy/toolchain.py --harness core
+      - name: run the Windows push cells
+        run: python tools/deploy/run.py --native --os windows --cadence push -n 4
+      - name: per-cell durations
+        if: always()
+        shell: python
+        run: |
+          import glob
+          import os
+          import xml.etree.ElementTree as ElementTree
+
+          OUT = ".crapkit/deploy-out"
+          rows = []
+          for path in sorted(glob.glob(f"{OUT}/**/junit-*.xml", recursive=True)):
+              for case in ElementTree.parse(path).iter("testcase"):
+                  props = {prop.get("name"): prop.get("value") for prop in case.iter("property")}
+                  kinds = {child.tag for child in case} & {"failure", "error", "skipped"}
+                  verdict = "failed" if kinds & {"failure", "error"} else ("skipped" if kinds else "passed")
+                  rows.append((float(case.get("time") or 0), props.get("cell_id", "kit"),
+                               case.get("name", "").replace("|", "/"), verdict, os.path.relpath(path, OUT)))
+          rows.sort(key=lambda row: -row[0])
+          lines = [f"### Deploy cells: {len(rows)} tests, {sum(row[0] for row in rows):.0f} s", "",
+                   "| seconds | cell | test | verdict | run |", "|---:|---|---|---|---|"]
+          lines += [f"| {seconds:.1f} | {cell} | `{name}` | {verdict} | {run} |"
+                    for seconds, cell, name, verdict, run in rows]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("\n".join(lines if rows else ["### Deploy cells: no JUnit was written"]) + "\n")
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: deploy-windows
+          path: |
+            .crapkit/deploy-out
+            !.crapkit/deploy-out/**/in
+            !.crapkit/deploy-out/**/native-*
+          retention-days: 7
+          include-hidden-files: true
+          if-no-files-found: warn
+
+  # The Action as a consumer runs it: crapkit checked out beside a consumer
+  # repo with a planted breach, `uses: ./crapkit` with gate "true" and delta
+  # "false", and a token that can read pull requests but not comment on them.
+  # On push the cell is gha-action-consumer ("no pull request on this event");
+  # on a pull request it is gha-action-readonly-token (the comment post fails
+  # with 403 and the gate still decides the job).
+  deploy-action:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      outcome: ${{ steps.action.outcome }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          path: crapkit
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: build the consumer at the workspace root
+        run: python crapkit/tools/deploy/consumer.py
+      # The README's Action recipe installs what the lanes run before the Action;
+      # consumer.py seeded in its own venv, so the runner's Python has no pytest.
+      - name: install what the consumer's py lane runs
+        run: python -m pip install pytest pytest-cov
+      - id: action
+        name: the action scores the consumer
+        continue-on-error: true
+        uses: ./crapkit
+        with:
+          gate: "true"
+          delta: "false"
+      - name: assert what the consumer sees
+        if: always()
+        run: >-
+          python crapkit/tools/deploy/assert_action.py
+          --cell ${{ github.event_name == 'pull_request' && 'gha-action-readonly-token' || 'gha-action-consumer' }}
+          --outcome "${{ steps.action.outcome }}"
+
+  # A step cannot read its own job's log, and the lines the action prints about
+  # its comment are only there: "no pull request on this event" on a push, and
+  # on a pull request gh's 403 and "posting the crapkit comment exited" with the
+  # gate line after it. This job reads deploy-action's finished log.
+  deploy-action-log:
+    needs: deploy-action
+    # always() runs this job after a red deploy-action too; a schedule has no
+    # deploy-action log to read, so the job skips before a runner boots.
+    if: always() && github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: assert what deploy-action's log shows
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python tools/deploy/assert_action.py
+          --cell ${{ github.event_name == 'pull_request' && 'gha-action-readonly-token' || 'gha-action-consumer' }}
+          --job deploy-action
+          --outcome "${{ needs.deploy-action.outputs.outcome }}"

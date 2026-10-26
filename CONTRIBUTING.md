@@ -5,18 +5,39 @@
 ```
 git clone https://github.com/JeanFrancoisGagne/crapkit
 cd crapkit
-pip install -e ".[dev]"
+pip install -e ".[dev,accuracy-push]"
+npm ci --prefix tools/accuracy/node/push
 git config core.hooksPath git-hooks
+git config merge.crapkit-ratchet.driver "python -m crapkit ratchet merge %O %A %B"
 ```
 
-Quote `".[dev]"`: zsh globs the bare form and the install fails before pip sees it.
+Quote `".[dev,accuracy-push]"`: zsh globs the bare form and the install fails before pip
+sees it.
 
 The dev extra includes pytest, pytest-cov and pytest-xdist. Keep all three in
 the test environment: fixture lanes launch their own pytest processes with
 coverage and worker flags. Run the shared test schedule below after setup.
 
-`core.hooksPath` arms the complexity gate on your own commits. Without it your commits
-pass locally and get rejected in review.
+`core.hooksPath` arms the complexity gate on your own commits and change control on
+your pushes. Without it your commits pass locally and get rejected in review. Both
+hooks run the checkout's own code: pre-commit puts the checkout's `src/` first on
+PYTHONPATH for the gate, and pre-push runs the checkout's
+`tools/accuracy/change_control.py`, whose test runs get the same `src/` first. A commit
+in a linked worktree is judged by that worktree's crapkit, not by the one your python
+has installed. The `accuracy-push` extra is what the pre-push hook runs on: the pinned
+oracles of the calculation-accuracy suite ([docs/accuracy.md](docs/accuracy.md)).
+Without it the hook stops the push and prints the install line. The Node tools `npm ci`
+puts under `tools/accuracy/node/push` are what the pre-push checks of a JavaScript or
+TypeScript calculation and `change_control.py declare` run; without them both stop and
+print the `npm ci` line.
+
+The `merge.crapkit-ratchet.driver` line defines the merge driver `.gitattributes` names
+for `crapkit-ratchet.tsv`. git never takes a driver command from a committed file, so
+each clone runs the line once. Without it git merges the marks file as text, and a
+hand-resolved conflict is where a mark gets raised
+([docs/ratchet.md](docs/ratchet.md#the-git-merge-driver)). The line starts crapkit with
+`python -m`, through the same `python` both hooks run, where docs/ratchet.md gives a
+repo that installs crapkit as a tool the `crapkit` console script.
 
 ## Tests
 
@@ -36,25 +57,42 @@ shared runner to reproduce a unit failure serially, and `--suite unit` or
 has its own Python process and test directories. Both suites disable a globally
 installed pytest-randomly plugin.
 
+A change to anything crapkit computes, a score, a label, a ranking or a pass/fail,
+also runs the calculation-accuracy suite: `python tools/accuracy/run.py --tier push -n 4`
+([docs/accuracy.md](docs/accuracy.md) has every tier). The pre-push hook runs the
+accuracy checks of each calculation whose module your branch touches. A fix to a
+calculation needs the rows [docs/accuracy.md: past bugs](docs/accuracy.md#past-bugs)
+names, and a change that moves a golden declares itself with
+`python tools/accuracy/change_control.py declare`.
+
 Add `--coverage` to the shared runner to combine branch coverage, subprocess
 measurements, configured test contexts and JUnit results. Every direct run retains its
 evidence in a unique `.crapkit/test-runs/run-*` directory and prints the absolute path
 before starting. Either suite failing makes the runner fail. The next suite starts
 only after the previous suite's owned descendants stop. Cancellation stops the run.
-Default evidence expires after seven days or beyond the ten most recent runs;
-active runs and unrecognized directories are preserved. Change the limits with
-`--retention-days N` and `--retention-count N` (0 disables a limit), or print the runs
-they would remove, without running a suite, with `--preview-retention`. See
-[resource policies](docs/resources.md).
+The runner marks default `.crapkit/test-runs/run-*` directories and is the only
+command that removes them. At each default start it expires idle runs older than
+`--retention-days` (7) or beyond the `--retention-count` (10) most recent; active runs
+and unrecognized directories are preserved. Zero disables a limit, and setting both to
+zero keeps all recognized runs. `--preview-retention` prints the runs the limits would
+remove, as JSON, and runs no suite. A run the filesystem will not fully delete, such as
+one holding a read-only file, keeps its receipt: `--preview-retention` still lists it
+and the next start tries again. Explicitly selecting an existing retained run, or a
+directory inside it, removes its retention receipt under the same lease and makes that
+run caller-managed. Retention runs once at startup, outside individual tests and
+analysis calls. See [resource policies](docs/resources.md) for the locks and logs a
+run shares with crapkit itself.
 
 `--output DIR` replaces evidence in a caller-managed directory inside `--repo`; relative
-paths resolve from that repository. Crapkit's own lane supplies `--output .crapkit/cov`
+paths resolve from that repository. crapkit's own lane supplies `--output .crapkit/cov`
 while it owns those measurement artifacts, and the CI verdict driver uses that location
 in its private checkout. A direct run should keep the default destination so it cannot
 change an active lane's evidence.
 
-`python tools/docs/generate.py` updates the marked version and command facts and
-the editor schema. CI checks these generated sections through the unit suite.
+`python tools/docs/generate.py` rewrites every generated block: SECURITY.md's version
+support, the test schedule here and in AGENTS.md, docs/accuracy.md's calcs, rulings and
+conventions tables, pyproject.toml's mutmut paths, and the editor schema,
+`crapkit.schema.json`. CI checks these generated sections through the unit suite.
 
 `tests/unit` covers pure seams, including `cli/verifying.py` and `cli/scoring.py`, which it
 drives in process rather than through a subprocess. `tests/e2e` drives `python -m crapkit`
@@ -66,6 +104,11 @@ against real git repos in tmp dirs and asserts through the CLI only.
 probe before and after each test. Fake interpreters on PATH therefore do not leave
 cached answers for later tests. Investigate doctor failures under a changed test order;
 the former cache leak is fixed.
+
+`tests/conftest.py` removes `FORCE_COLOR`, `PY_COLORS`, `PYTHON_COLORS`, `NO_COLOR` and
+`CLICOLOR_FORCE` and sets `COLUMNS=80` for the whole session, children included. Help
+text colours on Python 3.14 and wraps at `COLUMNS`, so the help tests pass or fail the
+same way in any shell. A test that needs colour or a width sets it with `monkeypatch`.
 
 ### The e2e CLI runner
 
@@ -89,9 +132,9 @@ so no global Git configuration is required.
 
 ## The rules the repo holds itself to
 
-- **The complexity gate is real.** Every function you add or touch must sit at ccn 6 or
-  lower, the `target = 6` in this repo's own `crapkit.toml`. Comprehension `for`/`if`
-  clauses, ternaries, and `and`/`or` all count. `git-hooks/pre-commit` runs
+- **The complexity gate is real.** Every function you add or touch must sit at or under
+  its scope's `target` in this repo's own `crapkit.toml`: 6 for `src` and `tools`, 5 for
+  `tools/accuracy`. Comprehension `for`/`if` clauses, ternaries, and `and`/`or` all count. `git-hooks/pre-commit` runs
   `python -m crapkit hook-precommit` over your staged blobs, which exits 6 on a breach and
   turns into a git exit 1. Decompose; never widen the gate. A refusal is design feedback.
 - **Tests first.** A behavior change starts with the failing test that proves it: unit
@@ -133,19 +176,39 @@ Two gates, and the first one is yours.
 **Before you push.** `git-hooks/pre-commit` refuses the commit on a staged function over
 ccn 6. Then `python -m crapkit verify` on the branch: it reruns the lane, gates the
 functions your diff touched, and checks that no ratchet mark rose and no test that passed
-in the baseline fails now. CI also runs the event-base hook and a complete verdict
-against separate base and candidate wheel installations.
+in the baseline fails now. `git-hooks/pre-push` runs change control on every pushed
+commit and the accuracy checks of each calculation whose module the branch touches;
+a golden or metric that moved without a declared change stops the push with the
+`change_control.py declare` command that records it. CI also runs the event-base hook,
+a complete verdict against separate base and candidate wheel installations, and the
+accuracy push tier.
 
-**In CI** (`.github/workflows/ci.yml`), five jobs. A newer push to a pull request
-cancels the run it replaces; every push to main runs to the end.
+**In CI** (`.github/workflows/ci.yml`), thirteen jobs. A newer push to a pull request
+cancels the run it replaces; every push to main runs to the end. The nightly schedule
+skips every job except `test`, since it has no pushed change to judge.
 
 | Job | Runs | What fails the job |
 |---|---|---|
-| `test` | Editable dev install, console-script check and `python tools/testing/run.py --suite ...` on Python 3.11, 3.12 and 3.13 on Ubuntu and Windows; Ubuntu/Python 3.12 belongs to `dogfood`. An Ubuntu job runs both suites; each Windows suite is a job of its own. | A test failure. |
+| `test` | Editable dev install, console-script check and `python tools/testing/run.py --suite ...` on every Python pyproject's classifiers name (3.11, 3.12, 3.13 and 3.14) on Ubuntu and Windows, and on macOS for the letter-case rows; Ubuntu/Python 3.12 belongs to `dogfood`. A push or pull request runs Ubuntu on 3.11, 3.13 and 3.14, Windows on 3.11 and 3.14 and macOS on 3.13. Windows on 3.12 and 3.13 runs only on the nightly schedule at 04:41 UTC, which also runs macOS on 3.11, a macOS Python without `os.waitid`. An Ubuntu or macOS job runs both suites; each Windows suite is a job of its own. `CRAPKIT_REQUIRE_LOCALES=1` makes a Latin-1 locale row fail where localedef cannot build its locale, where elsewhere it skips. | A test failure. |
 | `verdict-measure` | One job per side: `python tools/testing/ci.py --base "$BASE_REF" --measure base` or `--measure candidate` builds and verifies that side's wheel, measures both suites and uploads the coverage evidence, the wheel and its proof. | A build, install or provenance failure. A failing suite still uploads; the join judges it. |
-| `verdict` | `python tools/testing/ci.py --base "$BASE_REF" --join` checks each uploaded wheel against the bytes and commit its proof records, installs it into a fresh venv, proves its source again, transfers the complete baseline ledger and runs `verify --no-tighten`. | A candidate suite failure, incomplete evidence from either revision, a refused measurement or a failing CRAP verdict. |
-| `plugin` | `claude plugin validate plugin --strict` and `claude plugin validate .` check the plugin, hooks, skills and marketplace manifests. | A validation error. |
-| `dogfood` | The repository's composite action runs `coverage`, `verify --json` and `worklist --top 5` on Crapkit. | Action execution errors, a test failure or an event-base complexity breach (`hook-precommit --base "$BASE_REF"`). Its `gate: false` setting leaves score enforcement to `verdict`. |
+| `verdict` | `python tools/testing/ci.py --base "$BASE_REF" --join` checks each uploaded wheel against the bytes and commit its proof records, installs it into a fresh venv, proves its source again, transfers the complete baseline ledger and runs `verify --no-tighten`. Then, whatever the join decided: `tools/accuracy/change_control.py` against `refs/accuracy/green`, `tools/accuracy/wheel_diff.py diff` of the two wheels on the small corpus, and the self-measurement floor over the candidate's coverage. | A candidate suite failure, incomplete evidence from either revision, a refused measurement or a failing CRAP verdict; a golden, expected value or metric that moved without a declared change; a CLI entry point the candidate's lane never ran. |
+| `accuracy-push` | The calculation-accuracy push tier from the hash-locked `tools/accuracy/requirements-push.txt`: `python tools/accuracy/run.py --tier push -n 4`, every push check on Ubuntu and the `--os-sensitive` ones on Windows. See [docs/accuracy.md](docs/accuracy.md). | A value that departs from its oracle, hand table or model; a strict xfail that passes, which means its bug is fixed and its rulings row must say so. |
+| `accuracy-xplat` | `python tools/accuracy/wheel_diff.py xplat` over the two push receipts: the small corpus's exports as Ubuntu and Windows printed them. | An export that differs: ints and labels exactly, four-decimal floats by their text, full-precision floats beyond 2 ulp. |
+| `accuracy-green` | On a push to main only. When `verdict`, `accuracy-push` and `accuracy-xplat` passed, it moves `refs/accuracy/green` to the commit, the base the next change-control run judges against; otherwise it opens or updates the `accuracy-red` issue. | A ref push or an issue write that GitHub refuses. |
+| `plugin` | `claude plugin validate plugin --strict` and `claude plugin validate .` check the plugin, hooks, skills and marketplace manifests. Then `test_claude_code_loads_every_manifest_doctor_passes` asks that Claude Code to load each manifest encoding `doctor --plugin-root` passes, under `CRAPKIT_REQUIRE_CLAUDE=1`. | A validation error, or a manifest `doctor --plugin-root` passes that this Claude Code refuses. |
+| `dogfood` | The repository's composite action runs `coverage`, `verify --json` and `worklist --top 5` on crapkit, with `CRAPKIT_REQUIRE_LOCALES=1` as in `test`. | Action execution errors, a test failure or an event-base complexity breach (`hook-precommit --base "$BASE_REF"`). Its `gate: false` setting leaves score enforcement to `verdict`. |
+| `deploy-linux` | `python tools/deploy/run.py --cadence push --os linux --image core --cache gha -n 4 --shard 1/2`, and `--shard 2/2` on a second runner at the same time, builds `crapkit-deploy:core`, or reuses it from the Actions cache, and runs half of the Linux push cells of `tests/deploy` in it with no network; the two halves run every one. | A cell failure, or a new image whose tools differ from `tools/deploy/pins.toml`. |
+| `deploy-linux-native` | `tools/deploy/toolchain.py`, then `run.py --native --os linux --cadence push --cell lin-native-start` on the bare runner, where the container guard does not apply. | A cell failure. |
+| `deploy-windows` | `tools/deploy/toolchain.py`, then `run.py --native --os windows --cadence push -n 4`: the Windows push cells under cmd.exe, both PowerShells and PortableGit. | A cell failure. |
+| `deploy-action` | `tools/deploy/consumer.py` builds a consumer beside the checkout, `uses: ./crapkit` scores it with gate "true" and delta "false" under a read-only pull-request token, and `tools/deploy/assert_action.py` checks the outcome, the log line and the comment. | An assertion about what the consumer sees. |
+| `deploy-action-log` | After `deploy-action`, `tools/deploy/assert_action.py --job deploy-action` reads that job's finished log through `gh api`: the gate line, and "no pull request on this event" on a push or the 403 from posting the comment on a pull request. | A line the log does not hold, or an action outcome other than failure. |
+
+`test` also runs one macOS job, Python 3.13 on a push and 3.11 on the nightly, with
+both suites in it, for the letter-case rows. APFS opens `SRC/a.py` for a tracked
+`src/a.py` under POSIX path rules. Ubuntu's disk keeps the two names apart, so
+those rows skip there,
+and Windows folds case alongside its own separator and drive rules. A case row
+that fails only on the macOS job reads a path's letter case as text somewhere.
 
 Both verdict jobs check installed source bytes: a measurement before mapping
 coverage paths, the join before an uploaded measurement stands for its revision.
@@ -171,15 +234,27 @@ prove it:
 | File | Change |
 |---|---|
 | `src/crapkit/config_contract.py` | add the label to the scope languages enum; `SUPPORTED_LANGUAGES` derives from it |
-| `src/crapkit/universe.py` | add its suffixes to `LANGUAGE_EXTENSIONS` |
+| `src/crapkit/languages.py` | add its suffixes to `LANGUAGE_EXTENSIONS` |
 | `src/crapkit/_pygdefer.py` | name it in the module docstring's list, which a test pins to the language set |
 
-Run `python tools/docs/generate.py` to update the editor schema. Then regenerate
-`plugin/hooks/hooks.json` from `LANGUAGE_EXTENSIONS` (a test rebuilds it
-and diffs), and name the language in the README intro and the handbook standfirst, both
-pinned to the same set. Bump `ANALYSIS_VERSION` in `analyze.py` so existing stores
-re-analyze. Coverage joins only where a parser exists, so a new language's scopes declare
+Run `python tools/docs/generate.py` to update the editor schema. Nothing in
+`plugin/hooks/hooks.json` changes: it registers one `Edit|Write` handler and lists no
+extension, and `claude-hook` screens each edit by `languages.LANGUAGE_EXTENSIONS`, so the
+advisory reads the new suffixes once the map has them. Name the language in the README
+intro and the handbook standfirst, give it a `cc-only` row in the handbook's language
+table (`<table id="languages">`) listing its suffixes, and add its display name to
+`DISPLAY` in `tests/unit/test_polyglot_constants.py`, whose tests pin all four to the
+language set. Bump `ANALYSIS_VERSION` in `analyze.py` so existing stores re-analyze. Coverage joins only where a parser exists, so a new language's scopes declare
 `coverage_optional = true` until one does.
+
+Bumping `ANALYSIS_VERSION` touches `analyze.py`, which `calcs.tsv` rows name, so declare
+the change: `python tools/accuracy/change_control.py declare <id> --kind feature --calcs
+"<the calcs declare lists as moved>" --reason "<language> support"`. It regenerates the
+goldens, appends the `metric-digests.tsv` row for the new version and prints the
+CHANGELOG line. Re-measure `GOLDEN_RECORDS` and set `GOLDEN_ANALYSIS_VERSION` in
+`tests/unit/test_analysis_cache_identity.py`. A new reader module also gets a
+`calcs.tsv` row in `tests/accuracy/analysis_oracles` naming the module, its functions
+and an independent test; then run `python tools/docs/generate.py`.
 
 `mutate.py` needs nothing unless the language spells its operators differently. Anything
 unnamed there falls through to the C-family table, which is right for Swift, Go, Vue, Zig,
@@ -192,7 +267,11 @@ shell and PowerShell.
 | Module | Why it exists |
 |---|---|
 | `lizardtypescript.py` | keeps sibling JavaScript and TypeScript expression arrows separate; refuses ambiguous TypeScript angle syntax instead of guessing. It extends each reader instance without changing the installed lizard package. `mask_templates` blanks the template-literal characters lizard's tokenizer misreads, so a template nested in `${...}` no longer hides the functions after it; `analyze.py` applies it to every JavaScript-family file. |
-| `lizardrust.py` | lizard's Rust reader counts a `match` block once no matter how many arms it has (lizard #494). This one counts each non-wildcard arm, and retires itself the day upstream fixes it. |
+| `lizardrust.py` | lizard's Rust reader counts a `match` block once no matter how many arms it has (lizard #494). This one counts each non-wildcard arm, and its match rule retires the day upstream fixes it. It also ends a `//` comment at its line. |
+| `lizardlinecomment.py` | lizard's tokenizer reads a `//` comment that ends in a backslash on into the next line, as only C's preprocessor does, so a function whose signature sat on that line had no row. `register()` ends the comment at its line in lizard's Java, Swift, TypeScript and TSX readers in place, so the reader classes stay lizard's; JavaScript and Vue follow the TypeScript reader. The Go, Zig and Rust readers take its `LINE_COMMENT` in their own tokenizers. |
+| `lizardgolike.py` | lizard reads Go and Zig with one state machine that waits for any later `{` after a parameter list, so a function type (`var cb func(int) error`) took the next block as its body. These readers end a signature where the language does. A reader that must decide before any counter sees a token defines `peek`, which `analyze._ReaderLookahead` calls with each raw token. |
+| `lizardclike.py` | lizard's C, C++ and Objective-C readers name a parameter after the last word of its declaration, so an unnamed or array parameter and every Objective-C argument went uncounted; they read a `<` comparison as a template bracket and lost every function after it, and read a class defined inside a function as that function's body; an attribute before the body named the function; and every counter read the `&&` of `auto&& x` or `static_cast<T&&>` as a logical and. These readers keep lizard's class names, because crapkit picks language rules by reader name. |
+| `lizardjava.py` | lizard's Java reader hid every method after an annotated local variable, an enum constant with a body or an annotation element with a default, read a second annotation with arguments as the method, and named a method nested in a method with its class twice (`A::A::go.run`). Same class name as lizard's, same reason. |
 | `lizardshell.py` | lizard ships no shell reader, and answers `.sh` with `CLikeReader` rather than a failure, so the numbers were plausible and wrong. |
 | `lizardpowershell.py` | same for `.ps1` and `.psm1`, plus a cp1252 decode fallback. |
 

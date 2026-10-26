@@ -60,7 +60,7 @@ class _Store:
         self._seen("function_history")
         return [{"run_id": 7, "ccn": 8}]
 
-    def attempts_for(self, keys):
+    def attempts_for(self, keys, names_in=None):
         self._seen("attempts_for")
         return {key: [] for key in keys}
 
@@ -74,6 +74,11 @@ class _Store:
         self._seen("twin_index")
         return build()
 
+    def run_sources(self, run_id):
+        """A run that recorded no content, as every run 0.8.0 wrote."""
+        self._seen("run_sources")
+        return None
+
 
 @pytest.fixture()
 def counted(monkeypatch) -> dict:
@@ -81,6 +86,7 @@ def counted(monkeypatch) -> dict:
     import crapkit.coupling_cache
     import crapkit.dup
     import crapkit.gitio
+    import crapkit.marks_history
 
     seen: dict[str, int] = {}
 
@@ -100,7 +106,7 @@ def counted(monkeypatch) -> dict:
     monkeypatch.setattr(crapkit.coupling_cache, "load_coupling", counter("coupling", []))
     monkeypatch.setattr(crapkit.dup, "twins_in", counter("twins", []))
     monkeypatch.setattr(crapkit.dup, "function_index", counter("twin_index", []))
-    monkeypatch.setattr(crapkit.gitio, "file_log_patches", counter("mark_history", []))
+    monkeypatch.setattr(crapkit.marks_history, "file_log", counter("mark_history", []))
     return seen
 
 

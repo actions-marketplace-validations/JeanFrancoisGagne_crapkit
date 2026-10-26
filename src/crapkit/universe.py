@@ -3,6 +3,13 @@
 The file universe itself comes from `git ls-files` in the shell layer; lizard is
 always fed these explicit lists because its own directory walking descends
 nested node_modules (measured hang).
+
+A name git gives in bytes that are not UTF-8 has no spelling a row can be keyed
+on. It arrives in the list in its surrogateescape spelling (gitpaths), and the
+scope assignment below judges it by claim. When a scope takes it, the
+assignment refuses with exit 3 and names the rename: left out, a scoped file
+nothing read would pass every gate. Any other such name is left out, and the
+verdict lists it (`Universe.unreadable`) for the command to name once.
 """
 from __future__ import annotations
 
@@ -12,29 +19,10 @@ from collections.abc import Callable
 from typing import NamedTuple
 
 from .config import Config, Scope
+from .errors import UnreadableNameError
+from .gitpaths import readable, shown
+from .languages import LANGUAGE_EXTENSIONS
 
-LANGUAGE_EXTENSIONS = {
-    "typescript": (".ts",),
-    "tsx": (".tsx",),
-    "javascript": (".js", ".jsx", ".mjs", ".cjs"),
-    "python": (".py",),
-    "swift": (".swift",),
-    "go": (".go",),
-    "rust": (".rs",),
-    "shell": (".sh", ".bash"),
-    # Exactly lizard's CLikeReader.ext, and deliberately not one suffix more.
-    # `.hh`, `.hxx` and `.ipp` are real C++ headers that no lizard reader
-    # declares, and lizard answers an undeclared suffix with `get_reader_for(f)
-    # or CLikeReader` — a silent fallback, right for those three by luck and
-    # wrong for anything else. Every claim here rests on a declared mapping;
-    # those three are an opt-in for whoever needs them.
-    "cpp": (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"),
-    "objectivec": (".m", ".mm"),
-    "vue": (".vue",),
-    "java": (".java",),
-    "zig": (".zig",),
-    "powershell": (".ps1", ".psm1"),
-}
 
 # Test directories are excluded case-insensitively: Swift convention capitalizes Tests/.
 _TEST_DIR = re.compile(r"(^|/)(tests?|__tests__)(/|$)", re.IGNORECASE)
@@ -75,8 +63,16 @@ def exclude_matcher(globs: tuple[str, ...]) -> Callable[[str], re.Match[str] | N
     return re.compile("|".join(_glob_regex(g.lower()) for g in globs)).match
 
 
+def in_test_dir(path: str) -> bool:
+    """Does a test, tests or __tests__ component, in any case, put this path in a
+    test directory? The scored corpus drops such a path whatever the exclude globs
+    say, and `test-scoped` routes one outside every scope; a test NAME elsewhere
+    (test_x.py, x.spec.ts) is source until an exclude glob says otherwise."""
+    return _TEST_DIR.search(path) is not None
+
+
 def excluded(path: str, match_glob: Callable[[str], re.Match[str] | None]) -> bool:
-    return bool(_TEST_DIR.search(path) or _DOT_DIR.search(path) or match_glob(path.lower()))
+    return bool(in_test_dir(path) or _DOT_DIR.search(path) or match_glob(path.lower()))
 
 
 def _source_extensions(languages: tuple[str, ...]) -> tuple[str, ...]:
@@ -180,9 +176,21 @@ def owning_scope(path: str, matchers: tuple[ScopeMatch, ...]) -> str | None:
     a directory own that file.
     """
     for m in matchers:
-        if (path == m.path or path.startswith(m.prefix)) and path.endswith(m.extensions):
+        if (path == m.path or path.startswith(m.prefix)) and _has_extension(path, m.extensions):
             return m.name
     return None
+
+
+def _has_extension(path: str, extensions: tuple[str, ...]) -> bool:
+    """Does the path end in one of these lower-case extensions, in any letter case?
+
+    lizard picks a file's reader with a case-blind suffix match, so
+    `src/MAIN.CPP` is C++ to the reader, and it has to be C++ to the scope:
+    compared case-exactly it was neither scored nor named unclaimed, and the
+    commit gate passed a ccn-8 function in it. Only the extension folds; the
+    directory part stays exact, because git keys a path by its bytes.
+    """
+    return path.lower().endswith(extensions)
 
 
 def overlapping_scope(directory: str, matchers: tuple[ScopeMatch, ...]) -> str | None:
@@ -206,11 +214,14 @@ class Universe(NamedTuple):
     extension. `unclaimed` is the set that used to vanish here: source in a
     declared language that no scope PATH owns, which then commits with zero
     gating. `oversized` names what the byte ceiling cut, with the sizes, so
-    the skip is reported rather than silent.
+    the skip is reported rather than silent. `unreadable` holds each name git
+    gave in bytes that are not UTF-8 and no scope takes, left out and never
+    keyed; one a scope takes never gets here, because the scan refuses it.
     """
     by_scope: dict[str, list[str]]
     unclaimed: tuple[str, ...]
     oversized: tuple[tuple[str, int], ...]
+    unreadable: tuple[str, ...] = ()
 
 
 def _candidate(path: str, matchers: tuple[ScopeMatch, ...]) -> tuple[str | None, bool]:
@@ -218,7 +229,7 @@ def _candidate(path: str, matchers: tuple[ScopeMatch, ...]) -> tuple[str | None,
     owner = owning_scope(path, matchers)
     if owner is not None:
         return owner, True
-    return None, any(path.endswith(m.extensions) for m in matchers)
+    return None, any(_has_extension(path, m.extensions) for m in matchers)
 
 
 def _candidates(files: list[str], cfg: Config,
@@ -261,15 +272,69 @@ def _partition(candidates: list[tuple[str, str | None]], scopes: tuple[Scope, ..
     return assigned, unclaimed, oversized
 
 
+_NAMED = 5  # left-out names a command names one by one before it counts the rest
+
+
+def left_out_lines(names: tuple[str, ...]) -> list[str]:
+    """The lines a command prints for the names its scan left out: one per
+    name, the first five, then one line with the count of the rest."""
+    lines = [f"crapkit: left out {shown(name)}: git names it in bytes that are not UTF-8, and crapkit "
+             "reads every path as UTF-8; rename it (git mv) to have it read" for name in names[:_NAMED]]
+    if len(names) > _NAMED:
+        lines.append(f"crapkit: left out {len(names) - _NAMED} more name(s) that are not UTF-8")
+    return lines
+
+
+def _claimed_text(claimed: list[tuple[str, str]]) -> str:
+    path, scope = claimed[0]
+    more = f" (and {len(claimed) - 1} more)" if len(claimed) > 1 else ""
+    return (f"{shown(path)}{more} is in scope {scope!r}, but git names it in bytes that are not "
+            "UTF-8 and crapkit reads every path as UTF-8; a file a scope takes is refused, not "
+            "left out, so no gate passes it unread: rename it (git mv) to a UTF-8 name")
+
+
+def claiming_scope(path: str, cfg: Config) -> str | None:
+    """The scope the scan's rule gives one path (excludes, extension, deepest
+    declared path), whether or not its name is UTF-8, or None when none takes
+    it. For a caller that answers for one name without refusing it."""
+    found = _candidates([path], cfg, scope_matchers(cfg.scopes))
+    return found[0][1] if found else None
+
+
+def _refuse_claimed(names: list[str], cfg: Config, matchers: tuple[ScopeMatch, ...]) -> None:
+    """Exit 3 when the scope assignment takes a name crapkit cannot read. The
+    sentence names the first and counts the rest; --json lists each."""
+    claimed = sorted((path, owner) for path, owner in _candidates(names, cfg, matchers)
+                     if owner is not None)
+    if claimed:
+        raise UnreadableNameError(_claimed_text(claimed), [path for path, _ in claimed])
+
+
 def scan_files(files: list[str], cfg: Config, *,
                size_of: Callable[[str], int] | None = None) -> Universe:
     """The whole verdict. `size_of` is injected so this stays pure; the shell
-    layer passes a working-tree stat, and callers with no tree pass nothing."""
+    layer passes a working-tree stat, and callers with no tree pass nothing.
+    A name that is not UTF-8 is refused when a scope takes it and listed in
+    `unreadable` otherwise; it is never keyed, and never listed as unclaimed."""
+    matchers = scope_matchers(cfg.scopes)
+    keyed, unreadable = _split_readable(files)
+    _refuse_claimed(list(unreadable), cfg, matchers)
     assigned, unclaimed, oversized = _partition(
-        _candidates(files, cfg, scope_matchers(cfg.scopes)),
-        cfg.scopes, cfg.max_file_bytes, size_of)
+        _candidates(keyed, cfg, matchers), cfg.scopes, cfg.max_file_bytes, size_of)
     return Universe({name: sorted(paths) for name, paths in assigned.items()},
-                    tuple(sorted(unclaimed)), tuple(sorted(oversized)))
+                    tuple(sorted(unclaimed)), tuple(sorted(oversized)), unreadable)
+
+
+def _split_readable(files: list[str]) -> tuple[list[str], tuple[str, ...]]:
+    """The names a row can key, in their order, and the unreadable ones,
+    sorted and each once."""
+    keyed, unreadable = [], set()
+    for path in files:
+        if readable(path):
+            keyed.append(path)
+        else:
+            unreadable.add(path)
+    return keyed, tuple(sorted(unreadable))
 
 
 def assign_files(files: list[str], cfg: Config, *,

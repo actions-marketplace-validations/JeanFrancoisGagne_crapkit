@@ -7,19 +7,25 @@ those is a value some caller already holds, so each is a field here instead of a
 round trip.
 
 The caller reads the store, git, configuration and file texts once per batch.
-This module formats those values; command quoting follows the host platform's
-shells. The packet keeps the existing `brief --json` field types.
+This module formats those values. A command reads the same in sh, bash,
+PowerShell and cmd.exe when its arguments allow it, and follows the host
+platform's shells when they do not. The packet keeps the existing `brief --json`
+field types.
 """
 from __future__ import annotations
 
 import base64
+from fractions import Fraction
 import os
 import re
 import shlex
 
+from .invariants import check_budget, check_rejudged
+from .invocation import console_script
 from .ratchet_report import DAY, mark_age_days
 from .keys import position
-from .score import remedy, shares_its_def_line
+from .score import crap_load, over_ceiling, remedy, shares_its_def_line, unjoined
+from .sourcelines import source_lines
 
 # What the gate actually enforces, said once. A session that reads a ceiling of
 # 6 beside a standing mark of 72 otherwise reads a contradiction and either
@@ -43,7 +49,9 @@ _CLOSERS = ")]}>"
 # for a child of a venv interpreter launched without a shell, to the base
 # interpreter the venv wraps: Windows searches the parent application's
 # directory before PATH, and a venv's python.exe is a trampoline for that base.
-REFRESH = "crapkit coverage --reuse-unchanged"
+# A packet uvx built says `uvx crapkit`: uvx puts no `crapkit` on PATH, and the
+# agent reading the packet runs in a shell of its own (invocation.console_script).
+REFRESH = "coverage --reuse-unchanged"
 
 
 def function_source(text: str | None, start: int, end: int) -> str | None:
@@ -54,7 +62,7 @@ def function_source(text: str | None, start: int, end: int) -> str | None:
     """
     if text is None:
         return None
-    return "\n".join(text.splitlines()[start - 1:end])
+    return "\n".join(source_lines(text)[start - 1:end])
 
 
 def file_functions(rows) -> list[dict]:
@@ -73,9 +81,9 @@ def file_totals(rows, scope_targets: dict, target: int) -> dict:
     A file can hold rows from two scopes; scoring the whole file against one
     ceiling would report debt a per-scope target deliberately allows.
     """
-    over = sum(1 for r in rows if r.crap > scope_targets.get(r.scope, target))
+    over = sum(1 for r in rows if over_ceiling(r.crap, scope_targets.get(r.scope, target)))
     return {"functions": len(rows), "over_target": over,
-            "crap_load": round(sum(r.crap for r in rows), 2)}
+            "crap_load": round(crap_load(r.crap for r in rows), 2)}
 
 
 def gate_rule(*, ceiling: int, mark: float | None, mark_age_days: int | None,
@@ -126,42 +134,82 @@ ENCODED_PREFIX = "powershell -NoProfile -NonInteractive -EncodedCommand "
 
 
 def _windows_encoded(arguments: list[str]) -> str:
-    """Cross cmd expansion and PowerShell parsing without exposing path text."""
-    quoted = " ".join("'" + _native_argument(arg).replace("'", "''") + "'" for arg in arguments)
-    script = ("$command = Get-Command crapkit -CommandType Application -TotalCount 1 -ErrorAction Stop; "
+    """Cross cmd expansion and PowerShell parsing without exposing path text.
+    Under uvx the application is uvx, and `crapkit` is its first argument."""
+    head, *lead = console_script().split()
+    quoted = " ".join("'" + _native_argument(arg).replace("'", "''") + "'"
+                      for arg in [*lead, *arguments])
+    script = (f"$command = Get-Command {head} -CommandType Application -TotalCount 1 -ErrorAction Stop; "
               "$LASTEXITCODE = 1; & $command.Source " + quoted + "; exit $LASTEXITCODE")
     encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
     return ENCODED_PREFIX + encoded
 
 
-# What cmd.exe or PowerShell rewrites even inside double quotes.
-_INTERPRETED = frozenset('"%!$`\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029')
+# What cmd.exe or PowerShell rewrites even inside double quotes. PowerShell
+# reads each of the three typographic double quotes as a double quote.
+_INTERPRETED = frozenset('"%!$`\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029\u201c\u201d\u201e')
+# Add what sh and bash rewrite there too: a backslash can escape.
+_NOT_PORTABLE = _INTERPRETED | {"\\"}
+_PORTABLE_BARE = r"[\w./:][-\w./:]*"
+_WINDOWS_BARE = r"[\w./:\\][-\w./:\\]*"
+
+
+# A long flag such as `--gate` or `--top`, which sh, cmd.exe and PowerShell all
+# hand to a native command as written. PowerShell's stop-parsing token `--%` is
+# not one.
+_LONG_FLAG = r"--[a-z][-a-z]*"
+
+
+def _double_quoted(argument: str, bare: str = _PORTABLE_BARE) -> str:
+    """A plain argument bare, any other inside double quotes."""
+    if argument == "--" or re.fullmatch(f"{_LONG_FLAG}|{bare}", argument, re.ASCII):
+        return argument
+    return '"' + argument + '"'
 
 
 def _windows_argument(argument: str) -> str:
-    if argument in ("--", "--gate") or re.fullmatch(r"[\w./:\\][-\w./:\\]*", argument, re.ASCII):
-        return argument
-    return '"' + argument + '"'
+    return _double_quoted(argument, _WINDOWS_BARE)
+
+
+def _portable(argument: str) -> bool:
+    """Read literally inside double quotes by sh, bash, PowerShell and cmd.exe."""
+    return bool(argument) and argument.isprintable() and not _NOT_PORTABLE.intersection(argument)
+
+
+def _line(words) -> str:
+    return _spelled(" ".join(words))
 
 
 def console_command(arguments: list[str]) -> str:
     """One crapkit command line that hands `arguments` over intact.
 
-    POSIX quotes for sh. On Windows the line pastes into cmd.exe and PowerShell
-    alike: a plain argument prints bare, and one holding a space or an operator
-    goes in double quotes, which both shells read. An argument that either
-    shell rewrites even inside double quotes (expansion text, a line break, a
-    double quote of its own) takes the encoded PowerShell form instead.
+    The line is often read on another OS than the one that wrote it: a report
+    made on a Linux CI runner opens on a Windows laptop. So when every argument
+    reads literally inside double quotes in sh, bash, PowerShell and cmd.exe,
+    the line takes that one form on every OS: a plain argument bare, any other
+    in double quotes. Single quotes, the POSIX form, reached a cmd.exe reader
+    as part of the argument. Only an argument one of those shells rewrites
+    inside double quotes (expansion text, a backslash, a line break, a quote of
+    its own) takes the writing OS's form: POSIX quotes for sh, and on Windows
+    double quotes or the encoded PowerShell form.
     """
+    if all(map(_portable, arguments)):
+        return _line(map(_double_quoted, arguments))
     if os.name != "nt":
-        return "crapkit " + " ".join(shlex.quote(arg) for arg in arguments)
+        return _line(map(shlex.quote, arguments))
     return _windows_command(arguments)
 
 
 def _windows_command(arguments: list[str]) -> str:
     if any(_INTERPRETED.intersection(arg) for arg in arguments):
         return _windows_encoded(arguments)
-    return "crapkit " + " ".join(_windows_argument(arg) for arg in arguments)
+    return _line(map(_windows_argument, arguments))
+
+
+def _spelled(arguments: str) -> str:
+    """A command line of already-quoted arguments, headed by the console script
+    as a shell outside this process starts it."""
+    return f"{console_script()} {arguments}"
 
 
 def _file_command(command: str, path: str, flags=()) -> str:
@@ -179,12 +227,18 @@ def commands(path: str, scoped: bool, note: str = "") -> dict:
     """
     out = {"gate": _file_command("rescore", path, ["--gate"]),
            "scoped_tests": _file_command("test-scoped", path) if scoped else None,
-           "verify": "crapkit verify",
-           "refresh": REFRESH,
+           "verify": _spelled("verify"),
+           "refresh": _spelled(REFRESH),
            "refresh_writes_run": True}
     if not scoped and note:
         out["scoped_tests_note"] = note
     return out
+
+
+def refresh_command() -> dict:
+    """`commands` for a payload that carries `stale` and names no per-file
+    command: the refresh alone, the same string a packet's `commands` holds."""
+    return {"refresh": _spelled(REFRESH)}
 
 
 def budget(row, ceiling: int) -> dict:
@@ -194,15 +248,36 @@ def budget(row, ceiling: int) -> dict:
     One definition for both readers. `next-item` published these and `brief` did
     not, so a session that opened on a packet re-derived numbers the queue had
     already computed — and two derivations of one formula drift with nothing to
-    catch it.
+    catch it. `invariants.check_budget` reads both against their definitions.
     """
-    return {"est_splits": 0 if row.ccn <= ceiling else -(-row.ccn // ceiling),
-            "est_uncovered_paths": max(0, round((1 - row.cov) * row.ccn))}
+    estimate = {"est_splits": 0 if row.ccn <= ceiling else -(-row.ccn // ceiling),
+                "est_uncovered_paths": _uncovered_paths(row.ccn, row.cov)}
+    check_budget(row, ceiling, estimate)
+    return estimate
 
 
-# The flags of rows no coverage artifact joins: the scope has no lane, or asks
-# for none. Scoring leaves them out of the shared-span check, so a rejudge does.
-_UNJOINED = ("no-lane", "cc-only")
+# cov arrives as the double of covered / total. Two fractions whose denominators
+# are at most 10**7 differ by at least 1e-14, and the double sits within 6e-17 of
+# its fraction, so limit_denominator hands the fraction back for any such total.
+_COVERAGE_DENOMINATOR = 10 ** 7
+
+
+def _uncovered_paths(ccn: int, cov: float) -> int:
+    """round((1 - cov) * ccn), half to even, on the exact product. The doubles
+    put (1 - 5/12) * 6, exactly 3.5, at 3.4999999999999996, and round() of that
+    said 3."""
+    return max(0, round((1 - Fraction(cov).limit_denominator(_COVERAGE_DENOMINATOR)) * ccn))
+
+
+def measurement(row) -> dict:
+    """Whether a measurement stands behind `cov`, and so behind the budget.
+
+    A `no-lane` or `cc-only` row scores at cov 0.0 because no artifact could
+    speak about it, and `est_uncovered_paths` multiplies that stand-in into a
+    count of paths no test walks. `unmeasured: true` says so beside them; the
+    numbers keep the values this payload has always given them.
+    """
+    return {"unmeasured": unjoined(row.flag)}
 
 
 def rejudged(row, ceiling: int, rows_of):
@@ -215,12 +290,15 @@ def rejudged(row, ceiling: int, rows_of):
     uncommitted edit from 6 to 4, a ccn-5 function read `remedy: ok` beside
     `est_splits: 2`. `rows_of(path)` returns the file's scored rows and is
     called only for a row whose stored verdict cannot say whether another
-    function declares its lines.
+    function declares its lines. The row it returns is checked against the
+    README's remedy table at `ceiling` (`invariants.check_rejudged`).
     """
     verdict = remedy(row.ccn, row.crap, ceiling)
     if verdict == "add-tests" and _shares_span(row, rows_of):
         verdict = "split-lines"
-    return row if verdict == row.remedy else row._replace(remedy=verdict)
+    judged = row if verdict == row.remedy else row._replace(remedy=verdict)
+    check_rejudged(judged, ceiling)
+    return judged
 
 
 def _shares_span(row, rows_of) -> bool:
@@ -233,7 +311,7 @@ def _shares_span(row, rows_of) -> bool:
     """
     if row.remedy in ("add-tests", "split-lines"):
         return row.remedy == "split-lines"
-    if row.flag in _UNJOINED:
+    if unjoined(row.flag):  # scoring leaves these out of the span check too
         return False
     return shares_its_def_line(row) or any(_same_span(row, other)
                                            for other in rows_of(row.path))
@@ -242,7 +320,7 @@ def _shares_span(row, rows_of) -> bool:
 def _same_span(row, other) -> bool:
     """Another function on the same lines. The same function scored under a
     second scope carries the same name and occurrence, so it is not one."""
-    return (other.flag not in _UNJOINED and (other.start, other.end) == (row.start, row.end)
+    return (not unjoined(other.flag) and (other.start, other.end) == (row.start, row.end)
             and (other.long_name, other.occurrence) != (row.long_name, row.occurrence))
 
 

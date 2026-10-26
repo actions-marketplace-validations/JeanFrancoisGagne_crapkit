@@ -25,7 +25,7 @@ Four tables hold them: `[crapkit]`, `[[scope]]`, `[[lane]]`, `[exclude]`.
 ```
 $ crapkit doctor
 resources: up to 8 analysis worker(s) per pool, 8 shared slot(s); lane log limit 16777216 bytes per file
-FAIL unknown key crapkit.churn_windo_months — crapkit ignores it (typo?); [crapkit] accepts these keys: alert_command, analysis_worker_budget, analysis_workers, churn_window_months, debt_max_age_months, diff_uncovered_max, log_max_bytes, max_parallel_lanes, mutation_command, mutation_timeout_seconds, mutation_workers, notes, ratchet_file, repayment_min_per_30d, scoped_tests, target, tighten_max_jump, worklist_floor, worklist_top
+FAIL unknown key crapkit.churn_windo_months - crapkit ignores it (typo?); [crapkit] accepts these keys: alert_command, analysis_worker_budget, analysis_workers, churn_window_months, debt_max_age_months, diff_uncovered_max, log_max_bytes, max_parallel_lanes, mutation_command, mutation_timeout_seconds, mutation_workers, notes, ratchet_file, repayment_min_per_30d, scoped_tests, target, tighten_max_jump, worklist_floor, worklist_top
 doctor: 1 problem(s)
 ```
 
@@ -39,53 +39,183 @@ an unknown parser, a lane naming an undeclared scope, a negative `timeout_second
 
 Without `--repo`, CLI commands find the nearest `crapkit.toml` at or above the
 current directory. A `.git` entry stops the search. With `--repo PATH`, that path
-names the exact project root; the flag belongs after the subcommand.
+names the exact project root; the flag belongs after the subcommand. A directory with
+none refuses with exit 3 and a line that names `crapkit init`, `--repo`, and the
+`crapkit.toml` files the checkout tracks, spelled from where you stand. `init` does
+not search: it writes `crapkit.toml` into `--repo PATH` or the current directory,
+each read by the rules below.
+
+`hook-precommit` also looks down. Git runs a hook at the repository's top, so when
+no `crapkit.toml` sits at or above it, the gate runs in each root below that owns a
+staged file, nearest configuration winning, and prints paths from the top. Outside a
+commit with nothing staged it runs in every root whose `crapkit.toml` git tracks.
+
+Git names every tracked file one way: relative to the root, with `/` between
+directories, in the letter case its index holds. crapkit reads each spelling below
+as that one before it compares the path with a scope, a mark or a stored row.
 
 | File argument | Meaning |
 |---|---|
 | Relative path with a discovered root | Relative to the current directory, then rebased to the project root. |
 | Relative path with explicit `--repo` | Relative to the named project root. |
-| Absolute source path | Accepted when it resolves inside the project root. |
+| Leading `./` | Dropped: `./src/a.py` is `src/a.py`. |
+| Absolute source path | Accepted when it resolves inside the project root, reached through a symlink, a junction or a lower-case drive letter too. |
 | Windows backslash | A directory separator on Windows; a literal filename character on POSIX. |
+| Letter case | On a disk that ignores case (Windows NTFS, macOS APFS by default), `SRC/App.py` names the file git lists as `src/app.py`, and crapkit uses git's spelling. On a case-sensitive disk (Linux ext4) the case has to match. |
+| Git Bash and WSL paths (Windows) | `/c/repo/src/a.py` from Git Bash or MSYS and `/mnt/c/repo/src/a.py` from WSL read as `C:\repo\src\a.py`, unless the current drive holds a literal `\c\repo`. This covers `--repo` too, for `init` as for every other command. |
+| Extended-length and admin-share paths (Windows) | `\\?\C:\repo`, `\\?\UNC\localhost\C$\repo` and this machine's own `\\localhost\C$\repo` read as `C:\repo`. |
+| Network share root (Windows) | A root on a network share, such as `\\server\share\repo` given to `--repo` or standing as the working directory, exits 3 before any lane starts and before `init` reads the tree. cmd.exe cannot start a command in a UNC directory and would run every lane in `C:\Windows`. The refusal ends with the command that fixes it, `Map the share to a drive letter (net use Z: \\server\share) and run crapkit from Z:\repo`. A root typed on a mapped drive keeps that letter, for the CLI and for an MCP call's `repo` alike. |
+| Bytes that are not UTF-8 | The path resolves as the OS spelled it, so a checkout under a directory named in Latin-1 places its files like any other. When the root-relative name itself is not UTF-8 and a file exists under it, the command exits 3 naming the rename, since no row can key that name. With no file behind it, each such byte reads as U+FFFD and the command answers as it does for a missing file. |
 
-These rules apply to source arguments such as `brief`, `rescore`, `test-scoped`
-and `claims release`. The `claude-hook` exception gets its root from its input
-payload. [MCP tools](agent-json.md#mcp-server) take project-relative paths because
-their CLI calls run at the server's selected root.
+    crapkit: src/caf\xe9.py is named in bytes that are not UTF-8, and crapkit reads every path as UTF-8: rename it (git mv) to a UTF-8 name
 
-Tracked Git paths preserve whitespace and Unicode separators. Their bytes must
-decode as UTF-8; invalid filename bytes are refused. Scope-prefix normalization
-below applies to configuration strings, not to the filenames Git reports.
-Output flags such as `--export`, `--sarif` and `--emit-baseline` are project-relative;
-an absolute output path explicitly selects a destination outside it.
+These rules apply to source arguments such as `brief`, `explain`, `rescore`,
+`test-scoped`, `ratchet move`, `mutate --files` and `claims release`, and to
+`next-item --exclude`, where a fragment drops a leading `./`, reads `\` as `/` on
+Windows and ignores letter case where the disk does. The `claude-hook` exception
+gets its root from its input payload, and reads the payload's `file_path` and `cwd`
+by the same rules. [MCP tools](agent-json.md#mcp-server) pass their `path` and
+`repo` to the same readers, so a relative path is relative to the server's
+selected root.
 
-Parsed source diffs use Crapkit's own Git settings. Display preferences, external
-diff commands and textconv do not change attribution. A supported source file
+A path in a CLI argument follows the rules of the OS it was typed on. A path
+crapkit reads out of a file follows one rule everywhere, because the file may come
+from the other OS: `crapkit.toml`, coverage reports and JUnit reports separate at `\`
+on every OS. So a tracked file whose name holds `\`, which Linux and macOS allow, is
+unsupported: a coverage report's key for it reads as a path with one more directory,
+and the file scores untested. `crapkit doctor` names each such file in one WARN:
+
+```
+$ crapkit doctor
+resources: up to 8 analysis worker(s) per pool, 8 shared slot(s); lane log limit 16777216 bytes per file
+...
+WARN 1 tracked file(s) hold \ in their name, which crapkit does not support: crapkit.toml, coverage reports and JUnit ids read \ as a directory separator, so such a file cannot be measured: src/pkg/we\ird.py; rename each without the \
+```
+
+`crapkit.toml` itself is committed and read on every OS, so each path it carries
+drops a leading `./` and reads `\` as `/`. Scope `paths`, `[exclude] globs` and
+`path_prefix` also drop a leading `/` and read from the root, and on a disk that
+ignores case, scope paths, `path_prefix` and `inputs` take the case their
+directories list. A scope path spelled absolutely (`/home/dev/repo/web`,
+`/c/repo/web`, `/mnt/c/repo/web`, `\\server\share\web`, `//server/share/web`,
+`C:/repo/web`) is refused at load with exit 3, with its relative spelling when it lands
+in this checkout.
+
+Tracked Git paths preserve whitespace and Unicode separators. crapkit reads every
+path as UTF-8, because rows, marks and caches are keyed on it. A file whose name
+Git reports in other bytes (a Latin-1 name made on Linux, which Git for Windows
+keeps in the index as it was) has no key, so crapkit runs the scope assignment
+itself (each scope's paths, its languages' extensions, its excludes) on the name,
+and the answer decides what happens:
+
+| The name | What crapkit does |
+|---|---|
+| A scope takes it: tracked, committed since the base, or staged | `inventory`, `coverage`, `verify`, `doctor`, `watch` and `hook-precommit` exit 3 with one line naming the path and `git mv`, before any lane runs, and print nothing else about it. Left out, it would be a source file no reader read, and the gate would pass it. `claude-hook` answers an edit to it, a Bash-written one included, with exit 2 and a two-line advisory naming the file and the rename. |
+| No scope takes it: tracked or staged | Left out of the run. stderr names it once, the first five such names one by one and then a count of the rest, and the command keeps its own exit code. `inventory --json`, `coverage --json` and `verify --json` list it in `unreadable_names`. |
+| It is untracked | A change like any other. A lane whose `inputs` hold it, or a lane with no `inputs` at all, reruns under `--reuse-unchanged`, and the rerun reason names the file. Nothing leaves it out, so no line names it. |
+
+    crapkit: src/caf\xe9.py is in scope 'src', but git names it in bytes that are not UTF-8 and crapkit reads every path as UTF-8; a file a scope takes is refused, not left out, so no gate passes it unread: rename it (git mv) to a UTF-8 name
+    crapkit: left out docs/r\xe9sum\xe9.txt: git names it in bytes that are not UTF-8, and crapkit reads every path as UTF-8; rename it (git mv) to have it read
+
+A commit that adds, edits or removes such a name also counts as a change to a lane
+whose `inputs` hold it, so `coverage --reuse-unchanged` reruns that lane.
+
+On Linux, `git mv $'src/caf\xe9.py' src/café.py` renames such a file. Git for Windows
+checks it out as `src/café.py` already, so there `git add -A` stages the rename.
+
+`init` has no scopes to assign with yet, so it prints the warning and writes the
+config; the first command that loads that config refuses a name a scope takes.
+
+Scope-prefix normalization below applies to configuration strings, not to the
+filenames Git reports.
+Output flags (`--export`, `--sarif`, `--emit-baseline` and `report --out`) are
+project-relative; an absolute output path selects a destination outside the project.
+Those flags, `verify --baseline-tsv`, `inventory --db`, `doctor --plugin-root` and the
+`CLAUDE_CONFIG_DIR` and `CRAPKIT_RESOURCE_DIR` variables read a Git Bash, WSL,
+extended-length or admin-share path as the drive it names, by the rows above. A
+relative `inventory --db` path is read from the working directory.
+
+On Linux and other POSIX systems Python hands a path to the OS in the locale's
+encoding. Under a locale that is not UTF-8 (`LANG=en_US.ISO-8859-1`), `pkg/café.py`
+would go out as `pkg/caf\xe9.py`, a file that does not exist. So `crapkit` (the
+console script and `python -m crapkit`) starts itself again once with `python -X
+utf8` when the filesystem encoding is not UTF-8 and UTF-8 mode is off, before it
+reads stdin, and every path it opens is spelled in UTF-8. Its own helper processes,
+the POSIX start gate that runs each command and the measurement owner that holds its
+outputs, start in UTF-8 mode with it, so an MCP tool reaches `pkg/café.py` as well. It
+sets the flag and not `PYTHONUTF8`, so lane and mutation commands keep the environment
+you gave them. `-X utf8=0` turns the restart off. Windows and macOS always spell paths
+in UTF-8.
+
+Under such a locale a Python lane's child still spells paths in the locale's
+encoding, so its coverage.py names `pkg/café.py` as `pkg/cafÃ©.py`. crapkit reads
+such a key back through the locale's encoding when `pkg/café.py` exists and
+`pkg/cafÃ©.py` does not, so the file's functions read as measured, as they do under
+a UTF-8 locale. `PYTHONUTF8 = "1"` in the lane's `env` has the child write UTF-8
+names in the first place.
+
+A checkout under a directory whose name is not UTF-8, or on a host whose name is
+not, works for every crapkit command: both names are hashed as the bytes the OS
+holds. coverage.py does not: its combine step fails under such a directory or host
+name, so a pytest-cov lane there fails at exit 5, and the failure line names the
+directory or the host name and the rename ([lanes](lanes.md#a-killed-run-leaves-its-coverage-shards-behind)).
+Rename the directory or the host to UTF-8.
+
+Parsed source diffs use crapkit's own Git settings. Display preferences, external
+diff commands and textconv do not change attribution. History reads do the same:
+`log.showSignature`, `log.follow` and `log.showRoot` change nothing in churn,
+`explain --history` or `ratchet report`, and a signed history walks without a
+signature check per commit. A supported source file
 marked binary by Git attributes receives a text fallback; ordinary binary files
-remain outside source decoding. Source text is read as UTF-8, then cp1252 as a
-fallback. UTF-16 source is outside that reader policy.
+remain outside source decoding. Source text is read as UTF-16 when the file opens
+with a UTF-16 byte-order mark (what PowerShell 5.1's `Out-File` and the ISE write),
+else as UTF-8, else as cp1252. A file with no byte-order mark that holds a NUL in at
+least half the even or odd positions of its first 8,000 characters is UTF-16 all the
+same; crapkit reads no function from it, and every gate fails on it as an unread file,
+naming it. Save it as UTF-8, or as UTF-16 behind its mark. Each of the five bytes
+cp1252 leaves undefined (0x81, 0x8D, 0x8F, 0x90, 0x9D) reads as the letter U+01NN, NN
+the byte (0x81 reads as `Ɓ`), so an identifier that holds one stays one name and the
+file scores as its UTF-8 twin does. No cp1252 file can spell those five letters, so no
+name read this way collides with one a file wrote.
+Inventory, the pre-commit gate, the advisory hook and `brief --json`'s `source` all
+read it that way. `mutate` writes a mutant back in the file's own encoding and
+changes no byte outside the mutated line. git's text fallback for a UTF-16 file
+counts a line at every 0A byte, and a character such as 上 (U+4E0A) holds one, so
+crapkit moves each changed range onto the text lines the scorer counts: an edit
+lands on the function it is in, whatever characters sit above it.
+A line ends at LF, CRLF or a lone CR, as Python and coverage.py read source. git's diff ends a line at LF only, so
+the commit gate, `rescore --gate`, `verify`, `mutate` and the advisory hook place each
+changed line by the bytes of the file it changed, and a new file saved with CR-only
+line ends has every function in it judged. `explain --history` hands `git log -L` the
+function's span in git's lines. A form feed, or any other character
+Python's `str.splitlines` also splits at, ends no line: `brief`, `mutate` and
+`duplication` count lines the way the scores do, and so does the shell reader's
+heredoc stripper. An istanbul lane's line numbers are placed the same way, since
+`@vitest/coverage-v8` ends a JavaScript line at LF only and Babel also ends one at
+U+2028 and U+2029; [the istanbul parser](lanes.md#what-the-istanbul-parser-reads)
+says how.
 
 ## `[crapkit]`
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
 | `target` | int >= 1 | `6` | The repo-wide CRAP ceiling. A `[[scope]]` may override it. Drives the gate, the `remedy` column, the ratchet drop threshold and every over-target count. |
-| `churn_window_months` | int >= 1 | `12` | How far back `git log` is read for churn weighting, coupling and the worklist rank. |
+| `churn_window_months` | int >= 1 | `12` | How far back `git log` is read for churn weighting, coupling and the worklist rank, counted back from HEAD's commit date, never from today. The months are counted on the UTC calendar, whatever `TZ` says, so a CI runner and a laptop cut the same window; a day the earlier month lacks rolls into the next, as git rolls it (6 months before Aug 31 is Mar 3). A commit counts when its commit date is at or after that instant. |
 | `worklist_floor` | int >= 1 | `5` | Minimum ccn for queue admission, in `worklist` and `next-item` alike. Printed in the worklist header as `floor ccn>=5`. It has no CLI flag. Two rules reach under it: files whose churn weight is in the top 10% are promoted down to ccn 3, and a function scoring over its ceiling is admitted whatever its ccn. |
 | `worklist_top` | int >= 1 | `50` | Cap on the worklist active list. `worklist --top N` overrides it per call. |
-| `ratchet_file` | string | `"crapkit-ratchet.tsv"` | The committed marks file, repo-relative. |
-| `alert_command` | string | `""` | A shell command that receives a digest or override body on **stdin**. `digest --alert` uses it, and an override refuses to grant without it. Never interpolated into the shell string. |
+| `ratchet_file` | string | `"crapkit-ratchet.tsv"` | The committed marks file, repo-relative. `\` separates directories on every OS and a leading `./` is dropped, so `gates\ratchet.tsv` written on Windows and `./gates/ratchet.tsv` both open `gates/ratchet.tsv` on Linux. |
+| `alert_command` | string | `""` | A shell command that receives a digest or override body on **stdin**, as UTF-8 with LF line ends on every OS. `digest --alert` uses it, and an override refuses to grant without it. Never interpolated into the shell string. It runs under sh, and under cmd.exe on Windows, which has no `cat`. To append each alert to a log: `alert_command = "cat >> .crapkit/alerts.log"` under sh, `alert_command = 'findstr "^" >> .crapkit/alerts.log'` on Windows. When it exits non-zero, an override grants nothing, `digest --alert` exits 5 after printing the digest, and each refusal quotes the last 300 characters the command printed as plain text, with escape codes removed and line ends read as LF. It quotes stderr when stderr holds text once the escape codes are gone, else stdout. |
 | `scoped_tests` | table | none | Written as its own table, `[crapkit.scoped_tests]`, mapping scope name to a command template. `test-scoped` fills `{files}` with the quoted file list; a template with no `{files}` runs as written, which is how a scope runs its whole suite when its tests live outside its own `paths`. `init` picks the form per scope from the tracked files: `{files}` only where the scope's own paths hold a test file; the whole-suite form otherwise, naming the repo's test directory unless pytest's `testpaths` already collects it; `npm run test -w <dir>` for an npm workspace with a test script; and the runner's related-tests mode (`npx vitest related --run {files}`, `npx jest --findRelatedTests {files}`) for a root JavaScript scope, keyed by what package.json names. One comment line above each entry says which form it chose. It is also step 4 of the burn-down loop and `brief`'s `commands.scoped_tests`, so **doctor warns** about a scope a lane measures with no template behind it (`null` there leaves a session with nothing to run between the gate and verify) and **doctor fails** a `{files}` template on a scope that holds no test file, since that template hands the runner a source path and collects nothing. |
 | `notes` | array of string | `[]` | House rules for this repo, in the config rather than in a file an agent has to find. `brief` carries them into the packet as `notes`, repo-wide lines first, then the scope's own. crapkit never parses them. |
-| `mutation_command` | string | `""` | The suite run once per mutant. A nonzero exit means the mutant was killed, so the command is also run **once against the unmutated tree** before the first mutant and must exit 0 there: without that baseline a command that cannot start here killed every mutant and scored 100%. `mutate` refuses to run without it. Shell and PowerShell files in the diff are skipped and named on stderr: `<` and `>` are redirections in both, so their mutants would be noise. So is every file outside the scored corpus (a test file, an excluded path, a file over `max_file_bytes`, a file no scope claims): `mutate` never mutates a test, and a diff with nothing left says `nothing to mutate` at exit 0 without running the command. |
-| `mutation_timeout_seconds` | int >= 1 | `300` | Per-mutant timeout. Expiry counts as killed, and the kill takes the suite's whole process tree, so a looping mutant does not outlive the run that gave up on it. At the default cap of 100 mutants this bounds one `mutate` run at over 8 hours, so lower it for a slow suite. |
+| `mutation_command` | string | `""` | The suite run once per mutant. A nonzero exit means the mutant was killed, except exit 5, pytest's code for a run that collected no test: no test judged that mutant, so it gets **no verdict**. Its progress line says `no verdict: the suite ran no test (exit 5), counted killed`: it still counts as killed, as it did in 0.8.0, and the summary names how many of the killed ran no test; `--json` counts it as `no_verdict`, a count inside `killed`. The command is also run **once against the unmutated tree** before the first mutant and must exit 0 there: without that baseline a command that cannot start here killed every mutant and scored 100%. `mutate` refuses to run without it. Shell and PowerShell files in the diff are skipped and named on stderr: `<` and `>` are redirections in both, so their mutants would be noise. So is every file outside the scored corpus (a test file, an excluded path, a file over `max_file_bytes`, a file no scope claims): `mutate` never mutates a test, and a diff with nothing left says `nothing to mutate` at exit 0 without running the command. |
+| `mutation_timeout_seconds` | int >= 1 | `300` | Per-mutant timeout. Expiry counts as killed and is reported apart: the progress line says `timed out, counted killed`, the summary says how many of the killed timed out, and `--json` counts them as `timed_out`, a count inside `killed`. The kill takes the suite's whole process tree, so a looping mutant does not outlive the run that gave up on it. At the default cap of 100 mutants this bounds one `mutate` run at over 8 hours, so lower it for a slow suite. |
 | `mutation_workers` | int >= 1 | `1` | Mutants run at once. Every worker uses a kept detached Git worktree, including one. See [mutation worktrees](#mutation-worktrees) for preparation, concurrent runs and cleanup. |
 | `diff_uncovered_max` | int >= 0 | absent | Ceiling on changed lines that never ran. **Absent means warn only**: `verify` still prints `warning: N changed line(s) have no coverage` on stderr and lists the first 20, but exits 0. Set it and a breach exits 9. A changed file no lane artifact mentions, such as a new module no test imports, counts every line of its functions (flag `untested`); its lines outside any function do not count, because no artifact says which of them are statements. |
 | `debt_max_age_months` | int >= 0 | absent | `ratchet report --enforce` flags open marks older than this (counted at 30 days per month). |
 | `repayment_min_per_30d` | int >= 0 | absent | `ratchet report --enforce` flags a burn-down that repaid fewer marks than this in the last 30 days while debt is open. |
 | `max_parallel_lanes` | int >= 1 | `1` | Lanes running at once. `1` is strictly serial. See [lanes.md](lanes.md#running-lanes-in-parallel). |
 | `analysis_workers` | int >= 0 | `0` | Requested analysis pool ceiling. `0` sizes pools automatically to balance startup cost and available work, within the process-visible CPU limit. Small or cached passes remain serial. Runnable chunks and the shared budget can admit fewer workers. |
-| `analysis_worker_budget` | int >= 0 | `0` | Shared pool slot ceiling for Crapkit processes running as the same user on this host. `0` uses available CPUs. Admission never waits: a busy pool gives up slots, falling back to the calling process when none are free. See [resource policies](resources.md). |
+| `analysis_worker_budget` | int >= 0 | `0` | Shared pool slot ceiling for crapkit processes running as the same user on this host. `0` uses available CPUs. Admission never waits: a busy pool gives up slots, falling back to the calling process when none are free. See [resource policies](resources.md). |
 | `log_max_bytes` | int >= 0 | `16777216` | Maximum bytes in each current and previous lane log, 16 MiB by default. Rotation keeps recent output and preserves no-progress accounting. `0` retains unlimited direct logs. |
 | `tighten_max_jump` | number >= 1 | `2.0` | How far a function's CRAP may move between two runs of the **same commit** and still tighten its mark. Past this factor, `verify` holds the mark and prints one `NO TIGHTEN` line on stderr naming the function and both values. One commit measured twice cannot have improved, so a jump that size is the measurement talking, not the code. See [ratchet.md](ratchet.md#damping-a-measurement-that-bounces). |
 
@@ -98,11 +228,11 @@ flag. Delete them.
 ### Mutation worktrees
 
 Every mutation worker runs in a detached Git worktree, including the default of one.
-Crapkit re-prepares each worker at the current HEAD, then replays dirty, untracked
+crapkit re-prepares each worker at the current HEAD, then replays dirty, untracked
 and deleted inputs before running the unmutated baseline and the mutants.
 
 The kept pool lives at `.crapkit/mutate-pool/w0..wN` and remains between runs.
-On reuse, Crapkit removes surplus worker directories under the pool's exclusive
+On reuse, crapkit removes surplus worker directories under the pool's exclusive
 lease, so reducing `mutation_workers` also reduces retained checkouts.
 `crapkit mutate --drop-pool` removes the kept pool and exits.
 
@@ -181,10 +311,28 @@ Read the ones you are about to point a scope at. Skip the rest.
 **`shell` and `powershell` report functions only.** Statements outside any function land in
 lizard's `*global*` pseudo-function, exactly like Python module-level code. A script that is
 one long top-level sequence reports nothing. That is the answer, not a parse failure.
+A shell `?` is a glob character and costs nothing, except inside `(( ))` and `$(( ))`,
+where bash reads C: there `a ? b : c` counts one in `ccn` and `cognitive`, and the `;;`
+of `for ((;;))` is no case arm.
 
 **`powershell` counts one point per `switch` arm**, the way `case` is counted in C, and
-`default` is free. Its keywords are matched case-sensitively as written, so `If (` in code
-counts nothing.
+`default` is free. The arms cost the same in `ccn_mod`, so the gate reads a twelve-arm
+switch as 13, not 2. Keywords count in any case, as PowerShell reads them: `If (` is an
+`if` and `Default` is the free arm. A keyword word that is a command, an argument or a
+member is no keyword in any case: `$xs | foreach { }` is the ForEach-Object alias and
+`git switch main` runs git, so neither costs anything, and a hashtable key such as
+`@{ if = 1 }` is a key. `-and`, `-or` and `-xor` in a command's arguments are that
+command's parameters, as PowerShell reads them: `if (Test-Path $a -or $b)` hands `-or`
+to Test-Path, which fails at run time, so only the `if` counts. Write
+`(Test-Path $a) -or $b` for the operator.
+
+**`powershell` gives a class's methods no row.** Their decisions count toward no function,
+not toward the function that declares the class, so nothing gates a method's complexity.
+Move logic you want gated into a function.
+
+**`shell` reads a keyword only where a command starts**, as the shell does. `echo done`,
+`state=done`, `[ "$s" = done ]`, `m[for]=3`, `arr=(if done)`, `echo $(date) done` and a
+case pattern such as `done)` cost nothing.
 
 **Pester test files need a glob of your own.** Pester names them `Foo.Tests.ps1`, beside the
 source they test, and no default exclude claims that spelling. `**/*.test.*` does not match
@@ -209,8 +357,8 @@ a mapping.
 Two more things before you point a scope at C code:
 
 - Both arms of an `#ifdef` fork are textually present, so a platform shim defines the same
-  function twice in one file. Each arm takes its own ratchet key — the first as written,
-  later ones suffixed `#2`, `#3` in file order — so both are marked and both are gated.
+  function twice in one file. Each arm takes its own ratchet key (the first as written,
+  later ones suffixed `#2`, `#3` in file order), so both are marked and both are gated.
   `analyze` prints one stderr line naming any file this happens in. See
   [Twins](ratchet.md#twins-one-name-several-functions).
 - A `&&` before a function's opening brace declares an rvalue reference, not a decision, and
@@ -223,19 +371,91 @@ Two more things before you point a scope at C code:
 HTML attributes to lizard and contribute nothing, so a component whose branching lives in its
 template reports only what its methods do.
 
-**`zig` reads one point high on `switch`.** It counts the `else` prong as one more case. The
-error is inflation only: it can cost a refactor that was not needed, never hide one that was.
+**`zig` counts each `switch` prong but the default**, the way C counts each `case` but
+`default`: `else =>` and `_ =>` are free, and `1, 2 =>` is one prong. The modified column
+reads the switch once, as it does a C `switch`. A Go `select` is Go's switch over channel
+operations and reads once there too. `try`, the `?` of an optional and the `||` that merges
+error sets decide nothing and cost nothing in `cognitive`; `try` and `?` open no `nesting`
+level either.
 
 **`rust`, `shell` and `powershell` run on crapkit's own readers.** lizard has neither a shell
 nor a PowerShell reader, and its Rust reader scores a 7-arm `match` as ccn 2 (filed upstream
-as lizard #494), so crapkit counts each non-wildcard arm the way C counts a `case`. The Rust
-module retires itself the day upstream fixes it.
+as lizard #494), so crapkit counts each non-wildcard arm the way C counts a `case`. Where
+lizard reads a Rust token as the C token of the same spelling, crapkit reads it as Rust: a
+signature decides nothing, so a `where` clause, a `?Sized` bound and a `for<'a>` binder
+add nothing to ccn; a `for<'a>` binder or the `for` of `impl Trait for Type` is no loop
+in a function's body either; a `||` or `&&` with no operand before it (`move || n`,
+`|&&x|`) is no operator in any column; and a let-else is one decision. A signature that
+ends in `;`, such
+as a trait's required method or a foreign function, is no function, and neither is a `fn`
+pointer type, `Vec<fn(i32) -> bool>` included. A comma inside a parameter's type or
+pattern parts no parameters, and a parameter that binds a pattern, `[a, b]: [u8; 2]`,
+counts once. crapkit also reads a Rust `#` as Rust does: lizard took `#[inline] fn f() {` on
+one line for a C preprocessor line and listed no function, and lost the code after a raw
+string (`r#"..."#`) or a raw identifier (`r#type`). Each correction retires the day upstream
+fixes its defect.
+
+**`go` and `zig` run on subclasses of lizard's readers.** lizard reads a function type as a
+function: after `var hooks []func()` the next Go function had no row, and a local `var cb
+func(int) error` took the enclosing function's next `if` block as its own body. crapkit ends
+a signature where the language does: at its body's `{`, at a `,` `;` `=` or closing bracket
+that belongs to the code around it, at a Go line break where the spec inserts a semicolon,
+and at a Zig `fn (`, which is always a type. A result type's braces (`struct{ a int }`,
+`error{Oops}!u8`) are not the body, and a parameter of function type, `f func(int, string)
+error`, counts once. A `func` right after `]` is an element type, so `[]func(){f, g}` is a
+literal and lists no function. The `type` of a Go type switch, `switch v.(type) {`, declares
+no type, so the switch's `}` no longer ends the function around it. Each `\\` line of a Zig
+multiline string is text. A Zig name written
+as a string, `fn @"weird name"(x: i32)`, names its function, and its handle is the whole
+`@"weird name"`. The Zig reader also counts switch prongs, as the paragraph above says.
 
 The cognitive column charges a Rust `match` like a `switch`: +1 plus the nesting it sits
 in, arms free. The two columns therefore say different things about one block on purpose.
 The 7-arm match above is ccn 7 and cognitive 1: seven ways through it, one decision to
-read. The rule is Rust's alone, because `match` is a soft keyword in Python and an
-ordinary identifier anywhere else.
+read. A Python match statement costs the same. `match` is a soft keyword there, so the
+rule reads the statement, not the word: `match = re.match(p, s)` costs nothing. A guard
+on an arm or a case (`x if x < 0 =>`, `case int() if v < 0:`) costs what an `if` one
+level inside the match costs: +2 in a match at the top of a function. Rust keeps its own
+set in both reported columns too:
+`loop` is charged as a loop and opens a nesting level, `?` is neither an increment nor
+a level (an early return, or the relaxed bound in `?Sized`), and `catch`, `switch`,
+`foreach`, `case` and `def` are names. The nesting column reads the same pass, so the
+`for` of a `for<'a>` binder, and of a trait implemented inside a function, opens no
+level there either.
+
+**A `//` comment ends at its line, except in `cpp` and `objectivec`.** That holds even when
+the comment ends in a backslash (`// C:\dir\`). lizard read such a comment on into the next
+line in every language, as the C preprocessor splices lines, so that line counted as
+comment: a function whose signature sat there had no row, and one whose `if` sat there
+ended at that `if`'s `}`. crapkit ends the comment at its line in `go`, `zig`, `java`,
+`javascript`, `typescript`, `tsx`, `vue`, `swift` and `rust`. C, C++ and Objective-C keep
+the splice, because their preprocessor joins the lines before it reads any comment.
+
+**`cpp`, `objectivec` and `java` run on lizard's readers with crapkit's fixes on top.** A
+file none of the fixes touches reads exactly as lizard reads it. lizard hid every function
+after some constructs: a `<` comparison in a default template argument, a C++20
+requires-clause, a Java annotated local variable or an enum constant with a body. It named
+rows after an attribute, `int run(int a) __attribute__((cold))`, a macro,
+`STRINGLIB(find)(const char *s)`, or a return type, `int (*get(int k))(int)`, and it
+counted neither an unnamed parameter, `f(int*, char)`, nor an array, `f(int a[4])`.
+crapkit lists, names and counts them. The
+[upgrading notes](upgrading.md#c-c-objective-c-and-java-rows) list
+every row that moved.
+
+**`swift` runs on crapkit's own reader too.** lizard's Swift reader took `super.init(...)`,
+`r.get()`, `Socket(protocol: p)`, `return type` and `#fileID` for a declaration or a
+preprocessor line, so it hid the functions after them and stretched the one holding them
+over its neighbours. crapkit reads each as the name or literal it is, and lists a function
+named by a raw identifier (``func `keeps onboarding if offline`()``, as Swift Testing names
+tests) under that name, backticks included. It also counts Swift decisions the way the
+McCabe text does: each `a ?? b` is one, and so is each `?` of an optional chain (`a?.b`,
+`f()?.g`, `c?()`), which adds to `ccn` only, as `?.` does in TypeScript. The `case` of
+`if case`, a keyword argument label such as `func value(for name: String)`, and an
+optional mark (`(any Error)?`, `[Int]?`, `Int?.self`, and `Empty?.none` or
+`Int?.some(1)`, which name a member of the optional type) are none. A conditional
+operator's `?`, which Swift writes with spaces on both sides, still counts. The
+expression in a string interpolation, `\( )`, is code and counts like any other; the text
+around it, a multi-line string's included, is not.
 
 ### Scope matching
 
@@ -294,22 +514,49 @@ An array of tables. One lane per coverage command. Full recipes in [lanes.md](la
 
 | Key | Type | Required | Default | What it does |
 |---|---|---|---|---|
-| `name` | string | yes | | The lane's id. Names its log at `.crapkit/lane-<name>.log` and `coverage --lane`. |
-| `command` | string | yes | | Run through the shell, cwd at the repo root unless `cwd` says otherwise. Its exit code is recorded, not enforced: a suite with known failures still writes a valid artifact. crapkit reads it with the shell that will run it, sh on POSIX and cmd.exe on Windows, and so does `doctor`. That reading covers quoting, carets, `&&` segments, redirections and `;`: [How a lane command is read](lanes.md#how-a-lane-command-is-read). |
-| `artifact` | string | yes | | Repo-relative path to the coverage file the command writes. Its absence after the command (and its retries) is the failure. Two lanes may not share an artifact path. Point it under `.crapkit/cov/`, which `init` already gitignores; `doctor` warns about a lane writing at the repo root. See [Where artifacts live](lanes.md#where-artifacts-live). |
+| `name` | string | yes | | The lane's id. Names its log at `.crapkit/lane-<name>.log` and `coverage --lane`. Since the log is a file, the loader refuses on every OS, exit 3, a name Windows cannot use as a file name: one holding `<`, `>`, `:`, `"`, `/`, `\`, `\|`, `?`, `*` or a control character, a device name (`CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, or `COM` or `LPT` and a digit, 0 to 9, `¹`, `²` or `³`, with or without an extension, such as `nul.txt`), a name that ends in a dot or a space, and an empty name. Two lanes whose names differ only in case are refused too, since Windows and macOS give them one log file. |
+| `command` | string | yes | | Run through the shell, cwd at the repo root unless `cwd` says otherwise. Its exit code is recorded, not enforced: a suite with known failures still writes a valid artifact. crapkit reads it with the shell that will run it, sh on POSIX and cmd.exe on Windows, and so does `doctor`. That reading covers quoting, carets, backslashes, `&&` segments, blocks, redirections, `;`, line breaks and comments: [How a lane command is read](lanes.md#how-a-lane-command-is-read). A `{python}` or `{python:DIR}` token names the interpreter so one committed line runs on every OS: [The launcher token](#the-launcher-token). |
+| `artifact` | string | yes | | Repo-relative path to the coverage file the command writes. Its absence after the command (and its retries) is the failure. Two lanes may not share an artifact path. Point it under `.crapkit/cov/`, which `init` already gitignores; `doctor` warns about a lane writing at the repo root. `\` separates directories on every OS and a leading `./` is dropped, here and in `results_artifact`. See [Where artifacts live](lanes.md#where-artifacts-live). |
 | `parser` | `istanbul` \| `coveragepy` | yes | | How to read the artifact. |
 | `scopes` | array of string | yes | | Which scopes this lane's coverage speaks for. A scope in no lane's list can only score `no-lane`. |
-| `cwd` | string | no | repo root | Repo-relative working directory for the command. `doctor` fails when it does not exist. |
-| `path_prefix` | string | no | `""` | Prefix joined onto coverage.py's relative paths, for a suite run from a subdirectory. A coveragepy key: the istanbul reader never reads it. It only ever prepends, so it cannot rebase a path the runner wrote absolutely, which is the runner's own switch instead ([The same tree, spelled absolutely](lanes.md#the-same-tree-spelled-absolutely)). |
-| `env` | table of string | no | `{}` | Extra environment for the command, merged over the inherited environment. Use it to cap a runner that sizes its own worker pool from free memory, and to hand a junit reporter its output path when the reporter reads no path off the command line (`jest-junit` is one). Every lane gets it, so raising `max_parallel_lanes` without one lets N lanes each claim the whole box. A `PATH` here **replaces** the inherited one for that lane, and `doctor` looks for the lane's runner on it, so a lane that ships its own toolchain is checked the way it runs. |
-| `inputs` | array of string | no | `[]` | Root-relative paths the command reads: its source, tests, fixtures and runner config. With them, `--reuse-unchanged` reuses the lane while the commit its artifact was built at is still behind HEAD, no committed, staged, unstaged or untracked change touches these paths (a lane's declared `artifact` or `results_artifact` is not such a change), the artifact bytes still match, and this lane's own table, `env` included, is the one it was measured with. Other `crapkit.toml` settings and environment variables the lane does not set are outside that proof. Without `inputs` a lane is reused only at the same clean HEAD. Entries are literal paths, no globs: an entry holding `*` or `?`, or one that is absolute or climbs out of the root, is a config error. An entry that matches no tracked file, and no untracked file outside `.gitignore`, such as a misspelled directory, still loads, but reuse can see no change through it, so `doctor` fails on it. A file the command reads that the list leaves out is never checked, so an edit to it reuses a stale artifact. See [Reusing artifacts](lanes.md#reusing-artifacts). |
-| `full_suite` | bool | no | `true` | `false` permits a positional argument in a pytest coverage command. At `true`, a positional is a config error: subset coverage under a suite with cross-file pollution is run-order dependent. A flag's value is not a positional (`-n 8`, `-o timeout=300`, `-p no:randomly` all pass), and the command is read by the shell that will run it, one argv per `&&`, `\|\|`, `&` or `\|` segment, with every segment that runs pytest checked. On cmd.exe a `;` starts nothing, so `pytest --cov; echo done` hands pytest `echo` and is refused; write the second command after `&&`. Use double quotes for values, since cmd.exe does not treat `'` as a quote. Set it false deliberately for a genuinely scoped suite. |
+| `cwd` | string | no | repo root | Repo-relative working directory for the command. `\` separates directories on every OS and a leading `./` is dropped, so `backend\` written on Windows is `backend/` on Linux. `doctor` fails when it does not exist. `coverage` fails such a lane without starting the command, `lane 'py' FAILED: cwd <path> is not a directory, so the command never ran; fix cwd = 'nope' for this lane in crapkit.toml, or create that directory`, and exits 5 when no lane is left. |
+| `path_prefix` | string | no | `""` | Prefix joined onto coverage.py's relative paths, for a suite run from a subdirectory. Read like a scope path: `api\`, `./api/`, `.\api\` and `/api/` all read `api/`, `.` reads as no prefix, and on a disk that ignores case `API/` takes the case the directory lists. A coveragepy key: the istanbul reader never reads it. It only ever prepends, so it cannot rebase a path the runner wrote absolutely, which is the runner's own switch instead ([The same tree, spelled absolutely](lanes.md#the-same-tree-spelled-absolutely)). |
+| `env` | table of string | no | `{}` | Extra environment for the command, merged over the inherited environment. Use it to cap a runner that sizes its own worker pool from free memory, and to hand a junit reporter its output path when the reporter reads no path off the command line (`jest-junit` is one). Every lane gets it, so raising `max_parallel_lanes` without one lets N lanes each claim the whole box. crapkit adds `PYTHONIOENCODING=utf-8` unless this table sets it ([why](lanes.md#a-python-child-writes-its-log-in-utf-8)). A `PATH` here **replaces** the inherited one for that lane, and `doctor` looks for the lane's runner on it, so a lane that ships its own toolchain is checked the way it runs. |
+| `inputs` | array of string | no | `[]` | Root-relative paths the command reads: its source, tests, fixtures and runner config. With them, `--reuse-unchanged` reuses the lane while this clone holds the commit its artifact was built at, no committed, staged, unstaged or untracked change touches these paths between that commit's tree and the working tree (a lane's declared `artifact` or `results_artifact`, and an untracked file the lane's own run wrote, are not such changes), the artifact bytes still match, this lane's own table, `env` included, is the one it was measured with, and so is the crapkit version. The check compares trees, so a message-only amend or a rebase that leaves these paths as they were reruns nothing. Gitignored files under these paths, other `crapkit.toml` settings and environment variables the lane does not set are outside that proof, and the line that reuses the lane says so. Without `inputs` a lane is reused only at the same clean HEAD. Entries are literal paths, no globs: an entry holding `*` or `?`, or one that is absolute or climbs out of the root, is a config error. An entry that matches no tracked file, and no untracked file outside `.gitignore`, such as a misspelled directory, still loads, but reuse can see no change through it, so `doctor` fails on it. A file the command reads that the list leaves out is never checked, so an edit to it reuses a stale artifact. See [Reusing artifacts](lanes.md#reusing-artifacts). |
+| `full_suite` | bool | no | `true` | `false` permits a positional argument in a pytest coverage command. At `true`, a positional is a config error: subset coverage under a suite with cross-file pollution is run-order dependent. A flag's value is not a positional (`-n 8`, `-o timeout=300`, `-p no:randomly` all pass), and the command is read by the shell that will run it, one argv per `&&`, `\|\|`, `&` or `\|` segment, blank beside the operator or not, with every segment that runs pytest checked. On cmd.exe a `;` starts nothing, so `pytest --cov; echo done` hands pytest `echo` and is refused; write the second command after `&&`. Use double quotes for values, since cmd.exe does not treat `'` as a quote. A positional that names a testpaths entry in another letter case, on a disk that ignores case, names that entry. Set it false deliberately for a genuinely scoped suite. |
 | `container_ok` | bool | no | `false` | Lets a `coveragepy` lane run inside a container. Without it such a lane refuses with exit 5 whenever `/.dockerenv` exists or `CRAPKIT_INSIDE_CONTAINER=1`. |
 | `results_artifact` | string | no | `""` | A JUnit XML report, under `.crapkit/cov/` for the same reason as `artifact`. Two checks read it and neither runs without it: no-new-failures (`verify` exit 8) and the crashed-worker trust check, plus the suite-shrink warning. `doctor` WARNs on a `coveragepy` or `istanbul` lane that declares none, naming both, and `crapkit init` writes it on the lanes it detects. Declared but missing is exit 5, so the check can never pass vacuously, and so is a report saying the run never finished ([a crashed xdist worker or a session error](lanes.md#a-junit-that-says-the-run-did-not-finish)). Under `--reuse-artifacts` both of those are one warning instead, and the lane records no test counts: there the operator is reading a report off disk, which can be the junit of a run whose coverage was salvaged by hand. |
 | `timeout_seconds` | int >= 0 | no | `0` | crapkit kills the command past this. The kill takes the whole process tree, not just the shell, and crapkit waits for it, so no orphan suite keeps running after the lane fails. `0` means no crapkit-owned timeout. |
 | `no_progress_seconds` | int >= 0 | no | `0` | crapkit kills the command when its log has not grown for this many seconds. `timeout_seconds` has to be longer than your slowest honest run, so it cannot cut a suite that hangs early without cutting the slow ones too; this one measures output instead. Set it above the longest quiet stretch the runner has, since a silent build step before the tests looks the same as a hang. `0` means no progress watch. See [lanes.md](lanes.md#a-suite-that-stops-making-progress). |
 | `retries` | int >= 0 | no | `0` | Reruns after a timeout or a missing artifact. Each attempt appends to the lane log under an `--- attempt N ---` header, and a failure message hoists its cause out of the last attempt alone, so the attempts before it are readable only in the log the message names. |
 | `retest_command` | string | no | `""` | Rerun template for newly failed tests, before exit 8 is decided. See [lanes.md](lanes.md#flake-retest). |
+
+### The launcher token
+
+A committed `crapkit.toml` runs on every OS its collaborators use, and the path to a
+venv's python differs between them. A lane naming `.venv\Scripts\python.exe` fails on
+Linux, and one naming `.venv/bin/python` fails under cmd.exe. The loader replaces a
+launcher token with the spelling of the OS reading the file:
+
+| Token | Windows | Linux and macOS |
+|---|---|---|
+| `{python}` | `python` | `python3` |
+| `{python:.venv}` | `.venv\Scripts\python.exe` | `.venv/bin/python` |
+| `{python:api/.venv}` | `api\.venv\Scripts\python.exe` | `api/.venv/bin/python` |
+
+`DIR` is the venv directory, written with `/`, and the shell reads it from the lane's
+`cwd` like any other path in the command. The token works in a lane's `command` and
+`retest_command`, in `[crapkit.scoped_tests]` templates beside `{files}`, and in
+`mutation_command`. The replacement happens at load, so the full-suite guard,
+`doctor`'s interpreter probe and every run read the command the shell will run.
+Text that only looks like the token, such as `{PYTHON}` or `{python:}`, stays as
+written.
+
+`crapkit init` writes `{python:DIR}` for a venv it finds in the tree and `{python}`
+where no venv carries pytest. A machine where that name does not resolve keeps the
+name that does, such as `py` on a Windows PATH with only the launcher. A lane behind
+a lockfile's manager keeps `uv run python` and its siblings, since the manager picks
+the interpreter. See [lanes.md](lanes.md#the-interpreter-a-lane-binds-to).
 
 ---
 
@@ -319,6 +566,28 @@ An array of tables. One lane per coverage command. Full recipes in [lanes.md](la
 |---|---|---|---|
 | `globs` | array of string | `[]` | Paths matching any glob leave the corpus. Each glob matches the **whole** repo-relative path, case-insensitively, and a leading `**/` matches zero or more directories, so one glob covers the repo root and every nested copy. |
 | `max_file_bytes` | int >= 0 | absent (no limit) | Files larger than this leave the corpus entirely, minified blobs included. `doctor` reports each one as a `note`, never a FAIL, and the count surfaces as `skipped_max_bytes` in `inventory --json` and `coverage --json`. |
+
+A glob is read the way a scope path is, so a config written on either OS excludes the
+same files on both:
+
+- `\` separates directories on every OS: `src\gen\**` reads `src/gen/**`, and
+  `**\gen\**` reads `**/gen/**`.
+- A leading `./` or `/` is dropped: `./src/gen/**` and `/src/gen/**` read
+  `src/gen/**`, from the root and never from the filesystem's.
+- A trailing `/` names the directory's contents, as in .gitignore: `src/gen/` reads
+  `src/gen/**`.
+
+`crapkit doctor` WARNs on each glob that matches no tracked file and quotes it as
+written, with the spelling the loader reads when that differs. Such a glob excludes
+nothing, so the files it was meant for stay scored. The globs `init` writes by default
+are left out, since they guard trees a repo may never track.
+
+```
+$ crapkit doctor
+resources: up to 8 analysis worker(s) per pool, 8 shared slot(s); lane log limit 16777216 bytes per file
+...
+WARN [exclude] glob './src/gen/**' matches no tracked file (read as 'src/gen/**'), so it excludes nothing; fix the path or delete the glob
+```
 
 Test directories are excluded **unconditionally**, before `globs` is consulted: any path
 component matching `test`, `tests` or `__tests__`, case-insensitively. You do not need a
@@ -387,8 +656,9 @@ note app/core.py (181 bytes) skipped: over max_file_bytes
 ## Tuning the parallelism knobs
 
 `doctor --tune` reads this machine's cpu count and whatever lane durations are already
-recorded in `.crapkit/artifacts.json`, and prints paste-ready lines. It writes nothing and
-runs nothing:
+recorded in `.crapkit/artifacts.json`, or, for a lane with none, the time its
+`results_artifact` JUnit report claims, and prints paste-ready lines. It writes nothing
+and runs nothing:
 
 ```
 $ crapkit doctor --tune
@@ -400,8 +670,20 @@ mutation_workers = 6
 # lane cost: 1.2s serial -> ~1.2s across 1 lane slot(s)
 ```
 
-The cost line needs at least one recorded lane duration. With none it says so and the
-suggestion comes from the cpu count alone. The suggestion never proposes more lane slots
+The cost line needs at least one lane duration. With none it says so and the suggestion
+comes from the cpu count alone. Its estimate assumes the order a parallel run starts lanes
+in, longest first, and the two read each lane's duration the same way. A lane's duration is the one `crapkit coverage`
+recorded the last time it ran the lane, else the `time` attributes of the lane's
+`results_artifact`. A lane with neither, a stamp with no usable `seconds` or a junit
+report that is missing, unreadable (not UTF-8, or not XML) or carries no `time` is an
+unknown cost, not a cost of 0, and stops neither command: the sum leaves it out, both numbers become lower bounds, and the line names it. For
+lanes of 100 s, unknown and 30 s:
+
+```
+# lane cost: 130.0s serial -> ~100.0s across 3 lane slot(s) for 2 of 3 lanes; cost unknown for 'b', which recorded no duration yet (crapkit coverage records one when it runs a lane)
+```
+
+The suggestion never proposes more lane slots
 than there are lanes, and it stays at 1 while one `coveragepy` lane deletes and combines
 another's coverage.py data files, as a lane left on `.coverage` does to a lane on
 `.coverage.b` in the same directory: a `# held at 1:` line names them and the `COVERAGE_FILE`

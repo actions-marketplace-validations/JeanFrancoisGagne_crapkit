@@ -1,22 +1,38 @@
-"""Parse `git diff -U0` output into per-file changed line ranges. Pure.
+"""Parse `git diff -U0` output into per-file changed line ranges. Pure but for
+`worktree_ranges`, which reads the files a working-tree diff names.
 
 Ranges are new-side. A pure deletion (zero new lines) still marks the line it
 happened at, so a function shrunk by an edit is still a touched function.
 Paths come from the +++ header (the new side survives renames) and decode
-git's C-style quoting through the shared path decoder.
+git's C-style quoting through the shared path decoder. A path whose bytes are
+not UTF-8 keeps them as surrogates: no row is keyed on it, and the scope
+assignment refuses it when a scope takes it (gitpaths, universe).
 
 Hunk body lines are consumed by the counts the @@ header declares, never
 pattern-matched: an added source line whose text starts with "++ " arrives as
 "+++ <text>" and would otherwise read as a file header, repointing every later
 hunk at a phantom path the gate never checks.
+
+`changed_ranges` answers in git's line numbers, and git ends a line at LF only.
+Function spans and coverage lines come from readers that also end a line at a
+lone CR (analyze.decode_source, Python's compiler, coverage.py, ECMAScript), so
+anything compared with them goes through `reader_ranges` first. `git_span` goes
+the other way, for a function's span handed to git (`git log -L`).
 """
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 import re
+from pathlib import Path
+from typing import Callable
 
-from .gitpaths import unquote_path
+from .gitpaths import header_path
+from .repotext import utf16_marked
 
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+# What ends a line for the reader: an LF, alone or after a CR, and a CR no LF follows.
+_READER_LINE_END = re.compile(rb"\r(?!\n)|\n")
+_LONE_CR = re.compile(rb"\r(?!\n)")
 
 
 def _spend_body_line(line: str, rem_old: int, rem_new: int) -> tuple[int, int] | None:
@@ -39,12 +55,15 @@ def _spend_body_line(line: str, rem_old: int, rem_new: int) -> tuple[int, int] |
 
 
 def _open_file(line: str, ranges: dict[str, list[tuple[int, int]]]) -> str | None:
-    """Point the parser at the file a `+++ ` header names; None for /dev/null."""
+    """Point the parser at the file a `+++ ` header names; None for /dev/null.
+    A name that is not UTF-8 keys its ranges in its surrogateescape spelling,
+    so the scope assignment the gate runs next refuses it when a scope takes
+    it, instead of passing a file it never read, and the command's one scan
+    names it left out when none does."""
     target = line[4:].removesuffix("\t")
     if target == "/dev/null":
         return None
-    target = unquote_path(target)
-    path = target[2:] if target.startswith("b/") else target
+    path = header_path(target)
     ranges.setdefault(path, [])
     return path
 
@@ -79,6 +98,7 @@ def _files_with_hunks(
 
 
 def changed_ranges(diff_text: str) -> dict[str, list[tuple[int, int]]]:
+    """Each file's changed new-side ranges, in git's line numbers."""
     ranges: dict[str, list[tuple[int, int]]] = {}
     current: str | None = None
     rem_old = rem_new = 0
@@ -95,3 +115,168 @@ def changed_ranges(diff_text: str) -> dict[str, list[tuple[int, int]]]:
         if m:
             rem_old, rem_new = _record_hunk(m, current, ranges)
     return _files_with_hunks(ranges)
+
+
+# --- a UTF-16 file's lines ------------------------------------------------------------
+#
+# git summarizes a UTF-16 file as binary, and its `--text` patch counts a line at
+# every 0A byte. A code unit holding one that is not U+000A (上 is U+4E0A, 0A 4E in
+# UTF-16LE; U+0A0A holds two) adds a line the text does not have, so each hunk
+# below it lands late. These map git's lines onto the text lines the scorer counts
+# (analyze.decode_source: CRLF, a lone CR and LF each end one line).
+
+_BOM_LENGTH = 2
+
+
+def utf16_line_spans(raw: bytes) -> list[tuple[int, int]]:
+    """For each line git counts in a UTF-16 file that opens with its byte-order
+    mark, the first and last text line it covers."""
+    starts = [0] + [m.end() for m in re.finditer(b"\n", raw) if m.end() < len(raw)]
+    ends = [start - 1 for start in starts[1:]] + [len(raw) - 1]
+    lines = _unit_lines(_code_units(raw))
+    return [(_line_at(lines, -(-(start - _BOM_LENGTH) // 2)), _line_at(lines, (end - _BOM_LENGTH) // 2))
+            for start, end in zip(starts, ends)]
+
+
+def _code_units(raw: bytes) -> list[int]:
+    """The 16-bit code units after the byte-order mark; a last odd byte is one
+    more unit, as the decoder reads it as one more character."""
+    body = raw[_BOM_LENGTH:] + b"\0" * (len(raw) % 2)
+    order = "little" if raw.startswith(b"\xff\xfe") else "big"
+    return [int.from_bytes(body[i:i + 2], order) for i in range(0, len(body), 2)]
+
+
+def _unit_lines(units: list[int]) -> list[int]:
+    """The text line each code unit sits on."""
+    lines, line = [], 1
+    for i, unit in enumerate(units):
+        lines.append(line)
+        line += _ends_line(unit, units[i + 1] if i + 1 < len(units) else None)
+    return lines
+
+
+def _ends_line(unit: int, following: int | None) -> int:
+    """1 when this code unit ends a text line: LF, or a CR no LF follows."""
+    return int(unit == 0x0A or (unit == 0x0D and following != 0x0A))
+
+
+def _line_at(lines: list[int], unit: int) -> int:
+    """The line of a code unit, the nearest one when the index runs off either end."""
+    if not lines:
+        return 1
+    return lines[min(max(unit, 0), len(lines) - 1)]
+
+
+def text_line_ranges(ranges: list[tuple[int, int]], spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Ranges in git's lines, moved onto text lines by `utf16_line_spans`."""
+    def span(line: int) -> tuple[int, int]:
+        return spans[min(max(line, 1), len(spans)) - 1]
+    return [(span(first)[0], span(last)[1]) for first, last in ranges]
+
+
+def rendered_ranges(ranges_by_path: dict[str, list[tuple[int, int]]]) -> str:
+    """A `-U0` patch whose hunks cover exactly these new-side ranges, which
+    changed_ranges reads back unchanged. Each path is C-quoted."""
+    return "".join(f"+++ {_quoted('b/' + path)}\n" + "".join(_hunk(first, last) for first, last in ranges)
+                   for path, ranges in ranges_by_path.items())
+
+
+def _hunk(first: int, last: int) -> str:
+    count = last - first + 1
+    return f"@@ -0,0 +{first},{count} @@\n" + "+\n" * count
+
+
+def _quoted(path: str) -> str:
+    """git's C quoting, every byte outside printable ASCII in octal, so a name
+    with a newline, a quote or a byte that is not UTF-8 reads back as itself."""
+    return '"' + "".join(_quoted_byte(b) for b in path.encode("utf-8", "surrogateescape")) + '"'
+
+
+def _quoted_byte(b: int) -> str:
+    return chr(b) if 0x20 <= b < 0x7F and b not in (0x22, 0x5C) else "\\" + format(b, "03o")
+
+
+def _git_line_starts(raw: bytes) -> list[int]:
+    """The reader line each git line starts on, git line 1 first, then one entry
+    past the last git line: the reader line after the one holding the file's
+    last byte. An LF that closes the file opens no git line.
+    """
+    starts, line = [1], 1
+    for end in _READER_LINE_END.finditer(raw):
+        line += 1
+        if end.group() == b"\n":
+            starts.append(line)
+    if raw.endswith(b"\n"):
+        return starts
+    return starts + [line + (not raw.endswith(b"\r"))]
+
+
+def _on_reader_lines(ranges: list[tuple[int, int]], raw: bytes | None) -> list[tuple[int, int]]:
+    """One file's git ranges moved onto the reader lines its bytes hold.
+
+    A git line past the end, which only bytes read after the diff was taken can
+    produce, is read as the last git line.
+    """
+    if not _lone_crs(raw):
+        return ranges
+    starts = _git_line_starts(raw)
+    last = len(starts) - 1
+    return [(starts[min(lo, last) - 1], starts[min(hi, last)] - 1) for lo, hi in ranges]
+
+
+def reader_ranges(
+    ranges_by_path: dict[str, list[tuple[int, int]]],
+    new_side: Callable[[str], bytes | None],
+) -> dict[str, list[tuple[int, int]]]:
+    """git's ranges on the lines a reader numbers, each file placed by its own bytes.
+
+    `new_side(path)` answers the bytes the diff's new side holds for the path,
+    or None where there are none. Each lone CR above a git line moves it one
+    reader line down, and a git line holding lone CRs spans every reader line in
+    it: a new CR-only file is one git line and every function in it.
+    """
+    return {path: _on_reader_lines(ranges, new_side(path))
+            for path, ranges in ranges_by_path.items()}
+
+
+def _file_bytes(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except OSError:  # deleted since the diff, or not a file
+        return None
+
+
+def worktree_ranges(diff_text: str, root: Path) -> dict[str, list[tuple[int, int]]]:
+    """`changed_ranges` of a diff whose new side is the working tree under `root`,
+    on the reader's lines. The diff's paths are root-relative (gitio runs every
+    git with diff.relative)."""
+    return reader_ranges(changed_ranges(diff_text), lambda rel: _file_bytes(root / rel))
+
+
+def git_span(raw: bytes | None, start: int, end: int) -> tuple[int, int]:
+    """A span of reader lines in git's numbers: the git lines that hold it.
+
+    `raw` is the file at the revision git will number the span in, or None where
+    there is none. A reader line past the end reads as the last git line.
+    """
+    if raw is not None and utf16_marked(raw):
+        return _utf16_git_span(utf16_line_spans(raw), start, end)
+    if not _lone_crs(raw):
+        return start, end
+    starts = _git_line_starts(raw)[:-1]
+    return bisect_right(starts, start), bisect_right(starts, end)
+
+
+def _lone_crs(raw: bytes | None) -> bool:
+    """Whether a reader and git can number these bytes apart at a lone CR. A
+    UTF-16 file cannot: its CR is 0D 00 or 00 0D, no 0A byte follows its 0D, and
+    utf16_line_spans already maps its git lines onto its text lines."""
+    return raw is not None and not utf16_marked(raw) and _LONE_CR.search(raw) is not None
+
+
+def _utf16_git_span(spans: list[tuple[int, int]], start: int, end: int) -> tuple[int, int]:
+    """The git lines that hold text lines `start` to `end`, from each git
+    line's (first, last) text line (utf16_line_spans): a text line a 0A byte
+    inside a code unit splits sits on two git lines."""
+    first = bisect_left([last for _, last in spans], start) + 1
+    return min(first, len(spans)), bisect_right([first for first, _ in spans], end)

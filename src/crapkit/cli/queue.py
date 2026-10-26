@@ -8,14 +8,17 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 from .. import keys, packet
 from ..churn_cache import load_churn
 from ..errors import ConfigError, CrapkitError
-from ..gitio import head_commit, ls_files
+from ..gitio import head_commit, ls_files, shallow_checkout, shallow_warning
 from ..invocation import _self
+from ..repopath import Fragment, fragments
 from ..keys import claim_key, key_names, key_of, lookup, position, split_ordinal
-from ..score import SCORED_COLUMNS
+from ..named import first_few
+from ..score import CRAP_PLACES, SCORED_COLUMNS, unjoined
 from ..store import SnapshotStore
 from ..uncovered import load_uncovered
 from ..worklist import (NO_RATCHET, Marks, RatchetMarks, Worklist, admission, build_worklist,
@@ -29,11 +32,11 @@ def _scored_store(root: Path) -> tuple[SnapshotStore, dict]:
     """The store and the run next-item ranks, or the error naming what to run."""
     db_path = root / ".crapkit" / "crap.sqlite"
     if not db_path.is_file():
-        raise CrapkitError(f"no snapshot in {root} — run `{_self()} coverage` first")
+        raise CrapkitError(f"no snapshot in {root} - run `{_self()} coverage` first")
     store = SnapshotStore(db_path)
     latest = _latest_scored(store)
     if latest is None:
-        raise CrapkitError(f"no scored run in {root} — run `{_self()} coverage` first")
+        raise CrapkitError(f"no scored run in {root} - run `{_self()} coverage` first")
     return store, latest
 
 
@@ -66,6 +69,13 @@ def _pushdown_floor(cfg) -> int:
     return sql_floor(cfg.worklist_floor, min([cfg.target, *cfg.scope_targets.values()]))
 
 
+def _warn_shallow(shallow: bool, counts: str) -> None:
+    """The stderr line that says the churn or mark ages below count a history
+    this clone holds only part of. The JSON carries the same fact as `shallow`."""
+    if shallow:
+        print(shallow_warning(counts), file=sys.stderr)
+
+
 def cmd_next_item(args: argparse.Namespace) -> int:
     _positive_top("next-item", args.top)
     root = _command_root(args.repo)
@@ -77,7 +87,7 @@ def cmd_next_item(args: argparse.Namespace) -> int:
                            cfg, _file_reader(store, latest["id"]))
     adm = admission(load_churn(root, cfg.churn_window_months), cfg.worklist_floor)
     ranked, skipped_no_lane = _next_ranked(scored, adm)
-    excludes = args.exclude or []
+    excludes = fragments(args.exclude or [], root)
     ranked = [r for r in ranked if not _excluded_item(r, excludes)]
     handles = _Handles(store, latest["id"])
     ranked, skipped_claimed = _unclaimed(store, ranked, handles)
@@ -85,7 +95,8 @@ def cmd_next_item(args: argparse.Namespace) -> int:
     commit = head_commit(root)
     ranked, conflicts = _maybe_claim(commit, args.claim, ranked, handles, args.top)
     head = _next_head(latest, skipped_no_lane, skipped_claimed + conflicts,
-                      latest["commit"] != commit)
+                      run_freshness(root, store, latest, commit), shallow_checkout(root))
+    _warn_shallow(head["shallow"], "churn counts")
     _emit_next(store, head, ranked, args.top, adm, cfg, scored, excludes, scopes,
                lambda: load_uncovered(root, cfg), handles)
     return 0
@@ -105,10 +116,20 @@ class _Handles:
         self._run_id = run_id
         self._by_path: dict[str, dict] = {}
         self._keys: dict[str, dict] = {}
+        self._rows: dict[str, list] = {}
+
+    def _positions(self, path: str) -> list:
+        if path not in self._rows:
+            self._rows[path] = self._store.read_positions(self._run_id, path)
+        return self._rows[path]
+
+    def names(self, path: str) -> set[str]:
+        """Every long_name the run holds in PATH, which a claim is matched against."""
+        return {r.long_name for r in self._positions(path)}
 
     def of(self, row) -> str:
         if row.path not in self._by_path:
-            rows = self._store.read_positions(self._run_id, row.path)
+            rows = self._positions(row.path)
             self._by_path[row.path] = keys.handles(rows, run_id=self._run_id)
             self._keys[row.path] = key_names(rows, run_id=self._run_id)
         return self._by_path[row.path][lookup(row)]
@@ -127,10 +148,13 @@ def _unclaimed(store, ranked: list, handles) -> tuple[list, int]:
     """The rows no session is holding, and how many an open claim hid.
 
     Filtering happens whether or not this session claims anything: a claim is
-    worthless if only the session that took it honours it.
+    worthless if only the session that took it honours it. A claim is read
+    against the run's own names, so one taken before analysis version 11 on a
+    nested def still holds it (keys.claim_in_run).
     """
     held, legacy = {}, set()
-    for claim in store.open_claims():
+    for saved in store.open_claims():
+        claim = keys.claim_in_run(saved, handles.names)
         key = claim_key(claim)
         if key is None:
             legacy.add((claim["path"], claim["long_name"]))
@@ -146,16 +170,70 @@ def _claim_available(row, held: dict, legacy: set, handles) -> bool:
     return pair not in legacy and (not precise or handles.key(row) not in precise)
 
 
+class RunFreshness(NamedTuple):
+    """Whether the run a payload ranks still describes the tree.
+
+    `stale` keeps the meaning it has always had: the run's commit is not HEAD.
+    It says nothing about content, so an amend that moves no byte sets it and
+    an uncommitted rewrite of a scored function leaves it false. `changed`
+    names the files the run scored that hold other content now than the run
+    recorded, or is None for a run that recorded none (every run 0.8.0 wrote)
+    and when git could not read the tree to compare, whose error `unread`
+    carries. 0.9.0's schema 2 redefines `stale` from `changed`, here and
+    nowhere else.
+    """
+    stale: bool
+    changed: list[str] | None
+    unread: str = ""
+
+    @property
+    def scored_changes(self) -> int | None:
+        return None if self.changed is None else len(self.changed)
+
+    def fields(self) -> dict:
+        """The two keys every payload about a scored run carries."""
+        return {"stale": self.stale, "scored_changes": self.scored_changes}
+
+    def envelope(self) -> dict:
+        """The two keys plus the command that answers them, for a payload that
+        names no per-file commands of its own."""
+        return {**self.fields(), "commands": packet.refresh_command()}
+
+
+def run_freshness(root: Path, store, latest: dict, head: str) -> RunFreshness:
+    """`stale` and the scored files that moved since the run, for every payload
+    that carries them, so no two payloads can disagree about one run."""
+    changed, unread = _moved_since(root, store.run_sources(latest["id"]))
+    return RunFreshness(latest["commit"] != head, changed, unread)
+
+
+def _moved_since(root: Path, recorded: dict | None) -> tuple[list[str] | None, str]:
+    """The recorded files whose content differs now, deleted ones included,
+    and "". None and git's error when git cannot read the tree: a failed read
+    is neither "changed" nor "unchanged"."""
+    from ..errors import GitError
+    from ..lane_sources import moved
+
+    if recorded is None:
+        return None, ""
+    try:
+        return moved(root, recorded), ""
+    except GitError as exc:
+        return None, str(exc)
+
+
 def _next_head(latest: dict, skipped_no_lane: int, skipped_claimed: int,
-               stale: bool) -> dict:
+               fresh: RunFreshness, shallow: bool) -> dict:
     """skipped_claimed appears only when a claim actually hid something, so a
     store nobody ever claimed in emits exactly the JSON it emitted before.
 
-    `stale` is the same verdict worklist prints its warning from: the snapshot
-    describes a commit HEAD has moved past, so the spans in it may have moved.
+    `stale` and `scored_changes` are the verdict worklist prints its warnings
+    from, and `commands.refresh` is the one call that answers both. `shallow`
+    says the churn the queue ranks ties on was counted in a clone that holds
+    only part of its history.
     """
     head = {"run_id": latest["id"], "commit": latest["commit"],
-            "skipped_no_lane": skipped_no_lane, "stale": stale}
+            "skipped_no_lane": skipped_no_lane, **fresh.envelope(), "shallow": shallow}
     if skipped_claimed:
         head["skipped_claimed"] = skipped_claimed
     return head
@@ -239,8 +317,10 @@ def _handle(handles, row) -> str | None:
     return None if handles is None else handles.of(row)
 
 
-def _excluded_item(r, excludes: list) -> bool:
-    return any(pat in r.path or pat in r.long_name for pat in excludes)
+def _excluded_item(r, excludes: list[Fragment]) -> bool:
+    """A row whose path holds an `--exclude`'s path side (repopath's fragment
+    entry), or whose function name holds it as typed: a name keeps its case."""
+    return any(ex.within(r.path) or ex.typed in r.long_name for ex in excludes)
 
 
 def _skip_reason(r, adm, excludes: list) -> str | None:
@@ -312,8 +392,13 @@ def _no_lane_gap(r, adm) -> bool:
 
 
 def _next_ranked(scored, adm):
+    """Worst CRAP first, compared at the 4 places a mark holds so equal scores
+    tie; then the file with more commits, then path and start line. Unrounded,
+    ccn 25 at 80% coverage read 29.999999999999996 against 30.0 for ccn 5 at
+    none, and the quieter file's function came first."""
     ranked = sorted((r for r in scored if _rankable(r, adm)),
-                    key=lambda r: (-r.crap, -adm.of(r.path).commits, r.path, r.start))
+                    key=lambda r: (-round(r.crap, CRAP_PLACES), -adm.of(r.path).commits,
+                                   r.path, r.start))
     return ranked, sum(1 for r in scored if _no_lane_gap(r, adm))
 
 
@@ -349,6 +434,7 @@ def _next_item_payload(top, adm, cfg, uncovered, handle: str | None = None) -> d
         # budgeting hints: pieces a decomposition needs; decision paths no test
         # walks. brief publishes these from the same helper, never a second copy
         **packet.budget(top, ceiling),
+        **packet.measurement(top),
         # est_uncovered_paths counts them; these name them, so an add-tests
         # remedy no longer costs a by-hand read of the coverage artifact
         **_uncovered_fields(uncovered, top),
@@ -372,8 +458,8 @@ def _print_claims(as_json: bool, claims: list) -> None:
 
 def _release_target(target: list) -> tuple[str, str]:
     if len(target) != 2:
-        raise CrapkitError("claims release needs PATH NAME — the path and function "
-                           "next-item printed — or --all to close every open claim")
+        raise CrapkitError("claims release needs PATH NAME - the path and function "
+                           "next-item printed - or --all to close every open claim")
     return target[0], target[1]
 
 
@@ -393,10 +479,26 @@ def _claim_matches(c: dict, name: str) -> bool:
     return keys.named_by(c["long_name"], name)
 
 
+def _as_saved(claim: dict) -> dict:
+    return claim
+
+
+def _answering(claims: list, name: str, spelled=_as_saved) -> list:
+    return [c for c in claims if _claim_matches(spelled(c), name)]
+
+
 def _named_claims(claims: list, path: str, name: str) -> list:
-    held = [c for c in claims if c["path"] == path and _claim_matches(c, name)]
+    """The open claims on PATH that answer to NAME.
+
+    A claim taken before analysis version 11 on a def nested three or more deep
+    saved the name that version renamed, and brief and next-item print the new
+    one. When no claim answers to NAME as saved, a claim answers to it under the
+    new spelling, so a claim saved as that new name is never closed with it.
+    """
+    on_path = [c for c in claims if c["path"] == path]
+    held = _answering(on_path, name) or _answering(on_path, name, keys.respelled_claim)
     if not held:
-        raise CrapkitError(f"no open claim on {name!r} in {path} — "
+        raise CrapkitError(f"no open claim on {name!r} in {path} - "
                            f"open: {_claims_summary(claims)}")
     return held
 
@@ -436,22 +538,22 @@ def cmd_claims(args: argparse.Namespace) -> int:
 
 def _no_match_message(path: str, name: str, rows: list, candidates: list) -> str:
     if candidates:
-        return f"{name!r} in {path} is ambiguous — candidates: {', '.join(candidates)}"
+        return f"{name!r} in {path} is ambiguous - candidates: {', '.join(candidates)}"
     known = sorted({keys.bare_name(r.long_name) for r in rows})
     return (f"no function named {name!r} in {path} in the latest scored run"
-            f" — it holds: {', '.join(known) or 'nothing'}")
+            f" - it holds: {', '.join(known) or 'nothing'}")
 
 
 def _no_line_message(path: str, name: str, rows: list) -> str:
     starts = ", ".join(str(s) for s in sorted({r.start for r in rows}))
     return (f"no function starts at line {name} in {path} in the latest scored run"
-            f" — it starts functions at: {starts or 'nothing'}")
+            f" - it starts functions at: {starts or 'nothing'}")
 
 
 def _no_handle_message(path: str, name: str, rows: list) -> str:
     held = ", ".join(keys.handle_names(rows))
     return (f"no {name} in {path} in the latest scored run"
-            f" — it holds: {held or 'no anonymous functions'}")
+            f" - it holds: {held or 'no anonymous functions'}")
 
 
 def _pick_function(path: str, rows: list, name: str, run_id: int | None = None):
@@ -502,7 +604,7 @@ def _past_the_last_twin(path: str, name: str, rows: list, long_name: str) -> str
 
 def _no_twin_message(path: str, name: str, wanted: str, held: int) -> str:
     return (f"no {name} in {path} in the latest scored run"
-            f" — it holds {held} function(s) named {wanted!r}")
+            f" - it holds {held} function(s) named {wanted!r}")
 
 
 def _brief_mark(entries: list | None, key: tuple[str, str]) -> float | None:
@@ -519,16 +621,19 @@ def _brief_churn(churn: dict, path: str) -> dict | None:
 
 
 def _brief_coupling(ranked: list, path: str) -> list[dict]:
-    """This file's partners, cut out of the ranking every path in a batch shares."""
-    from .verifying import _is_test_path
+    """This file's partners, cut out of the ranking every path in a batch shares.
+    A partner is a test by the rule init and doctor read, directory or runner
+    naming convention, so x_test.go counts and tools/test_deploy.sh does not."""
+    from ..universe import is_test_file
 
-    return packet.coupling_partners(ranked, path, _is_test_path)
+    return packet.coupling_partners(ranked, path, is_test_file)
 
 
 def _brief_twins(loader, row) -> list[dict]:
     from ..dup import twins_in
 
-    return packet.with_contained(twins_in(loader.twin_index(), row, loader.source(row.path)))
+    return packet.with_contained(twins_in(loader.twin_index(), row, loader.source(row.path),
+                                          loader.scored_file(row.path)))
 
 
 class _BriefLoader:
@@ -540,11 +645,14 @@ class _BriefLoader:
     by what actually invalidates it — the path — never by which packet asked.
     """
 
-    def __init__(self, root: Path, cfg, store, latest: dict) -> None:
+    def __init__(self, root: Path, cfg, store, latest: dict, shallow: bool | None = None) -> None:
+        """`shallow` is the command's one answer to whether this clone holds its
+        whole history; None only for a loader no command built."""
         self.root = root
         self.cfg = cfg
         self.store = store
         self.latest = latest
+        self.shallow = shallow
         self._whole_repo: dict = {}
         self._scored_files: dict = {}
         self._file_keys: dict = {}
@@ -612,8 +720,10 @@ class _BriefLoader:
     def head(self) -> str:
         return self._once("head", lambda: head_commit(self.root))
 
-    def stale(self) -> bool:
-        return self.latest["commit"] != self.head()
+    def freshness(self) -> RunFreshness:
+        """One read of HEAD and of the run's record for a whole batch."""
+        return self._once("freshness",
+                          lambda: run_freshness(self.root, self.store, self.latest, self.head()))
 
     def versions(self) -> dict:
         return self._once("versions", _brief_versions)
@@ -656,21 +766,27 @@ class _BriefLoader:
                                     self.key(row))
 
     def _read_mark_events(self) -> list:
-        from ..gitio import file_log_patches
+        """The mark events off the marks file's whole history, renames
+        included, read once per batch: the ages ratchet report gives."""
+        from ..marks_history import marks_history
         from ..ratchet_report import mark_events
 
-        return mark_events(file_log_patches(self.root, self.cfg.ratchet_file))
+        return mark_events(marks_history(self.root, self.cfg.ratchet_file))
 
     def attempts(self, row) -> list:
         key = self.key(row)
         if key not in self._attempts:
-            self._attempts.update(self.store.attempts_for([key]))
+            self._attempts.update(self.store.attempts_for([key], self.names))
         return self._attempts[key]
 
     def prime_attempts(self, rows: list) -> None:
         """One query for a whole batch's claims, before the packets ask one by one."""
         self._attempts.update(
-            self.store.attempts_for([self.key(r) for r in rows]))
+            self.store.attempts_for([self.key(r) for r in rows], self.names))
+
+    def names(self, path: str) -> set[str]:
+        """Every long_name the run holds in PATH, which a claim pairs against."""
+        return {r.long_name for r in self.scored_file(path)}
 
 
 def _brief_versions() -> dict:
@@ -731,7 +847,8 @@ def _packet_context(loader, row, rows: list) -> dict:
         "file_totals": packet.file_totals(rows, cfg.scope_targets, cfg.target),
         "gate_rule": _packet_gate(loader, row),
         "lane": packet.lane_record(packet.lane_for(scope, cfg.lanes)),
-        "stale": loader.stale(),
+        **loader.freshness().fields(),
+        "shallow": loader.shallow,
         "versions": loader.versions(),
         "commands": _packet_commands(cfg, row, scope),
         "attempts": loader.attempts(row),
@@ -762,6 +879,7 @@ def _brief_packet(loader, row) -> dict:
         "target": ceiling,
         "remedy": row.remedy,
         **packet.budget(row, ceiling),
+        **packet.measurement(row),
         "ratchet_mark": loader.mark(row),
         "churn": _brief_churn(loader.churn(), row.path),
         "coupling": _brief_coupling(loader.coupling(), row.path),
@@ -807,13 +925,19 @@ def _print_brief_context(out: dict) -> None:
           f"lane {lane['name'] if lane else 'none'}  ->  {out['commands']['gate']}")
 
 
+def _cov_word(out: dict) -> str:
+    """The coverage a reader at a terminal sees: a percentage, or the fact that
+    nothing measured it, which a 0% beside a no-lane row used to hide."""
+    return "not measured" if out["unmeasured"] else f"{out['scored']['cov']:.0%}"
+
+
 def _print_brief(as_json: bool, out: dict) -> None:
     if as_json:
         _print_json(out)
         return
     s = out["scored"]
     print(f"{out['path']}:{s['start']}  {out['function']}")
-    print(f"  ccn {s['ccn']} (cognitive {s['cognitive']})  cov {s['cov']:.0%}  "
+    print(f"  ccn {s['ccn']} (cognitive {s['cognitive']})  cov {_cov_word(out)}  "
           f"crap {s['crap']:.1f} vs ceiling {out['target']}  -> {s['remedy']}")
     print(f"  mark {_mark_text(out['ratchet_mark'])}  churn {_churn_text(out['churn'])}")
     print(f"  uncovered lines: {_brief_lines_text(out)}")
@@ -855,7 +979,7 @@ def _brief_batch(loader, count: int) -> dict:
     rows, skipped_claimed = _batch_rows(loader, count)
     loader.prime_attempts(rows)
     out = {"run_id": loader.latest["id"], "commit": loader.latest["commit"],
-           "stale": loader.stale(),
+           **loader.freshness().envelope(), "shallow": loader.shallow,
            "packets": [_brief_packet(loader, row) for row in rows]}
     if skipped_claimed:
         out["skipped_claimed"] = skipped_claimed
@@ -865,8 +989,8 @@ def _brief_batch(loader, count: int) -> dict:
 def _brief_target(args: argparse.Namespace) -> tuple[str, str]:
     """PATH and NAME, which only --batch may leave out."""
     if not args.path or not args.name:
-        raise CrapkitError("brief needs PATH NAME — the path and function next-item "
-                           "printed — or --batch N for the top N queue items")
+        raise CrapkitError("brief needs PATH NAME - the path and function next-item "
+                           "printed - or --batch N for the top N queue items")
     return args.path, args.name
 
 
@@ -875,7 +999,8 @@ def cmd_brief(args: argparse.Namespace) -> int:
     root = _command_root(args.repo)
     cfg = _load_repo_config(root)
     store, latest = _scored_store(root)
-    loader = _BriefLoader(root, cfg, store, latest)
+    loader = _BriefLoader(root, cfg, store, latest, shallow_checkout(root))
+    _warn_shallow(loader.shallow, "churn counts and mark ages")
     if args.batch is not None:
         _print_json(_brief_batch(loader, _resolve_batch(args.batch)))
         return 0
@@ -893,10 +1018,30 @@ def _resolve_top(requested: int | None, cfg) -> int:
     return top
 
 
-def _stale_warning(stale: bool, as_json: bool, latest: dict) -> None:
-    if stale and not as_json:
-        print(f"warning: snapshot is for {latest['commit'][:11]}, HEAD has moved on — "
-              f"rerun `{_self()} coverage`", file=sys.stderr)
+def _stale_warning(fresh: RunFreshness, as_json: bool, latest: dict) -> None:
+    """The plain table's warnings; --json carries the same verdict as fields."""
+    if as_json:
+        return
+    for line in _freshness_warnings(fresh, latest):
+        print(line, file=sys.stderr)
+
+
+def _freshness_warnings(fresh: RunFreshness, latest: dict) -> list[str]:
+    """One line per way the run no longer matches: HEAD moved past its commit,
+    and files it scored hold other content now. Either can happen without the
+    other, and the second names the files so the reader can check them."""
+    lines = []
+    if fresh.stale:
+        lines.append(f"warning: snapshot is for {latest['commit'][:11]}, HEAD has moved on - "
+                     f"rerun `{_self()} coverage`")
+    if fresh.changed:
+        lines.append(f"warning: {len(fresh.changed)} file(s) changed since run {latest['id']} "
+                     f"scored them: {first_few(fresh.changed)} - rerun `{_self()} coverage`")
+    if fresh.unread:
+        lines.append(f"warning: cannot tell which files changed since run {latest['id']} "
+                     f"scored them, because git failed: {fresh.unread} - fix what git "
+                     f"reports, then rerun `{_self()} coverage`")
+    return lines
 
 
 def _entry_json(e) -> dict:
@@ -927,14 +1072,17 @@ def _row_marker(e) -> str:
     return "  " + " ".join(marks) if marks else ""
 
 
-def _worklist_payload(wl, latest: dict, cfg, stale: bool, batches: list | None) -> dict:
+def _worklist_payload(wl, latest: dict, cfg, stale: bool, batches: list | None, *,
+                      changed: list[str] | None = None) -> dict:
     """The queue, plus `batches` when one was asked for.
 
     ADDED, never swapped in: a reader that wants active[] or stale off a batched
     call gets them, because the cut is a second view of the same queue.
+    `changed` is RunFreshness.changed: None when the run recorded no content.
     """
     payload = {
-        "run_id": latest["id"], "commit": latest["commit"], "stale": stale,
+        "run_id": latest["id"], "commit": latest["commit"],
+        **RunFreshness(stale, changed).envelope(),
         "floor": cfg.worklist_floor, "churn_window_months": cfg.churn_window_months,
         "active": [_entry_json(e) for e in wl.active],
         # what the cap hid: distinct from the over-ceiling total `trend` carries
@@ -951,15 +1099,18 @@ def _crap_text(crap: float | None) -> str:
     return "      -" if crap is None else f"{crap:>7.1f}"
 
 
-def _cov_text(cov: float | None) -> str:
-    return "   -" if cov is None else f"{cov:>4.0%}"
+def _cov_text(e) -> str:
+    """A dash where no number was measured: an inventory-only run, and a
+    no-lane or cc-only row, whose cov of 0.0 only stands in for one. `brief`
+    and `rescore` say the same; a 0% there read as a measured, untested row."""
+    return "   -" if e.cov is None or unjoined(e.flag) else f"{e.cov:>4.0%}"
 
 
 def _row_text(e) -> str:
     """One printed row: the rank, the two numbers the score is made of, the
     churn, the place, the name. `ccn_std` and `weight` stay in the JSON."""
     return (f"  risk {e.risk:>8.1f}  ccn {e.ccn:>3}  crap {_crap_text(e.crap)}  "
-            f"cov {_cov_text(e.cov)}  {e.commits:>3}c/{e.authors}a  {e.path}:{e.start}  "
+            f"cov {_cov_text(e)}  {e.commits:>3}c/{e.authors}a  {e.path}:{e.start}  "
             f"{e.long_name}{_row_marker(e)}")
 
 
@@ -968,11 +1119,13 @@ def _cap_label(requested: int | None, top: int) -> str:
     return f"--top {top}" if requested is not None else f"worklist_top {top}"
 
 
-def _worklist_print(as_json: bool, wl, latest: dict, cfg, stale: bool,
-                    batches: list | None, cap: str) -> None:
-    _stale_warning(stale, as_json, latest)
+def _worklist_print(as_json: bool, wl, latest: dict, cfg, fresh: RunFreshness,
+                    batches: list | None, cap: str, shallow: bool) -> None:
+    _stale_warning(fresh, as_json, latest)
+    _warn_shallow(shallow, "churn counts")
     if as_json:
-        _print_json(_worklist_payload(wl, latest, cfg, stale, batches))
+        _print_json({**_worklist_payload(wl, latest, cfg, fresh.stale, batches,
+                                         changed=fresh.changed), "shallow": shallow})
         return
     print(f"worklist @ {latest['commit'][:11]} (run {latest['id']}, floor ccn>={cfg.worklist_floor}, "
           f"churn {cfg.churn_window_months}mo) - {len(wl.active)} of {wl.active_total} active "
@@ -980,6 +1133,32 @@ def _worklist_print(as_json: bool, wl, latest: dict, cfg, stale: bool,
     for e in wl.active:
         print(_row_text(e))
     _print_batches(batches)
+
+
+def _print_next_step(as_json: bool, root: Path, cfg, latest: dict) -> None:
+    if not as_json:
+        print("\n".join(_worklist_next(root, cfg, latest)))
+
+
+def _worklist_next(root: Path, cfg, latest: dict) -> list[str]:
+    """The command to run after reading the map, and why when that is not plain.
+
+    The README's first run is coverage, worklist, ratchet seed and verify.
+    worklist was the one step that printed no next step, so a user who followed
+    what crapkit printed stopped at the map with no mark signed. The order here
+    is that path: a run next-item and seed can read, then a marks file, then
+    the burn-down queue, whose `empty: true` is its own stop condition.
+    """
+    from ..store import is_trusted, untrusted_reason
+
+    if not is_trusted(latest):
+        return [f"run {latest['id']} is {untrusted_reason(latest)} and cannot serve as a "
+                "baseline for next-item, ratchet seed or verify", f"-> next: {_self()} coverage"]
+    if not (root / cfg.ratchet_file).is_file():
+        return [f"no {cfg.ratchet_file} yet: seed marks each function over its ceiling at "
+                "today's score, and from then on a mark may only fall",
+                f"-> next: {_self()} ratchet seed"]
+    return [f"-> next: {_self()} next-item"]
 
 
 def _worklist_run(root: Path, store) -> dict:
@@ -1008,7 +1187,7 @@ def _worklist_run(root: Path, store) -> dict:
     runs = rowful_runs(store)
     if runs:
         return runs[-1]
-    raise CrapkitError(f"no run with rows in {root} — run `{_self()} coverage` first "
+    raise CrapkitError(f"no run with rows in {root} - run `{_self()} coverage` first "
                        f"(or `{_self()} inventory` for complexity-only ranking, "
                        "with no coverage, flags or remedies)")
 
@@ -1022,8 +1201,10 @@ def cmd_worklist(args: argparse.Namespace) -> int:
     top = _resolve_top(args.top, cfg)
     wl = _worklist_for(root, cfg, store, latest, top=top, scopes=scopes)
     batches = _worklist_batches(root, cfg, wl.active, args.batches)
-    _worklist_print(args.json, wl, latest, cfg, latest["commit"] != head_commit(root), batches,
-                    _cap_label(args.top, top))
+    _worklist_print(args.json, wl, latest, cfg,
+                    run_freshness(root, store, latest, head_commit(root)), batches,
+                    _cap_label(args.top, top), shallow_checkout(root))
+    _print_next_step(args.json, root, cfg, latest)
     return 0
 
 

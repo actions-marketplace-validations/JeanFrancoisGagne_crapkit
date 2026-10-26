@@ -21,8 +21,9 @@ import tempfile
 import time
 from typing import IO
 
-from ._process_owner import CommandCancelled, close_input, kill_process_tree, own_processes
+from ._process_owner import CommandCancelled, close_input, helper_flags, kill_process_tree, own_processes
 from .errors import ToolError
+from .repotext import lenient
 
 __all__ = ["CommandCancelled", "NoProgress", "own_processes", "prepare_template",
            "run_bounded", "run_owned"]
@@ -136,16 +137,41 @@ class _StartFailed(ToolError, OSError):
     could not be put and answer with a finding."""
 
 
+class CwdMissing(_StartFailed):
+    """The start failed because the directory it was asked to start in is not
+    one. A caller that knows where that directory came from adds the fix."""
+
+
 def _run(command, streams, owner, kwargs, watch):
     """Start one owned command, wait for it and its cleanup, and return its code.
 
     `streams` are the command's stdout and stderr. `watch` is the deadline, the
     progress stream and the no-progress limit. None means the deadline passed.
     """
-    with _START(command, *streams, owner, kwargs) as process:
+    with ExitStack() as stack:
+        process = _entered(stack, _START(command, *streams, owner, kwargs), kwargs.get("cwd"))
         code = _complete_command(process, *watch, owner)
     _refuse_failed_start(code)
     return code
+
+
+def _entered(stack: ExitStack, start, cwd):
+    """The started process, or a start failure naming a cwd that is not a
+    directory. Popen raised FileNotFoundError on POSIX and NotADirectoryError
+    on Windows, which the lane layer does not read as a lane's failure, so a
+    lane whose cwd named nothing ended `crapkit coverage` in a traceback, exit
+    1. The cwd is read only once Popen has failed, so a start that works costs
+    no extra stat."""
+    try:
+        return stack.enter_context(start)
+    except (FileNotFoundError, NotADirectoryError) as error:
+        _refuse_missing_cwd(cwd, error)
+        raise
+
+
+def _refuse_missing_cwd(cwd, error: OSError) -> None:
+    if cwd is not None and not os.path.isdir(cwd):
+        raise CwdMissing(f"cwd {cwd} is not a directory, so the command never ran") from error
 
 
 @contextmanager
@@ -212,9 +238,10 @@ def _launched(command, stdout, stderr, owner, kwargs):
     with tempfile.TemporaryFile() as errors:
         launcher_stderr, descriptor, merge, passed = _launch_options(errors, stderr)
         registration, kwargs = owner.prepare({**kwargs, **passed})
-        # The base interpreter with startup hooks off starts nothing before its gate.
-        process = subprocess.Popen([getattr(sys, "_base_executable", sys.executable), "-I", "-S",
-                                    "-c", _OWNED_LAUNCH, json.dumps([command, descriptor, merge])],
+        # The base interpreter with startup hooks off starts nothing before its gate,
+        # and execs the command's text in the bytes this process would (helper_flags).
+        process = subprocess.Popen([getattr(sys, "_base_executable", sys.executable), *helper_flags(), "-I",
+                                    "-S", "-c", _OWNED_LAUNCH, json.dumps([command, descriptor, merge])],
                                    stdin=subprocess.PIPE, stdout=stdout, stderr=launcher_stderr,
                                    start_new_session=True, **kwargs)
         _hand_over(process, owner, registration, (_release_launcher, _dead_launcher, _kill_group))
@@ -299,6 +326,8 @@ _OWNED_LAUNCH = """import json, os, sys
 if sys.stdin.buffer.readline() != b'go\\n':
     raise SystemExit(1)
 command, error_descriptor, merge = json.loads(sys.argv[1])
+if isinstance(command, str):
+    command = ['/bin/sh', '-c', command]
 if error_descriptor is None:
     error_fd = os.dup(2)
 else:
@@ -310,11 +339,10 @@ with os.fdopen(error_fd, 'w', encoding='utf-8') as errors:
     try:
         with open(os.devnull, 'rb') as source:
             os.dup2(source.fileno(), 0)
-        if isinstance(command, str):
-            os.execl('/bin/sh', '/bin/sh', '-c', command)
         os.execvp(command[0], command)
     except OSError as error:
-        json.dump([error.errno, error.strerror, error.filename, None, error.filename2], errors)
+        # os.execv's error names no file; subprocess names the command it could not start.
+        json.dump([error.errno, error.strerror, error.filename or command[0], None, error.filename2], errors)
 raise SystemExit(1)
 """
 
@@ -402,7 +430,7 @@ def run_owned(command: str | list[str], timeout: float | None = None, *, owner=N
     """Run literal argv or a shell string until the command and descendants stop.
 
     Input is DEVNULL. Output is inherited unless capture_output requests separate
-    UTF-8 stdout/stderr strings. Background descendants stop with their command;
+    stdout/stderr strings, UTF-8 with each other byte read as U+FFFD. Background descendants stop with their command;
     callers wanting a persistent service must launch that service separately.
     TimeoutExpired and CommandCancelled are raised only after tree cleanup. So
     is the start failure, a ToolError that is also an OSError, which a Windows
@@ -425,10 +453,13 @@ def _capture_streams(stack, capture):
 
 
 def _captured_text(stream):
+    """What an owned command printed. crapkit only shows or matches it, and git
+    quotes a subject or a file name as stored: `HEAD is now at <sha> <subject>`
+    from a worktree add, with a Latin-1 subject, ended `mutate` here."""
     if stream is None:
         return None
     stream.seek(0)
-    return stream.read().decode("utf-8").replace("\r\n", "\n")
+    return lenient(stream.read()).replace("\r\n", "\n")
 
 
 def _raise_launch_error(errors):
@@ -439,7 +470,7 @@ def _raise_launch_error(errors):
     try:
         arguments = json.loads(payload)
     except (ValueError, UnicodeDecodeError) as error:
-        raise ToolError("command launcher failed: " + payload.decode("utf-8", "replace")) from error
+        raise ToolError("command launcher failed: " + lenient(payload)) from error
     raise OSError(*arguments)
 
 
@@ -471,8 +502,10 @@ def _exit_status(status) -> int:
 
 
 def _wait_command(proc, timeout):
-    """Leave a POSIX group leader unreaped until group cleanup confirms exit."""
-    if os.name == "nt":
+    """Leave a POSIX group leader unreaped until group cleanup confirms exit. A
+    Python with no os.waitid (Windows, python.org's macOS builds before 3.13)
+    reaps the leader here, and group cleanup finds its members by group id."""
+    if not hasattr(os, "waitid"):
         return proc.wait(timeout=timeout)
     options = os.WEXITED | os.WNOWAIT
     if timeout is None:

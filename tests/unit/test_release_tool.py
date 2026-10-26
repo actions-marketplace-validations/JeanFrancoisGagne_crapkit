@@ -8,6 +8,7 @@ reads every surface through its live API rather than a cached page.
 """
 import json
 import os
+import subprocess
 import sys
 from types import SimpleNamespace
 from pathlib import Path
@@ -23,12 +24,18 @@ DASH = chr(0x2014)
 NL = chr(10)
 
 
+def _codex_add(version: str) -> str:
+    return f"codex plugin marketplace add https://github.com/JeanFrancoisGagne/crapkit.git --ref v{version}{NL}"
+
+
 def _tree(tmp_path: Path, version: str = "0.5.1", heading: str = "0.5.2") -> Path:
     """A repo copy carrying every surface at `version`, with the next
     changelog heading still unreleased."""
     root = tmp_path / "repo"
     (root / "src" / "crapkit").mkdir(parents=True)
     (root / "plugin" / ".claude-plugin").mkdir(parents=True)
+    (root / "plugin" / ".codex-plugin").mkdir(parents=True)
+    (root / "docs").mkdir()
     (root / "pyproject.toml").write_text(f'[project]{NL}name = "crapkit"{NL}version = "{version}"{NL}',
                                          encoding="utf-8")
     (root / "src" / "crapkit" / "__init__.py").write_text(f'__version__ = "{version}"{NL}',
@@ -36,9 +43,20 @@ def _tree(tmp_path: Path, version: str = "0.5.1", heading: str = "0.5.2") -> Pat
     (root / "README.md").write_text(
         f"# crapkit{NL}{NL}```{NL}$ crapkit --version{NL}crapkit {version}{NL}```{NL}{NL}"
         f"    rev: v{version}{NL}{NL}uses: JeanFrancoisGagne/crapkit@v{version}{NL}"
-        f"uses: JeanFrancoisGagne/crapkit@v{version}{NL}", encoding="utf-8")
-    (root / "plugin" / ".claude-plugin" / "plugin.json").write_text(
-        json.dumps({"name": "crapkit", "version": version}, indent=2) + NL, encoding="utf-8")
+        f"uses: JeanFrancoisGagne/crapkit@v{version}{NL}{NL}      - run: pip install \"crapkit=={version}\"{NL}{NL}"
+        f"{_codex_add(version)}{_codex_add(version)}",
+        encoding="utf-8")
+    for page, lines in (("adoption.md", 1), ("upgrading.md", 1)):
+        (root / "docs" / page).write_text(_codex_add(version) * lines, encoding="utf-8")
+    (root / "docs" / "handbook.html").write_text(
+        f"<code>uses: JeanFrancoisGagne/crapkit@v{version}</code>{NL}{_codex_add(version) * 2}", encoding="utf-8")
+    onboard = root / "plugin" / "skills" / "crapkit-onboard" / "SKILL.md"
+    onboard.parent.mkdir(parents=True)
+    onboard.write_text(_codex_add(version) * 2, encoding="utf-8")
+    (root / "docs" / "agent-json.md").write_text(_codex_add(version), encoding="utf-8")
+    for manifest in (".claude-plugin", ".codex-plugin"):
+        (root / "plugin" / manifest / "plugin.json").write_text(
+            json.dumps({"name": "crapkit", "version": version}, indent=2) + NL, encoding="utf-8")
     (root / "server.json").write_text(
         json.dumps({"name": "io.github.JeanFrancoisGagne/crapkit", "version": version,
                     "packages": [{"identifier": "crapkit", "version": version}]}, indent=2) + NL,
@@ -54,7 +72,9 @@ def _tree(tmp_path: Path, version: str = "0.5.1", heading: str = "0.5.2") -> Pat
 def test_the_table_names_every_surface_a_release_touches():
     files = {s.path for s in release.SURFACES}
     assert files == {"pyproject.toml", "src/crapkit/__init__.py", "README.md",
-                     "plugin/.claude-plugin/plugin.json", "server.json"}
+                     "plugin/.claude-plugin/plugin.json", "plugin/.codex-plugin/plugin.json",
+                     "server.json", "docs/adoption.md", "docs/upgrading.md", "docs/handbook.html",
+                     "plugin/skills/crapkit-onboard/SKILL.md", "docs/agent-json.md"}
 
 
 def test_check_passes_on_a_tree_whose_surfaces_agree(tmp_path):
@@ -89,6 +109,57 @@ def test_check_refuses_a_changelog_with_no_unreleased_heading_for_the_version(tm
     report = release.check(root, "0.5.2")
 
     assert any("CHANGELOG.md" in p and "0.5.2" in p for p in report.problems), report.problems
+
+
+def _section_of(root: Path, size: int) -> None:
+    """A 0.5.2 section whose release body, as `notes` returns it, is `size`
+    characters: one line of text and the newline `notes` ends the body with."""
+    (root / "CHANGELOG.md").write_text(
+        f"# Changelog{NL}{NL}## 0.5.2 {DASH} unreleased{NL}{NL}{'x' * (size - 1)}{NL}{NL}"
+        f"## 0.5.1 {DASH} 2026-09-05{NL}{NL}Older.{NL}", encoding="utf-8")
+
+
+@pytest.mark.parametrize("size, refused", [(125_000, False), (125_001, True)])
+def test_check_refuses_a_section_github_refuses_as_a_release_body(tmp_path, size, refused):
+    """GitHub refuses a release body over 125,000 characters, and that refusal
+    comes after the tag, the push and PyPI. The 0.8.1 section ran to 241,619
+    characters and check passed it."""
+    root = _tree(tmp_path)
+    _section_of(root, size)
+
+    problems = release.check(root, "0.5.2").problems
+
+    assert len(release.notes(root, "0.5.2")) == size
+    assert problems == ([f"CHANGELOG.md: the 0.5.2 section is {size} characters; a GitHub "
+                         "release body takes at most 125000"] if refused else [])
+
+
+def test_check_counts_no_body_when_the_heading_is_missing(tmp_path):
+    """`notes` raises on a missing section, so the size is read only once the
+    heading is found; the heading's own refusal is the one line."""
+    root = _tree(tmp_path, heading="0.6.0")
+
+    assert release.check(root, "0.5.2").problems == [
+        f"CHANGELOG.md: '## 0.5.2 {DASH} unreleased' x0 (expected 1)"]
+
+
+def test_notes_writes_utf8_through_a_legacy_code_page_stdout(tmp_path):
+    """`notes VERSION > notes.md` previews the release body. Under a Windows
+    console or redirect, stdout was cp1252: the first CJK character in the
+    0.8.1 section ended the command with UnicodeEncodeError, exit 1, and an
+    empty file."""
+    root = _tree(tmp_path)
+    changelog = root / "CHANGELOG.md"
+    changelog.write_text(changelog.read_text(encoding="utf-8").replace("Text.", "上 and é"),
+                         encoding="utf-8")
+    env = {**os.environ, "PYTHONIOENCODING": "cp1252", "PYTHONUTF8": "0"}
+
+    done = subprocess.run([sys.executable, str(ROOT / "tools" / "release" / "release.py"), "notes",
+                           "0.5.2", "--repo", str(root)], capture_output=True, env=env)
+
+    assert done.returncode == 0, done.stderr.decode("utf-8", "replace")
+    printed = done.stdout.decode("utf-8").replace("\r\n", NL)  # a Windows stdout writes CRLF
+    assert printed == release.notes(root, "0.5.2")
 
 
 # --- bump ----------------------------------------------------------------------
@@ -216,6 +287,53 @@ def test_the_plan_orders_the_chain_the_way_the_contracts_require():
     assert names.index("verify") < names.index("push"), "nothing leaves the machine before verify is OK"
     assert names.index("push") < names.index("pypi") < names.index("github release")
     assert names.index("github release") < names.index("registry")
+
+
+def _accuracy_step():
+    (accuracy,) = [s for s in release.plan("0.5.2") if s.name == "accuracy"]
+    return accuracy
+
+
+def test_the_accuracy_stage_follows_verify():
+    """The accuracy suite runs on the tree verify passed, before the tag or main
+    leaves the machine."""
+    names = [s.name for s in release.plan("0.5.2")]
+    accuracy = _accuracy_step()
+
+    assert names.index("ratchet") < names.index("accuracy") < names.index("artifacts")
+    assert accuracy.stage == "accuracy"
+    assert accuracy.background
+
+
+@pytest.mark.parametrize("platform, python", [("linux", "3.12"), ("win32", "3.12"), ("win32", "3.11")])
+def test_the_local_tier_runs_the_rows_that_read_this_machine_s_state(platform, python):
+    """The bundle rows replay only where the history bundle is, and the mutation
+    receipts live only here: the stage's own command, read by run.py's parser
+    and check selection, runs both rows on every OS a release runs from. The
+    mutation row was Linux only, so a Windows release dropped the coverage gate
+    and nothing in its receipt said so; `covered` runs outside the image and
+    takes the newest receipt's environment, so it judges the same on Windows."""
+    expected = {"retro replays for the release", "mutation receipts cover the release"}
+    import runpy
+    tool = runpy.run_path(str(ROOT / "tools" / "accuracy" / "run.py"))
+    args = tool["_run_parser"]().parse_args(list(_accuracy_step().commands[0][2:]))
+    names = {check.name for check in tool["selected"](tool["load_checks"](), args.tier, args.shard, platform,
+                                                       args.os_sensitive, python=python, local=args.local)}
+
+    assert names & {"retro replays for the release", "mutation receipts cover the release"} == expected
+
+
+def test_the_accuracy_stage_publishes_no_release_ref():
+    """The remote run reaches the tagged commit through a scratch branch, never
+    through the tag or main."""
+    accuracy = _accuracy_step()
+    pushed = [command[-1] for command in accuracy.commands if command[:2] == ("git", "push")]
+
+    assert accuracy.commands[0][1:] == ("tools/accuracy/run.py", "--tier", "release", "--local", "--receipt",
+                                        ".crapkit/release-accuracy-0.5.2.json")
+    assert pushed == ["v0.5.2^{commit}:refs/heads/accuracy-release/0.5.2", "accuracy-release/0.5.2"]
+    assert accuracy.commands[2][-4:] == ("-f", "mode=release", "-f", "release_key=0.5.2")
+    assert accuracy.commands[3][:3] == ("gh", "run", "rerun") and "--failed" in accuracy.commands[3]
 
 
 def test_the_verify_step_is_marked_as_its_own_background_command():

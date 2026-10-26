@@ -35,6 +35,7 @@ picked the worst twin in one and the first in the other.
 from __future__ import annotations
 
 from collections import Counter
+import re
 
 from .errors import CrapkitError, ToolError
 
@@ -204,7 +205,75 @@ def claim_holds(claim: dict, key: tuple[str, str]) -> bool:
     return (claim["path"], claim["long_name"]) == (key[0], split_ordinal(key[1])[0])
 
 
+# --- claims taken before analysis version 11 ------------------------------------
+
+_CLAIM_NAMES = ("long_name", "key_name", "handle")
+
+
+def respelled_nested(path: str, name: str) -> str:
+    """NAME as analysis version 11 spells a nested Python def that an older
+    reader named: `a.b.c( x )` for `a.a.b.c( x )`. Any other NAME comes back
+    as it is.
+
+    Before version 11 a def three or more deep repeated the names of the defs
+    around it: three deep read `a.a.b.c`, four deep `a.a.b.a.a.b.c.d`. Only that
+    shape is rewritten, so `a.b.c.d`, which no older reader wrote, keeps its
+    name. A parameter list or a twin ordinal after the name stays as it is.
+    """
+    head = bare_name(name)
+    chain = _def_chain(head.split(".")) if path.lower().endswith(".py") else None
+    return name if chain is None else name.replace(head, ".".join(chain), 1)
+
+
+def _def_chain(parts: list[str]) -> list[str] | None:
+    """The defs an older reader's nested name runs through, outermost first,
+    or None when PARTS is not that spelling.
+
+    That reader spelled a def k deep as its parent's spelling minus the last
+    name, then its parent's spelling, then its own name, so the spelling
+    doubles with each level: `a`, `a.b`, `a.a.b.c`, `a.a.b.a.a.b.c.d`.
+    """
+    if len(parts) <= 2:
+        return parts
+    half = len(parts) // 2
+    parent = parts[half - 1:-1]
+    if parts[:half - 1] != parent[:-1]:
+        return None
+    chain = _def_chain(parent)
+    return None if chain is None else [*chain, parts[-1]]
+
+
+def respelled_claim(claim: dict) -> dict:
+    """The claim with every name it saved spelled as analysis version 11
+    spells a nested def: its long_name, its key name and its handle."""
+    path = claim["path"]
+    return {**claim, **{field: respelled_nested(path, claim[field])
+                        for field in _CLAIM_NAMES if claim.get(field)}}
+
+
+def claim_in_run(claim: dict, names_in) -> dict:
+    """The claim, naming the function a run holds under the name it now has.
+
+    A claim keeps the name it was handed out under. One taken before analysis
+    version 11 on a def nested three or more deep names a function the new run
+    does not hold, and matched as saved it held nothing: the queue handed the
+    def to the next session. `names_in(path)` is every long_name the run holds
+    in that file. The saved name wins while the run holds it, so a def nested
+    in a def of its own name (`a.a.b.c` under version 11 too) keeps its claim.
+    """
+    moved = respelled_claim(claim)
+    if moved["long_name"] == claim["long_name"]:
+        return claim
+    held = names_in(claim["path"])
+    return claim if claim["long_name"] in held or moved["long_name"] not in held else moved
+
+
 # --- the naming rules: what a NAME can say and which function it reaches -----
+
+# A Zig identifier spelled as a string (crapkit.lizardgolike reads it as one token),
+# or a Swift raw identifier between backticks (crapkit.lizardswift reads it as one).
+_QUOTED_NAME = re.compile(r'@"(?:\\.|[^"\\])*"|`[^`]*`')
+
 
 def bare_name(long_name: str) -> str:
     """The identifier a long_name opens with, before its parameter list.
@@ -223,7 +292,15 @@ def bare_name(long_name: str) -> str:
     Empty for a function lizard could not name: both `(anonymous)` and
     `(anonymous) ( z )` open with the parenthesis, so an empty prefix IS the
     test for anonymity, with no second string to keep in step.
+
+    A Zig name written as a string, `@"weird name" x : i32`, is one token whose
+    text holds a space and can hold a `(`, so it is cut whole. So is a Swift raw
+    identifier, "`keeps onboarding if offline` value : Int": its name runs to its
+    own closing backtick.
     """
+    quoted = _QUOTED_NAME.match(long_name)
+    if quoted:
+        return quoted.group()
     head = long_name.split("(")[0].strip()
     return head.split()[0] if head else ""
 
@@ -398,5 +475,9 @@ def _twin_key(rows: list, long_name: str, ordinal: int | None, run_id: int | Non
 
 def _severity(row) -> tuple:
     """Worst first, and the first in the file among equals. A row with no score,
-    as on an inventory run, ranks with every other unscored one."""
-    return row.crap or 0.0, -row.start, -position(row)[1]
+    as on an inventory run, ranks with every other unscored one.
+
+    Scores compare at the 4 places a mark holds (score.CRAP_PLACES; score imports
+    this module), so equal ones tie: ccn 25 at 80% coverage and ccn 5 at none
+    both score 30, which the floats read as 29.999999999999996 and 30.0."""
+    return round(row.crap or 0.0, 4), -row.start, -position(row)[1]

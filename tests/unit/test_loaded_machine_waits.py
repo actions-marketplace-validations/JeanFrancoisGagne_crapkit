@@ -12,6 +12,7 @@ The loaded machine here is a clock that moves only when a wait sleeps, one
 second per poll, so no test measures wall-clock time.
 """
 import ast
+from collections import Counter
 from pathlib import Path
 import re
 import time
@@ -22,6 +23,7 @@ import mutation_fixtures
 import state_concurrency_worker
 import test_ci_driver_lifetime
 import test_r2_execution_lifetime
+from test_one_hang_bound import code_tree
 from hang_guard import HANG_SECONDS
 
 TESTS = Path(__file__).resolve().parents[1]
@@ -79,13 +81,19 @@ def test_no_e2e_file_binds_the_cli_below_the_hang_bound():
 
 MUTATION_DEADLINE = re.compile(r"""mutation_timeout_seconds["']?\s*[:=]\s*(\d+)""")
 
-# A deadline a test is about keeps its number: (file, seconds) -> the reason.
+# A deadline a test is about keeps its number:
+# (file, seconds) -> (how many sites spell it, the reason).
 UNDER_TEST = {
     ("unit/test_lanes_infra.py", 1):
-        "test_lane_timeout_kills_the_command_and_says_so expects this lane to time out",
+        (1, "test_lane_timeout_kills_the_command_and_says_so expects this lane to time out"),
     ("unit/test_holding_suite_raises_the_mutation_deadline.py", 10):
-        "the deadline holding_suite must raise to the hold",
+        (2, "the deadline holding_suite must raise to the hold, in its tight and spaced spellings"),
+    ("e2e/test_mutate_e2e.py", 3):
+        (1, "test_a_mutant_whose_suite_gave_no_result_is_counted_apart[timeout] expects the "
+            "suite to time out; test_a_mode_whose_suite_must_finish_hands_crapkit_the_hang_bound "
+            "holds the other modes to the hang bound"),
 }
+EXCUSED = Counter({site: count for site, (count, _reason) in UNDER_TEST.items()})
 
 
 def _relative(path):
@@ -94,8 +102,18 @@ def _relative(path):
 
 def _tight(sites):
     """The (file, seconds) deadlines under the hang bound that no test is about.
-    0 is no deadline: the product then sets no timeout at all."""
-    return [site for site in sites if 0 < site[1] < HANG_SECONDS and site not in UNDER_TEST]
+    0 is no deadline: the product then sets no timeout at all. An UNDER_TEST
+    entry excuses the sites it counts, so one more deadline of the same length
+    in that file still shows."""
+    short = Counter(site for site in sites if 0 < site[1] < HANG_SECONDS)
+    return sorted((short - EXCUSED).elements())
+
+
+def test_an_excused_deadline_covers_one_site_not_its_whole_file():
+    excused = ("e2e/test_mutate_e2e.py", 3)
+
+    assert _tight([excused]) == []
+    assert _tight([excused, excused]) == [excused]
 
 
 def _mutation_deadlines(path):
@@ -122,7 +140,7 @@ def _spelled_timeout(keyword):
 
 
 def _lane_timeouts(path):
-    lanes = filter(_is_lane, ast.walk(ast.parse(path.read_text(encoding="utf-8"))))
+    lanes = filter(_is_lane, ast.walk(code_tree(path)))
     return [(_relative(path), keyword.value.value) for lane in lanes
             for keyword in filter(_spelled_timeout, lane.keywords)]
 

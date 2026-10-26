@@ -137,7 +137,8 @@ def test_the_sample_payload_carries_every_envelope_key_the_command_emits():
     sample = _sample_payload()
 
     assert set(sample) == {"schema", "empty", "item", "run_id", "commit",
-                           "skipped_no_lane", "stale"}
+                           "skipped_no_lane", "stale", "scored_changes", "commands",
+                           "shallow"}
 
 
 def test_the_sample_item_carries_every_key_the_payload_builder_returns():
@@ -147,7 +148,7 @@ def test_the_sample_item_carries_every_key_the_payload_builder_returns():
 
 
 def test_the_sample_payload_is_printed_with_sorted_keys():
-    line = [ln for ln in _doc(README).splitlines() if ln.startswith('{"commit"')][0]
+    line = [ln for ln in _doc(README).splitlines() if ln.startswith('{"comm')][0]
 
     assert line == json.dumps(json.loads(line), sort_keys=True), \
         "every read command prints sorted-keys JSON; the sample has to look like one"
@@ -211,11 +212,13 @@ def test_the_provider_install_is_pinned_to_the_vitest_major():
     assert 'npm i -D "@vitest/coverage-v8@<your vitest major>"' in step
 
 
-def test_the_provider_step_shows_both_worked_examples():
+def test_the_provider_step_reads_the_major_and_shows_the_one_npm_installs():
+    """`npm i -D vitest` installs vitest 5, so worked examples for 2 and 3 sent a
+    fresh repo to a provider its vitest refuses."""
     step = _provider_step()
 
-    for major in ("2", "3"):
-        assert f'"@vitest/coverage-v8@{major}"' in step, f"no worked example for vitest {major}"
+    assert "`npm ls vitest`" in step
+    assert '"@vitest/coverage-v8@5"' in step, "no worked example for vitest 5"
 
 
 def test_the_failed_lane_step_says_it_stores_nothing():
@@ -246,7 +249,8 @@ def test_the_handbook_links_out_by_url_not_by_relative_path():
     assert 'href="../' not in page
     assert not re.search(r'href="[^"#:]*[.]md[#"]', page),         "the handbook links a .md file by relative path; Pages downloads those"
     for name in ("README.md", "AGENTS.md", "docs/lanes.md", "docs/ratchet.md",
-                 "docs/configuration.md", "docs/agent-json.md", "docs/adoption.md"):
+                 "docs/configuration.md", "docs/agent-json.md", "docs/adoption.md",
+                 "docs/accuracy.md"):
         assert f'href="{BLOB}/{name}"' in page, f"the handbook lost its {name} link"
 
 
@@ -279,6 +283,7 @@ def _packet_keys(monkeypatch) -> set[str]:
     import crapkit.coupling_cache
     import crapkit.dup
     import crapkit.gitio
+    import crapkit.marks_history
 
     row = ScoredRow("core", "core/alpha.py", "alpha( a )", 1, 20, 8, 8, 8, 18, 1, 2,
                     0.5, "untested", 64.0, "decompose", 7)
@@ -293,14 +298,15 @@ def _packet_keys(monkeypatch) -> set[str]:
                          ("_brief_versions", {"crapkit": "0"})):
         monkeypatch.setattr(queue, name, lambda *a, _v=answer, **k: _v)
     for module, name in ((crapkit.coupling_cache, "load_coupling"),
-                         (crapkit.dup, "twins_in"), (crapkit.gitio, "file_log_patches")):
+                         (crapkit.dup, "twins_in"), (crapkit.marks_history, "file_log")):
         monkeypatch.setattr(module, name, lambda *a, **k: [])
     store = SimpleNamespace(read_rows=lambda *a, **k: [row],
                             read_scored=lambda *a, **k: [row],
                             read_scored_file=lambda *a, **k: [row],
                             function_history=lambda *a, **k: [],
-                            attempts_for=lambda keys: {key: [] for key in keys},
-                            twin_index=lambda run_id, build: build())
+                            attempts_for=lambda keys, names_in=None: {key: [] for key in keys},
+                            twin_index=lambda run_id, build: build(),
+                            run_sources=lambda run_id: None)
     loader = queue._BriefLoader(Path("/repo"), cfg, store, {"id": 7, "commit": "abc123def4567"})
     # `schema` is stamped on the way out by _print_json, not by the builder
     return set(queue._brief_packet(loader, row)) | {"schema"}

@@ -12,17 +12,20 @@ from typing import NamedTuple
 
 from .. import __version__
 from ..cache import merged_cache
-from ..errors import ConfigError, CrapkitError, ToolError
+from ..errors import ConfigError, CrapkitError, GitError, ToolError
+from ..invariants import check_rows
 from ..gitio import GitFacts, ls_files
 from ..invocation import _self
+from ..repopath import typed_path
 from ..snapshot import build_inventory_rows, tsv_lines
 from ..store import SnapshotStore
-from ..universe import assign_files, scan_files
+from ..universe import assign_files
 from ..uncovered import DeadLineFold
 from ._shared import (_analysis_tools, _command_root, _emit_findings, _file_sizer, _gate_line,
                       _latest_scored, _load_repo_config, _load_sources, _print_json,
-                      _ratchet_entries, _repo_out_path, _repo_relative, _stand,
-                      _write_tsv)
+                      _print_unread, _ratchet_entries, _refuse_unwritable_outputs,
+                      _repo_out_path, _say_left_out, _scan, _scored_arguments, _stand,
+                      _unreadable_json, _write_tsv)
 
 
 def _tracked_files(files_by_scope: dict) -> list[str]:
@@ -31,12 +34,19 @@ def _tracked_files(files_by_scope: dict) -> list[str]:
 
 
 def _present_on_disk(root: Path, tracked: list[str]) -> list[str]:
-    """Keep the tracked paths that exist, naming each dropped one on stderr."""
+    """Keep the tracked paths that exist, naming each dropped one on stderr in
+    `tracked`'s order. A set difference named them in hash order, which moves
+    with the per-process string hash seed, so one tree printed another order on
+    every run."""
     # git ls-files lists staged deletions too; a tracked-but-absent file has no
     # functions and must not crash the run
-    present = [f for f in tracked if (root / f).is_file()]
-    for gone in set(tracked) - set(present):
-        print(f"crapkit: tracked file missing from working tree, skipped: {gone}", file=sys.stderr)
+    present = []
+    for path in tracked:
+        if (root / path).is_file():
+            present.append(path)
+        else:
+            print(f"crapkit: tracked file missing from working tree, skipped: {path}",
+                  file=sys.stderr)
     return present
 
 
@@ -75,24 +85,59 @@ def _analyzed_corpus(root: Path, cache_path: Path, flat: list,
 
 
 class _Corpus(NamedTuple):
-    """What the analyzed file list came to: files in, files the byte ceiling cut."""
+    """What the analyzed file list came to: files in, files the byte ceiling
+    cut, {path: why} for the files no reader could read, {scope: files} for
+    the declared scopes that scored no function, and the unreadable names no
+    scope takes, left out."""
     files: int
     skipped_max_bytes: int
+    unread: dict = {}
+    empty_scopes: dict = {}
+    unreadable: tuple[str, ...] = ()
+
+
+def _empty_scopes(cfg, by_scope: dict, unread: dict) -> dict[str, int]:
+    """{scope: its file count} for every declared scope that claims no file, or
+    whose every file no reader could read: it scored no function, and a run
+    with nothing scored in it reads as 0 over the ceiling."""
+    return {s.name: len(by_scope.get(s.name, ())) for s in cfg.scopes
+            if set(by_scope.get(s.name, ())) <= unread.keys()}
+
+
+def _empty_scope_line(scope, files: int) -> str:
+    if files:
+        return (f"warning: scope {scope.name!r} scored no function: no reader could read any "
+                f"of its {files} file(s), named above")
+    return (f"warning: scope {scope.name!r} claims no file (paths: {', '.join(scope.paths)}; "
+            f"languages: {', '.join(scope.languages)}), so none of its code was scored; point "
+            f"its paths and languages at the code in crapkit.toml, and `{_self()} doctor` "
+            "lists the files each scope claims")
+
+
+def _warn_empty_scopes(cfg, empty: dict[str, int]) -> None:
+    for scope in cfg.scopes:
+        if scope.name in empty:
+            print(_empty_scope_line(scope, empty[scope.name]), file=sys.stderr)
 
 
 def _build_inventory(root: Path, cfg, git=None) -> tuple[str, list, _Corpus, int, dict]:
     """Shared by inventory/coverage: returns (commit, rows, corpus, cache_hits, tool_versions)."""
     lizard, *_ = _analysis_tools()
-    from ..analyze import ANALYSIS_VERSION
+    from ..analyze import ANALYSIS_VERSION, unread_reasons
     commit = (git or GitFacts(root)).head_commit()
-    universe = scan_files(ls_files(root), cfg, size_of=_file_sizer(root))
+    universe = _scan(root, ls_files(root), cfg)
+    _say_left_out(universe.unreadable)
     flat = _present_on_disk(root, _tracked_files(universe.by_scope))
     records_by_path, cache_hits = _analyzed_corpus(
         root, root / ".crapkit" / "cache.json", flat, _analysis_workers(cfg), cfg.analysis_worker_budget)
     rows = build_inventory_rows(_records_by_scope(universe.by_scope, records_by_path))
     tool_versions = {"crapkit": __version__, "lizard": lizard.version,
                      "analysis_version": str(ANALYSIS_VERSION)}
-    return commit, rows, _Corpus(len(flat), len(universe.oversized)), cache_hits, tool_versions
+    unread = unread_reasons(records_by_path)
+    empty = _empty_scopes(cfg, universe.by_scope, unread)
+    _warn_empty_scopes(cfg, empty)
+    corpus = _Corpus(len(flat), len(universe.oversized), unread, empty, universe.unreadable)
+    return commit, rows, corpus, cache_hits, tool_versions
 
 
 def _record_twin_index(root: Path, store: SnapshotStore, run_id: int) -> None:
@@ -111,17 +156,19 @@ def _record_twin_index(root: Path, store: SnapshotStore, run_id: int) -> None:
 def cmd_inventory(args: argparse.Namespace) -> int:
     root = _command_root(args.repo)
     cfg = _load_repo_config(root)
+    _refuse_unwritable_outputs(root, {"--export": args.export})
     commit, rows, corpus, cache_hits, tool_versions = _build_inventory(root, cfg)
     state_dir = root / ".crapkit"
 
-    db_path = Path(args.db) if args.db else state_dir / "crap.sqlite"
+    db_path = typed_path(args.db) if args.db else state_dir / "crap.sqlite"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     store = SnapshotStore(db_path)
+    check_rows(rows, cfg.ceiling_of)
     run_id = store.write_run(commit=commit, tool_versions=tool_versions, rows=rows, kind="inventory")
     _record_twin_index(root, store, run_id)
 
     if args.export:
-        _write_tsv(_repo_out_path(root, args.export), tsv_lines(rows))
+        _write_tsv(_repo_out_path(root, args.export, "--export"), tsv_lines(rows))
 
     summary = {
         "run_id": run_id,
@@ -130,6 +177,8 @@ def cmd_inventory(args: argparse.Namespace) -> int:
         "functions": len(rows),
         "cache_hits": cache_hits,
         "skipped_max_bytes": corpus.skipped_max_bytes,
+        "empty_scopes": corpus.empty_scopes,
+        "unreadable_names": _unreadable_json(corpus.unreadable),
         "db": str(db_path),
     }
     if args.json:
@@ -140,31 +189,32 @@ def cmd_inventory(args: argparse.Namespace) -> int:
     return 0
 
 
-def _lane_reuse(root: Path, lane, reuse_artifacts: bool, reuse_unchanged: bool):
+def _lane_reuse(fresh, lane, reuse_artifacts: bool, reuse_unchanged: bool):
     """The lane's verdict under --reuse-unchanged, None when that was not asked,
     with one stderr line either way: the commit it reuses, or why it reruns. A
     declined reuse printed nothing, and on a large consumer repo it costs a
     rerun of up to 88 minutes."""
-    from ..lanes import lane_reuse_verdict
-
     if reuse_artifacts or not reuse_unchanged:
         return None
-    verdict = lane_reuse_verdict(root, lane)
-    _report_reuse(lane.name, verdict)
+    verdict = fresh.reuse(lane)
+    _report_reuse(lane.name, verdict, fresh.leaves_out(lane))
     return verdict
 
 
-def _report_reuse(name: str, verdict) -> None:
-    if verdict.commit:
-        print(f"crapkit: lane {name!r}: measurement inputs unchanged; reusing without rerun "
-              f"(artifact built at {verdict.commit[:11]})", file=sys.stderr)
-    else:
+def _report_reuse(name: str, verdict, leaves_out: str) -> None:
+    """A reuse names what its proof leaves out: gitignored files and whatever
+    lives outside the repository never enter it, so an edit there reuses."""
+    if not verdict.commit:
         print(f"crapkit: lane {name!r}: rerunning: {verdict.reason}", file=sys.stderr)
+        return
+    print(f"crapkit: lane {name!r}: measurement inputs unchanged; reusing without rerun "
+          f"(artifact built at {verdict.commit[:11]}); its proof leaves out {leaves_out}",
+          file=sys.stderr)
 
 
-def _reuse_decisions(root: Path, lanes, reuse_artifacts: bool, reuse_unchanged: bool):
+def _reuse_decisions(fresh, lanes, reuse_artifacts: bool, reuse_unchanged: bool):
     """Each lane's verdict under --reuse-unchanged, and whether the lane reuses."""
-    verdicts = {lane: _lane_reuse(root, lane, reuse_artifacts, reuse_unchanged) for lane in lanes}
+    verdicts = {lane: _lane_reuse(fresh, lane, reuse_artifacts, reuse_unchanged) for lane in lanes}
     return verdicts, {lane: _reused(verdict, reuse_artifacts) for lane, verdict in verdicts.items()}
 
 
@@ -185,45 +235,45 @@ def _progress(message: str) -> None:
     sys.stderr.write(f"crapkit: {message}\n")
 
 
-def _run_one_lane(root: Path, lane, reuse: bool, scope_paths: dict | None, git, dead_lines=None, owner=None):
+def _run_one_lane(fresh, lane, reuse: bool, dead_lines=None, owner=None):
     """One lane's outcome or the error that failed it; a failed lane never sinks
-    the run. The error object, not its text: a refusal carries the modification
-    times of the files the attempt left unwritten, which the fold persists."""
+    the run. The error object, not its text: a refusal carries the sha256 of
+    each file the attempt left unwritten, which the fold persists."""
     from ..lanes import run_lane
 
     try:
-        return run_lane(root, lane, reuse_artifact=reuse, scope_paths=scope_paths, git=git,
-                        dead_lines=dead_lines, owner=owner), ""
+        return run_lane(fresh.root, lane, reuse_artifact=reuse, dead_lines=dead_lines,
+                        owner=owner, freshness=fresh), ""
     except ToolError as exc:
         return None, exc
 
 
-def _traced_lane(root: Path, lane, reuse: bool, scope_paths: dict | None, git, dead_lines=None, owner=None):
+def _traced_lane(fresh, lane, reuse: bool, dead_lines=None, owner=None):
     _progress(f"lane {lane.name!r} started")
-    outcome = _run_one_lane(root, lane, reuse, scope_paths, git, dead_lines, owner)
+    outcome = _run_one_lane(fresh, lane, reuse, dead_lines, owner)
     _progress(f"lane {lane.name!r} finished")
     return outcome
 
 
-def _execute_parallel(root: Path, ordered, reuse: dict, scope_paths, git, max_parallel: int,
-                      dead_lines=None, owner=None) -> dict:
+def _execute_parallel(fresh, ordered, reuse: dict, max_parallel: int, dead_lines=None,
+                      owner=None) -> dict:
     """Lanes are subprocess-bound, so threads are enough: subprocess.run drops the
     GIL for the whole command and each lane streams to its own log file."""
     from concurrent.futures import ThreadPoolExecutor
 
     with ThreadPoolExecutor(max_workers=max_parallel) as pool:
-        futures = {lane: pool.submit(_traced_lane, root, lane, reuse[lane], scope_paths, git, dead_lines, owner)
+        futures = {lane: pool.submit(_traced_lane, fresh, lane, reuse[lane], dead_lines, owner)
                    for lane in ordered}
     return {lane: future.result() for lane, future in futures.items()}
 
 
-def _execute_lanes(root: Path, ordered, reuse: dict, scope_paths, git, max_parallel: int,
-                   dead_lines=None, owner=None) -> dict:
+def _execute_lanes(fresh, ordered, reuse: dict, max_parallel: int, dead_lines=None,
+                   owner=None) -> dict:
     """Lane outcomes, serial below 2 and parallel otherwise."""
     if max_parallel < 2:
-        return {lane: _run_one_lane(root, lane, reuse[lane], scope_paths, git, dead_lines, owner)
+        return {lane: _run_one_lane(fresh, lane, reuse[lane], dead_lines, owner)
                 for lane in ordered}
-    return _execute_parallel(root, ordered, reuse, scope_paths, git, max_parallel, dead_lines, owner)
+    return _execute_parallel(fresh, ordered, reuse, max_parallel, dead_lines, owner)
 
 
 def _refuse_all_failed(lanes, lane_errors: dict, succeeded: list) -> None:
@@ -278,17 +328,18 @@ def _run_owned_lanes(root, lanes, reuse_artifacts, scope_paths, reuse_unchanged,
 
     Every reuse decision is taken up front, on one thread: it reads the working
     tree and a lane command WRITES to the working tree, so deciding lane by lane
-    would let one lane's output change the next lane's answer. Results then merge
-    in declaration order however the lanes finished, so max_parallel_lanes moves
-    wall time only — never a score.
+    would let one lane's output change the next lane's answer. The stamp file is
+    read once for the whole command (lane_freshness.Freshness). Results then
+    merge in declaration order however the lanes finished, so
+    max_parallel_lanes moves wall time only — never a score.
     """
+    from ..lane_freshness import Freshness
     from ..lanes import lane_order
 
-    facts = git or GitFacts(root)
-    verdicts, reuse = _reuse_decisions(root, lanes, reuse_artifacts, reuse_unchanged)
-    ordered = lane_order(root, list(lanes)) if max_parallel > 1 else list(lanes)
-    outcomes = _execute_lanes(root, ordered, reuse, scope_paths, facts, max_parallel,
-                              dead_lines, owner)
+    fresh = Freshness(root, lanes, scope_paths, git=git or GitFacts(root))
+    verdicts, reuse = _reuse_decisions(fresh, lanes, reuse_artifacts, reuse_unchanged)
+    ordered = lane_order(root, list(lanes), fresh.stamps) if max_parallel > 1 else list(lanes)
+    outcomes = _execute_lanes(fresh, ordered, reuse, max_parallel, dead_lines, owner)
     if owner is not None:
         owner.check()
     collected = _collect_lanes(root, lanes, outcomes)
@@ -305,7 +356,8 @@ class _ScoredRun(NamedTuple):
     inside the lanes that ran. coverage exits 5 on a lane error and reads no test
     failure; verify refuses to conclude on a lane error and weighs each test
     failure against its baseline. `corpus` and `cache_hits` are coverage's report
-    line, which is why verify names neither."""
+    line, which is why verify names neither. `sources` is the run's content
+    record for the store (store.write_run), None when git could not give it."""
     commit: str
     scored: list
     provenance: dict
@@ -315,6 +367,7 @@ class _ScoredRun(NamedTuple):
     corpus: _Corpus
     cache_hits: int
     dead_lines: DeadLineFold | None = None
+    sources: dict | None = None
 
 
 def _scored_run(root: Path, cfg, lanes, *, reuse_artifacts: bool, reuse_unchanged: bool = False,
@@ -324,10 +377,12 @@ def _scored_run(root: Path, cfg, lanes, *, reuse_artifacts: bool, reuse_unchange
     `git` is the caller's GitFacts when it already has one — verify asks for the
     dirty set before this runs, and that answer is the one the lanes must see too.
     """
+    from ..lane_results import failure_ids
     from ..score import SharedSpanFold, score_rows
 
     git = git or GitFacts(root)
     commit, rows, corpus, cache_hits, tool_versions = _build_inventory(root, cfg, git)
+    sources = _content_record(root, rows)
     dead_lines = DeadLineFold()
 
     coverage_by_path, provenance, lane_errors, succeeded = _run_lanes(
@@ -343,9 +398,19 @@ def _scored_run(root: Path, cfg, lanes, *, reuse_artifacts: bool, reuse_unchange
                         cc_only_scopes=cfg.coverage_optional_scopes,
                         shared_spans=shared_spans)
     _note_shared_spans(shared_spans, cfg)
-    test_failures = {f for prov in provenance.values() for f in prov.get("failures", ())}
-    return _ScoredRun(commit, scored, provenance, lane_errors, test_failures, tool_versions,
-                      corpus, cache_hits, dead_lines)
+    return _ScoredRun(commit, scored, provenance, lane_errors, set(failure_ids(provenance)),
+                      tool_versions, corpus, cache_hits, dead_lines, sources)
+
+
+def _content_record(root: Path, rows) -> dict | None:
+    """The git blob id of every scored file as the inventory read it, which
+    `scored_changes` compares with the tree; None when git cannot give it."""
+    from ..lane_sources import record
+
+    try:
+        return record(root, {row.path for row in rows})
+    except GitError:
+        return None
 
 
 _SPANS_NAMED = 3
@@ -358,11 +423,11 @@ def _over_target_at_zero(members, cfg):
     complexity 2 scores 6 at zero coverage, so no ceiling of 6 can fail it.
     The count carries those; the named lines are the ones worth splitting.
     """
-    from ..score import crap
+    from ..score import crap, over_ceiling
 
     for span in members:
         worst = max(span, key=lambda row: row.ccn)
-        if crap(worst.ccn, 0.0) > cfg.ceiling_of(worst.scope):
+        if over_ceiling(crap(worst.ccn, 0.0), cfg.ceiling_of(worst.scope)):
             yield worst
 
 
@@ -390,7 +455,7 @@ def _run_kind(lanes, cfg, failures) -> str:
     """A --lane subset or a run with failed lanes must never serve as the
     verify baseline: its lane set differs from what verify runs, so every
     pre-existing failure in the missing lanes would read as NEW forever."""
-    full = not failures and {l.name for l in lanes} == {l.name for l in cfg.lanes}
+    full = not failures and {lane.name for lane in lanes} == {lane.name for lane in cfg.lanes}
     return "coverage" if full else "partial"
 
 
@@ -436,14 +501,14 @@ def _refuse_empty_lane_run(cfg, requested) -> None:
         raise ConfigError(f"no lane named {requested!r}")
     if cfg.lane_less_scopes:
         raise ConfigError(
-            f"no [[lane]] to run for scope(s) {', '.join(cfg.lane_less_scopes)} — declare a "
+            f"no [[lane]] to run for scope(s) {', '.join(cfg.lane_less_scopes)} - declare a "
             "[[lane]] measuring them in crapkit.toml, or set coverage_optional = true on a "
             "scope no coverage parser can read")
 
 
 def _select_lanes(cfg, requested):
     """The lanes this run executes; an empty list is a legitimate answer."""
-    lanes = [l for l in cfg.lanes if requested is None or l.name == requested]
+    lanes = [lane for lane in cfg.lanes if requested is None or lane.name == requested]
     if not lanes:
         _refuse_empty_lane_run(cfg, requested)
     return lanes
@@ -452,11 +517,11 @@ def _select_lanes(cfg, requested):
 def _export_scored(root: Path, export: str, scored) -> None:
     from ..score import scored_tsv_lines
 
-    _write_tsv(_repo_out_path(root, export), scored_tsv_lines(scored))
+    _write_tsv(_repo_out_path(root, export, "--export"), scored_tsv_lines(scored))
 
 
 def _flag_counts(scored) -> dict[str, int]:
-    flags = {"measured": 0, "untested": 0, "no-lane": 0, "cc-only": 0}
+    flags = {"measured": 0, "untested": 0, "excluded": 0, "no-lane": 0, "cc-only": 0}
     for r in scored:
         flags[r.flag] += 1
     return flags
@@ -479,23 +544,29 @@ def _judged_rows(scored, unmeasured: list[str]) -> list:
 
 
 def _coverage_summary(run_id: int, run: _ScoredRun, cfg, shape: _RunShape, db_path) -> dict:
-    from ..score import grade
+    """The run's summary, its counts and grade checked against their bounds
+    before anything prints it (`invariants.check_summary`)."""
+    from ..invariants import check_summary
+    from ..score import crap_load, grade, over_ceiling
 
     flags = _flag_counts(run.scored)
     judged = _judged_rows(run.scored, shape.unmeasured)
-    over = sum(1 for r in judged if r.crap > cfg.ceiling_of(r.scope))
-    return {
+    over = sum(1 for r in judged if over_ceiling(r.crap, cfg.ceiling_of(r.scope)))
+    summary = {
         "run_id": run_id, "commit": run.commit, "files": run.corpus.files,
         "functions": len(run.scored), "cache_hits": run.cache_hits,
         "measured": flags["measured"], "untested": flags["untested"],
-        "no_lane": flags["no-lane"], "cc_only": flags["cc-only"],
-        "skipped_max_bytes": run.corpus.skipped_max_bytes,
+        "excluded": flags["excluded"], "no_lane": flags["no-lane"], "cc_only": flags["cc-only"],
+        "skipped_max_bytes": run.corpus.skipped_max_bytes, "empty_scopes": run.corpus.empty_scopes,
+        "unreadable_names": _unreadable_json(run.corpus.unreadable),
         "over_target": over, "grade": grade(over, len(judged)),
         "by_scope": _by_scope(run.scored, cfg),
-        "crap_load": round(sum(r.crap for r in run.scored), 2), "lanes": run.provenance,
+        "crap_load": round(crap_load(r.crap for r in judged), 2), "lanes": run.provenance,
         "lane_failures": run.lane_errors, "db": str(db_path),
         "kind": shape.kind, "unmeasured_scopes": shape.unmeasured, "ceilings": cfg.ceilings,
     }
+    check_summary(summary, len(judged))
+    return summary
 
 
 def _lanes_word(names: list[str]) -> str:
@@ -515,9 +586,10 @@ def _partial_opening(shape: _RunShape) -> str:
 
 
 def _bucket_text(summary: dict) -> str:
-    """The four flags counted, zero buckets dropped: `2 measured / 1 no-lane`."""
+    """The five flags counted, zero buckets dropped: `2 measured / 1 no-lane`."""
     buckets = [(summary["measured"], "measured"), (summary["untested"], "untested"),
-               (summary["no_lane"], "no-lane"), (summary["cc_only"], "cc-only")]
+               (summary["excluded"], "excluded"), (summary["no_lane"], "no-lane"),
+               (summary["cc_only"], "cc-only")]
     return " / ".join(f"{n} {word}" for n, word in buckets if n)
 
 
@@ -550,12 +622,20 @@ def _next_command(kind: str, root: Path) -> str:
 # What the hinted run does on a dirty tree: reuse proves a lane without `inputs`
 # only at a clean HEAD, so every such lane runs again.
 _DIRTY_TREE_NOTE = "(the working tree has uncommitted changes, so every lane that lists no `inputs` reruns)"
+_UNREAD_TREE_NOTE = ("(git cannot say whether the working tree is clean ({error}), so every lane "
+                     "that lists no `inputs` reruns)")
 
 
 def _dirty_note(root: Path) -> str:
-    from ..lanes import uncommitted_changes
+    """The note for a dirty tree, and for a tree git cannot read: that one
+    proves no lane either, and reading the failure as clean hid the note."""
+    from ..lane_freshness import uncommitted_changes
 
-    return f" {_DIRTY_TREE_NOTE}" if uncommitted_changes(root) else ""
+    try:
+        dirty = uncommitted_changes(root)
+    except GitError as exc:
+        return f" {_UNREAD_TREE_NOTE.format(error=exc)}"
+    return f" {_DIRTY_TREE_NOTE}" if dirty else ""
 
 
 def _print_coverage(as_json: bool, summary: dict, shape: _RunShape, root: Path) -> None:
@@ -578,13 +658,10 @@ def _warn_suite_drop(store: SnapshotStore, provenance: dict) -> None:
     baseline; `coverage` is the command that WRITES a baseline, and until now it
     said nothing at all about a suite that halved.
     """
-    from ..lanes import suite_drops
+    from ..lane_results import suite_drops
     from ..store import trusted_runs
 
-    trusted = trusted_runs(store)
-    if not trusted:
-        return
-    for note in suite_drops(trusted[-1]["lanes"], provenance):
+    for note in suite_drops(lambda: reversed(trusted_runs(store)), provenance):
         print(f"crapkit: {note}", file=sys.stderr)
 
 
@@ -592,6 +669,7 @@ def cmd_coverage(args: argparse.Namespace) -> int:
     root = _command_root(args.repo)
     cfg = _load_repo_config(root)
     lanes = _select_lanes(cfg, args.lane)
+    _refuse_unwritable_outputs(root, {"--export": args.export, "--sarif": args.sarif})
 
     run = _scored_run(root, cfg, lanes, reuse_artifacts=args.reuse_artifacts,
                       reuse_unchanged=args.reuse_unchanged)
@@ -601,8 +679,9 @@ def cmd_coverage(args: argparse.Namespace) -> int:
     store = SnapshotStore(db_path)
     _warn_suite_drop(store, run.provenance)
     shape = _run_shape(lanes, cfg, run)
+    check_rows(run.scored, cfg.ceiling_of)
     run_id = store.write_run(commit=run.commit, tool_versions=run.tool_versions, rows=run.scored,
-                             lanes=run.provenance, kind=shape.kind)
+                             lanes=run.provenance, kind=shape.kind, sources=run.sources)
     _record_twin_index(root, store, run_id)
     if args.export:
         _export_scored(root, args.export, run.scored)
@@ -693,20 +772,23 @@ def _refuse_missing(root: Path, rel_paths: list) -> None:
         raise ConfigError(f"{', '.join(missing)} does not exist under {root}")
 
 
-def _rescore_analyze(root: Path, cfg, files, cwd: Path | None = None) -> tuple[list, list, dict]:
+def _rescore_analyze(root: Path, cfg, files,
+                     cwd: Path | None = None) -> tuple[list, list, dict, dict]:
     """Fresh complexity for the named files, said from `cwd` where the user
-    stands. A commit's worth of files leaves the shared cache alone; more are
-    merged into it, never truncated."""
+    stands, and {path: why} for the ones no reader could read. A commit's
+    worth of files leaves the shared cache alone; more are merged into it,
+    never truncated."""
+    from ..analyze import unread_reasons
     from ..hook import file_ceilings
 
-    rel_paths = sorted({_repo_relative(p, root, cwd) for p in files})
+    rel_paths = _scored_arguments(files, root, cfg, cwd)
     _refuse_missing(root, rel_paths)
     files_by_scope = assign_files(rel_paths, cfg, size_of=_file_sizer(root))
     flat = _tracked_files(files_by_scope)
     records_by_path = _rescored_records(root, root / ".crapkit" / "cache.json", flat,
                                         _analysis_workers(cfg), cfg.analysis_worker_budget)
     rows = build_inventory_rows(_records_by_scope(files_by_scope, records_by_path))
-    return rows, flat, file_ceilings(cfg, files_by_scope, flat)
+    return rows, flat, file_ceilings(cfg, files_by_scope, flat), unread_reasons(records_by_path)
 
 
 def _baseline_rows(store: SnapshotStore, run_id: int, flat: list) -> list:
@@ -727,8 +809,10 @@ def _baseline_rows(store: SnapshotStore, run_id: int, flat: list) -> list:
     return rows
 
 
-def _rescore_overlay(store: SnapshotStore, latest: dict, rows: list, flat: list, cfg):
-    """Fresh complexity joined onto the LATEST run's stale coverage, by NAME first."""
+def _rescore_overlay(store: SnapshotStore, latest: dict, rows: list, flat: list, cfg,
+                     unjoined: set | None = None):
+    """Fresh complexity joined onto the LATEST run's stale coverage, by NAME first.
+    `unjoined` collects the rows whose cov no measurement stands behind."""
     from ..score import overlay_stale_coverage
 
     lane_scopes = {s for prov in latest["lanes"].values() for s in prov.get("scopes", ())}
@@ -736,10 +820,26 @@ def _rescore_overlay(store: SnapshotStore, latest: dict, rows: list, flat: list,
                                   lane_scopes=lane_scopes, target=cfg.target,
                                   scope_targets=cfg.scope_targets,
                                   cc_only_scopes=cfg.coverage_optional_scopes,
-                                  baseline_run_id=latest["id"])
+                                  baseline_run_id=latest["id"], unjoined=unjoined)
 
 
-def _rescore_json(overlay, latest: dict, gate: dict | None = None) -> None:
+def _unmeasured(row, unjoined: set) -> bool:
+    """No measurement behind this row's cov: the overlay found nothing to join
+    it to (a function added or renamed since the run), or its flag says no
+    artifact can speak about its scope."""
+    from ..score import unjoined as unjoined_flag
+
+    return row in unjoined or unjoined_flag(row.flag)
+
+
+# What every rescore payload says about its two sources, check_gate's verdict
+# on a name that is not UTF-8 included.
+RESCORE_NOTE = ("coverage is the baseline run's; complexity is the working tree's. "
+                "Run verify for the real verdict.")
+
+
+def _rescore_json(overlay, latest: dict, gate: dict | None = None,
+                  unjoined: set = frozenset()) -> None:
     """The functions, and under --gate the verdict beside them: one object,
     so an agent reading the payload never has to read stderr for the finding."""
     payload = {
@@ -748,9 +848,9 @@ def _rescore_json(overlay, latest: dict, gate: dict | None = None) -> None:
             "scope": r.scope, "path": r.path, "function": r.long_name, "start": r.start,
             "occurrence": r.occurrence,
             "end": r.end, "ccn": r.ccn, "cov": r.cov, "flag": r.flag, "crap": r.crap,
-            "remedy": r.remedy, "stale_coverage": True,
+            "remedy": r.remedy, "stale_coverage": True, "unmeasured": _unmeasured(r, unjoined),
         } for r in overlay],
-        "note": "coverage is the baseline run's; complexity is the working tree's. Run verify for the real verdict.",
+        "note": RESCORE_NOTE,
     }
     if gate is not None:
         payload["gate"] = gate
@@ -779,18 +879,25 @@ def _ceiling_breaches(rows, ceilings: dict[str, int], keys: dict | None = None) 
     return breaches
 
 
-def _gate_candidates(root: Path, rows: list) -> list:
-    """The functions this commit could be about: spans the working tree changed
-    against HEAD, index included, which is the set the pre-commit hook will see.
+def _changed_since_head(root: Path) -> dict:
+    """The spans the working tree changed against HEAD, index included, which is
+    the set the pre-commit hook will see."""
+    from ..diffparse import worktree_ranges
+    from ..gitio import diff_since
+
+    return worktree_ranges(diff_since(root, "HEAD"), root)
+
+
+def _gate_candidates(rows: list, ranges: dict, untracked: set[str]) -> list:
+    """The functions this commit could be about: the rows `ranges` touch, and
+    every row of an untracked file, which git diff cannot scope.
 
     Judging the whole file instead would flag every legacy function in it, so on
     any repo with seeded debt the flag is red forever and says nothing.
     """
-    from ..diffparse import changed_ranges
-    from ..gitio import diff_since
     from ..verify import touched_rows
 
-    return touched_rows(rows, changed_ranges(diff_since(root, "HEAD")))
+    return touched_rows(rows, ranges) + [r for r in rows if r.path in untracked]
 
 
 def _unmarked_breaches(breaches: list, entries: list) -> list:
@@ -811,32 +918,36 @@ def _unmarked_breaches(breaches: list, entries: list) -> list:
     return kept
 
 
-def _untracked_of(root: Path, overlay) -> set[str]:
+def _untracked_of(root: Path, paths: set[str]) -> set[str]:
     """Rescored paths git tracks nothing of. Invisible to git diff, so without
     special handling their violations print and then exit 0 — the one state
     where the gate lies."""
-    tracked = set(ls_files(root))
-    return {r.path for r in overlay} - tracked
+    return paths - set(ls_files(root))
 
 
 def _warn_untracked(untracked: set[str]) -> None:
     if untracked:
         print(f"crapkit: {len(untracked)} untracked file(s) gated in full "
-              f"({', '.join(sorted(untracked))}) — git add to gate only future edits",
+              f"({', '.join(sorted(untracked))}) - git add to gate only future edits",
               file=sys.stderr)
 
 
 class _GateVerdict(NamedTuple):
     """The commit's verdict, hours before the commit: what was judged, against
-    which ceiling per file, and the breaches no ratchet mark covers."""
+    which ceiling per file, the breaches no ratchet mark covers, the changed
+    files no reader could read, which it refuses because it judged nothing in
+    them, and the (path, start, long_name) of each row whose cov no measurement
+    stands behind."""
     judged: int
     ceilings: dict[str, int]
     breaches: list
     untracked: list[str]
+    unread: dict[str, str] = {}
+    unmeasured: frozenset = frozenset()
 
     @property
     def ok(self) -> bool:
-        return not self.breaches
+        return not (self.breaches or self.unread)
 
 
 def _unpardoned_breaches(root: Path, cfg, overlay, touched: list) -> list:
@@ -853,14 +964,28 @@ def _unpardoned_breaches(root: Path, cfg, overlay, touched: list) -> list:
     return _unmarked_breaches(touched, _ratchet_entries(root, cfg, overlay) or [])
 
 
-def _gate_verdict(root: Path, cfg, overlay, ceilings: dict[str, int]) -> _GateVerdict:
+def _gate_verdict(root: Path, cfg, overlay, ceilings: dict[str, int],
+                  unread: dict[str, str], unjoined: set = frozenset()) -> _GateVerdict:
+    """The verdict, once the rescored rows and the breaches meet their bounds
+    against the parsed config (`invariants.check_gate`)."""
+    from ..invariants import check_gate
     from ..keys import key_names
 
-    untracked = _untracked_of(root, overlay)
-    candidates = _gate_candidates(root, overlay) + [r for r in overlay if r.path in untracked]
+    untracked = _untracked_of(root, {r.path for r in overlay} | set(unread))
+    ranges = _changed_since_head(root)
+    candidates = _gate_candidates(overlay, ranges, untracked)
     touched = _ceiling_breaches(candidates, ceilings, key_names(overlay))
     breaches = _unpardoned_breaches(root, cfg, overlay, touched)
-    return _GateVerdict(len(candidates), ceilings, breaches, sorted(untracked))
+    check_gate(overlay, breaches, cfg.ceiling_of)
+    changed = {path: unread[path] for path in unread if path in ranges or path in untracked}
+    return _GateVerdict(len(candidates), ceilings, breaches, sorted(untracked), changed,
+                        _unmeasured_keys(candidates, unjoined))
+
+
+def _unmeasured_keys(rows, unjoined: set) -> frozenset:
+    """(path, start, long_name) of each row whose cov no measurement stands
+    behind, so the GATE line can say `cov -` where the table says so."""
+    return frozenset((r.path, r.start, r.long_name) for r in rows if _unmeasured(r, unjoined))
 
 
 def _breach_json(v, ceilings: dict[str, int]) -> dict:
@@ -871,10 +996,14 @@ def _breach_json(v, ceilings: dict[str, int]) -> dict:
 
 def _gate_json(verdict: _GateVerdict) -> dict:
     """The `gate` block of `rescore --gate --json`: the fields a wrapper needs
-    to say which function, which rule, and whether the tree clears the gate."""
+    to say which function, which rule, and whether the tree clears the gate.
+    `unread_files` has verify's name and shape; every file this gate judges is
+    a working-tree change, so each is dirty."""
     return {"ok": verdict.ok, "judged": verdict.judged, "ceilings": verdict.ceilings,
             "breaches": [_breach_json(v, verdict.ceilings) for v in verdict.breaches],
-            "untracked": verdict.untracked}
+            "untracked": verdict.untracked,
+            "unread_files": [{"path": path, "reason": why, "dirty": True}
+                             for path, why in sorted(verdict.unread.items())]}
 
 
 def _gate_ceiling_label(ceilings: dict[str, int]) -> str:
@@ -894,11 +1023,17 @@ def _report_gate(verdict: _GateVerdict, as_json: bool) -> int:
             print(f"gate: {verdict.judged} changed function(s) judged, "
                   f"0 over {_gate_ceiling_label(verdict.ceilings)}")
         return 0
-    print(f"crapkit gate: {len(verdict.breaches)} rescored function(s) over their scope ceiling:",
-          file=sys.stderr)
-    for v in verdict.breaches:
-        print(_gate_line(v), file=sys.stderr)
+    _print_unread(verdict.unread, "changed", file=sys.stderr)
+    _print_breaches(verdict.breaches, verdict.unmeasured)
     return 6
+
+
+def _print_breaches(breaches: list, unmeasured: frozenset = frozenset()) -> None:
+    if breaches:
+        print(f"crapkit gate: {len(breaches)} rescored function(s) over their scope ceiling:",
+              file=sys.stderr)
+    for v in breaches:
+        print(_gate_line(v, (v.path, v.start, v.long_name) in unmeasured), file=sys.stderr)
 
 
 def _rescore_baseline(root: Path) -> tuple[SnapshotStore, dict]:
@@ -906,11 +1041,11 @@ def _rescore_baseline(root: Path) -> tuple[SnapshotStore, dict]:
     refusal naming the command that makes one."""
     db_path = root / ".crapkit" / "crap.sqlite"
     if not db_path.is_file():
-        raise CrapkitError(f"no snapshot in {root} — run `{_self()} coverage` first")
+        raise CrapkitError(f"no snapshot in {root} - run `{_self()} coverage` first")
     store = SnapshotStore(db_path)
     latest = _latest_scored(store)
     if latest is None:
-        raise CrapkitError(f"no scored run in {root} — run `{_self()} coverage` first")
+        raise CrapkitError(f"no scored run in {root} - run `{_self()} coverage` first")
     return store, latest
 
 
@@ -919,19 +1054,30 @@ def cmd_rescore(args: argparse.Namespace) -> int:
     cfg = _load_repo_config(root)
     store, latest = _rescore_baseline(root)
 
-    rows, flat, ceilings = _rescore_analyze(root, cfg, args.files, cwd=_stand(args.repo))
-    overlay = _rescore_overlay(store, latest, rows, flat, cfg)
-    verdict = _gate_verdict(root, cfg, overlay, ceilings) if args.gate else None
+    rows, flat, ceilings, unread = _rescore_analyze(root, cfg, args.files, cwd=_stand(args.repo))
+    unjoined: set = set()
+    overlay = _rescore_overlay(store, latest, rows, flat, cfg, unjoined)
+    verdict = _gate_verdict(root, cfg, overlay, ceilings, unread, unjoined) if args.gate else None
     if args.json:
-        _rescore_json(overlay, latest, None if verdict is None else _gate_json(verdict))
+        _rescore_json(overlay, latest, None if verdict is None else _gate_json(verdict), unjoined)
     else:
-        _print_rescore_table(overlay, latest)
+        _print_rescore_table(overlay, latest, unjoined)
     return 0 if verdict is None else _report_gate(verdict, args.json)
 
 
-def _print_rescore_table(overlay, latest: dict) -> None:
+def _rescore_cov(r, unjoined: set) -> tuple[str, str]:
+    """The cov cell and the row's tail: a percentage, or a dash and the words
+    `coverage not measured` where a 0% stood for a number nobody took."""
+    if _unmeasured(r, unjoined):
+        return f"{'-':>5}", "  (coverage not measured)"
+    return f"{r.cov:>5.0%}", ""
+
+
+def _print_rescore_table(overlay, latest: dict, unjoined: set = frozenset()) -> None:
     """The refactor loop's view: fresh ccn, worst first, stale cov labeled."""
     print(f"rescore vs run {latest['id']} @ {latest['commit'][:11]} (coverage STALE, complexity fresh)")
     print(f"  {'ccn':>4} {'cov':>5} {'crap':>8}  {'remedy':11} function")
     for r in sorted(overlay, key=lambda x: (-x.ccn, x.path, x.start)):
-        print(f"  {r.ccn:>4} {r.cov:>5.0%} {r.crap:>8.1f}  {r.remedy:11} {r.path}:{r.start}  {r.long_name}")
+        cov, tail = _rescore_cov(r, unjoined)
+        print(f"  {r.ccn:>4} {cov} {r.crap:>8.1f}  {r.remedy:11} {r.path}:{r.start}  "
+              f"{r.long_name}{tail}")

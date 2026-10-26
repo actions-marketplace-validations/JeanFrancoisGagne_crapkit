@@ -31,7 +31,7 @@ next patch release and the advisory credits you unless you would rather it did n
 
 Configured commands run through `cmd.exe` on Windows and `sh` on POSIX,
 with the working directory and environment selected by the operation.
-Crapkit also starts Git and internal process owners; the table below describes
+crapkit also starts Git and internal process owners; the table below describes
 the commands a project config supplies.
 
 | What | When | What it runs |
@@ -82,8 +82,8 @@ write to their own configured destinations.
 | --- | --- |
 | `crap.sqlite` | the store: every scored run, its rows, its per-run rollups, and the override audit trail |
 | `cov/` and `lane-*.log` | where the lanes `init` writes put their artifacts, plus the streamed log of each lane run. A lane you write can point its artifact anywhere |
-| `churn-cache-v2.json`, `churn-commits-v1.json`, `churn-log-v2.z` | the git churn walk, cached per format version |
-| `coupling-cache-v1.json` | ranked coupling pairs at the default thresholds, keyed on HEAD, the churn window, the UTC date, the path format and a digest of the tracked set |
+| `churn-cache-v3.json`, `churn-commits-v1.json`, `churn-log-v3.z` | the git churn walk, cached per format version |
+| `coupling-cache-v2.json` | ranked coupling pairs at the default thresholds, keyed on HEAD, the churn window, the UTC date, the path format and a digest of the tracked set |
 | `mutate-pool/` | one git worktree per mutation worker, each a full checkout of HEAD |
 
 Mutation worktrees remain between runs so later runs can reuse their checkouts.

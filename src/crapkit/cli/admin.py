@@ -7,22 +7,31 @@ from __future__ import annotations
 
 import argparse
 import os
+import posixpath
 import re
 import sys
 from functools import lru_cache
 from pathlib import Path
+from typing import NamedTuple
 
 from .. import __version__, config
+from .._package import upgraded_to
 from ..config import load_config_text
 from ..doctor import Finding
-from ..errors import ConfigError, GitError, ToolError
+from ..errors import ConfigError, CrapkitError, GitError, ToolError
 from ..gitio import _common_dir, _git, _git_dir, ls_files
-from ..invocation import _self
-from ..lane_command import LaunchSpec, first_word, launch_spec, pytest_head, pytest_python
+from ..invocation import _self, quoted_path, shell_arg
+from ..lane_command import (LaunchSpec, expand_launchers, first_word, install_python, launch_spec,
+                            pytest_head, pytest_python, python_token, shell_segments)
+from ..named import first_few
+from ..repopath import typed_path
 from ..rootfind import MAX_LEVELS, find_root
 from ..store import SnapshotStore
-from ..universe import assign_files, overlapping_scope, path_matchers, scan_files
-from ._shared import _command_root, _file_sizer, _load_repo_config, _print_json, repo_text
+from ..gitpaths import readable
+from ..universe import overlapping_scope, path_matchers
+from ..watch import Snapshot, poll, snapshot
+from ._shared import (_command_root, _init_root, _load_repo_config, _print_json, _say_left_out,
+                      _scan, repo_text)
 
 
 def _present_lockfiles(root: Path) -> frozenset[str]:
@@ -92,19 +101,17 @@ def _imports_pytest(launcher: Path) -> bool:
 
 
 def _committed_launcher(venv: Path, root: Path) -> str:
-    r"""The launcher as a committed config spells it: repo-relative, so it
-    travels the way an absolute path never could, and written for the file it
-    lands in.
+    r"""The launcher as a committed config spells it: the launcher token for
+    this venv, repo-relative, so it travels the way an absolute path never
+    could, to either OS.
 
-    Windows takes both halves of that. cmd.exe reads an unquoted `/` as the end
-    of the command name (`.venv/Scripts/python --version` answers `'.venv' is
-    not recognized`), so the separator has to be a backslash; and `\` opens an
-    escape inside a TOML basic string, so init writes `.venv\\Scripts\\python.exe`
-    and the config loader hands back the single-backslash path that runs. Both
-    spellings start under cmd.exe, which is why the probe reads this one.
+    The OS's own spelling did not travel. Windows wrote `.venv\\Scripts\\python.exe`
+    (cmd.exe reads an unquoted `/` as the end of the command name, and `\`
+    opens an escape in a TOML basic string), which no Linux checkout has, and
+    Linux wrote `.venv/bin/python`, which cmd.exe cannot start. The loader
+    expands `{python:.venv}` into the launcher of the OS reading the file.
     """
-    separator = "\\\\" if os.name == "nt" else "/"
-    return separator.join([*venv.relative_to(root).parts, *_VENV_LAUNCHER])
+    return python_token(venv.relative_to(root).as_posix())
 
 
 def _repo_venv_python(root: Path, scopes: tuple[str, ...] = ()) -> str | None:
@@ -145,7 +152,22 @@ def _interpreter(root: Path, scopes: tuple[str, ...] = ()) -> str:
     runner = lockfile_runner(_present_lockfiles(root))
     if runner:
         return f"{runner} {_python_name()}"
-    return _repo_venv_python(root, scopes) or _python_name()
+    return _repo_venv_python(root, scopes) or _bare_python()
+
+
+def _bare_python() -> str:
+    """The `{python}` token where the name it reads as on this OS resolves
+    here, else `_python_name`'s answer.
+
+    A bare name did not travel either: the `python` a Windows init wrote does
+    not exist on an Ubuntu without python-is-python3, and the token reads as
+    `python3` there. A machine where only another name resolves (`py` on
+    Windows, `python` alone on POSIX) keeps that name, so the config still
+    runs on the machine that wrote it."""
+    import shutil
+
+    token = python_token()
+    return token if shutil.which(expand_launchers(token)) else _python_name()
 
 
 def _present_markers(root: Path) -> frozenset[str]:
@@ -157,30 +179,65 @@ def _present_markers(root: Path) -> frozenset[str]:
 def _marker_texts(root: Path) -> dict[str, str]:
     """The pytest config files this repo carries, by name. Presence of one picks
     the lane; `testpaths` inside it says whether one lane can measure them all."""
+    from ..repotext import plain_utf8
     from ..scaffold import PYTEST_MARKERS
 
-    return {name: (root / name).read_text(encoding="utf-8", errors="replace")
+    return {name: plain_utf8((root / name).read_bytes())
             for name in PYTEST_MARKERS if (root / name).is_file()}
 
 
 
-def _package_json(root: Path) -> dict[str, str]:
-    """Every tracked package.json's text, keyed by the directory holding it and
-    "" for the root one.
+def _package_json(root: Path) -> dict:
+    """Every tracked package.json, parsed once here into the fields init reads
+    (scaffold.NpmPackage), keyed by the directory holding it and "" for the
+    root one. No other module parses the file.
 
     A monorepo names its test runner in the workspace that owns the tests. Read
     from the root alone, init bound the js lane to a root script that only
     chains the workspaces and produces no coverage of its own. A vendored
     node_modules is skipped: its packages describe somebody else's tests.
     """
-    found: dict[str, str] = {}
-    for path in ls_files(root):
-        directory, _, name = path.rpartition("/")
-        if name != "package.json" or "node_modules/" in path:
-            continue
-        if (root / path).is_file():
-            found[directory] = (root / path).read_text(encoding="utf-8")
+    from ..scaffold import npm_package
+
+    found = {}
+    for path in _package_files(root):
+        data = _package_object(root, path)
+        if data is not None:
+            found[path.rpartition("/")[0]] = npm_package(data)
     return found
+
+
+def _package_files(root: Path) -> list[str]:
+    return [path for path in ls_files(root) if _tracked_manifest(path) and (root / path).is_file()]
+
+
+def _tracked_manifest(path: str) -> bool:
+    """A tracked package.json outside node_modules. One under a directory whose
+    name is not UTF-8 has no cwd a lane can spell; init named it left out."""
+    return path.rpartition("/")[2] == "package.json" and "node_modules/" not in path and readable(path)
+
+
+def _package_object(root: Path, rel: str) -> dict | None:
+    """A package.json read by repotext's JSON kind: UTF-8, a byte-order mark read
+    past as npm reads past it, one JSON object. A BOM used to cost the js lane
+    in silence, one é ended init with a traceback after crapkit.toml was
+    written, and a file that did not parse read as an empty one.
+
+    A root package.json init cannot read stops init before it writes anything:
+    the lane comes from that file, and a lane read off a guess is worse than
+    none. A nested one, a test fixture say, is skipped with one line naming it."""
+    from ..repotext import repo_json
+
+    if "/" not in rel:
+        try:
+            return repo_json(root / rel, rel)
+        except ConfigError as exc:
+            raise ConfigError(f"init wrote no file: {exc}") from None
+    try:
+        return repo_json(root / rel, "it")
+    except ConfigError as exc:
+        print(f"crapkit: init skipped {rel}: {exc}", file=sys.stderr)
+        return None
 
 def _next_step(scopes: dict, lanes: tuple) -> str:
     """What to run next, which is not the same sentence in all three cases.
@@ -218,7 +275,7 @@ def _unrouted_workspaces_note(written: tuple, package_json) -> str | None:
             "template, each with its own cwd and artifact")
 
 
-def _print_init_summary(scopes: dict, lanes: tuple, package_json="") -> None:
+def _print_init_summary(scopes: dict, lanes: tuple, package_json=None) -> None:
     from ..scaffold import live_lanes
 
     print(f"wrote crapkit.toml with {len(scopes)} scope(s): {', '.join(scopes)}")
@@ -238,11 +295,12 @@ def _no_scopes_reason(root: Path) -> str:
     from ..gitio import untracked_files
     from ..scaffold import source_candidates
 
-    untracked = source_candidates(untracked_files(root))
+    untracked = sorted(source_candidates(untracked_files(root)))
     if not untracked:
-        return "no source files found to scope — is this the repo root?"
-    return ("no tracked source files to scope — crapkit scores git-tracked files only; "
-            f"run `git add` first ({len(untracked)} untracked source file(s) found)")
+        return "no source files found to scope - is this the repo root?"
+    return ("no tracked source files to scope - crapkit scores git-tracked files only; "
+            f"run `git add` first ({len(untracked)} untracked source file(s) found: "
+            f"{first_few(untracked)})")
 
 
 _PROBE_TIMEOUT_SECONDS = 15
@@ -358,7 +416,7 @@ def _dead_interpreter_note(name: str, word: str, code: int) -> str:
            if config.SHELL_IS_CMD else "install it, or point the lane at an "
            "interpreter this machine has")
     return (f"note: lane {name!r} names `{word}`, and {_shell_label()} cannot run it "
-            f"(exit {code}) — {fix}, then `{_self()} coverage`")
+            f"(exit {code}) - {fix}, then `{_self()} coverage`")
 
 
 def _missing_pytest_cov_note(name: str, word: str, spec: LaunchSpec) -> str:
@@ -368,13 +426,18 @@ def _missing_pytest_cov_note(name: str, word: str, spec: LaunchSpec) -> str:
     own `.venv` carries pytest-cov still gets this note when the lane names the
     `python` a stock PATH answers with, and then installing a package is the
     wrong move: the reader has to be able to tell which of the two was asked.
-    The install command carries the same word, so it lands in that interpreter's
-    environment rather than whichever one the reader's shell has active. Where
-    the word lands is read the way the lane's shell reads it, so a relative
-    launcher names the same file from any directory doctor runs in."""
+    The install command names the same interpreter, so it lands in that
+    interpreter's environment rather than whichever one the reader's shell has
+    active; in a venv uv made, which holds no pip, it is `uv pip install
+    --python WORD`. Where the word lands is read the way the lane's shell reads
+    it, so a relative launcher names the same file from any directory doctor
+    runs in, and the install command names that file (`install_python`)."""
+    from ..launchers import pip_install
+
     resolved = spec.resolve(word) or word
     return (f"note: lane {name!r} names `{word}`, which resolves here to {resolved} and "
-            f"cannot import pytest_cov - run `{word} -m pip install pytest-cov` in the "
+            f"cannot import pytest_cov - run "
+            f"`{pip_install(resolved, 'pytest-cov', install_python(word, spec))}` in the "
             "environment the suite runs in "
             # Double quotes, not single: cmd.exe passes ' through as an
             # ordinary character and pip rejects the requirement. Double
@@ -404,7 +467,7 @@ def _absent_manager(spec: LaunchSpec, command: str) -> str | None:
 
 def _missing_manager_note(name: str, manager: str) -> str:
     return (f"note: lane {name!r} runs through `{manager}`, which this machine's PATH does "
-            f"not carry — install {manager}, or point the lane's command in crapkit.toml at "
+            f"not carry - install {manager}, or point the lane's command in crapkit.toml at "
             f"an interpreter that resolves here, then `{_self()} coverage`")
 
 
@@ -472,29 +535,78 @@ def _store_ignored_above(root: Path) -> bool:
 
 
 def _ignores_store(gitignore: Path) -> bool:
+    """Whether this .gitignore holds the store's line, read as git reads it:
+    past a UTF-8 BOM, which git skips."""
+    from ..repotext import lenient
+
     if not gitignore.is_file():
         return False
-    lines = {line.strip() for line in
-             gitignore.read_text(encoding="utf-8", errors="replace").splitlines()}
+    lines = {line.strip() for line in lenient(gitignore.read_bytes()).splitlines()}
     return bool(lines & {".crapkit/", ".crapkit"})
 
 
-def _extend_gitignore(root: Path, lanes: tuple) -> None:
+class _GitignoreStep(NamedTuple):
+    """What init's .gitignore step did: the entries it appended, or, for a
+    UTF-16 file git cannot read, the sentence saying init left it as it was
+    and which entries to add. Each caller decides what that sentence is: a
+    first init prints it and still writes crapkit.toml, and a second init
+    refuses with it, since the .gitignore is the one step left to finish."""
+    added: list[str]
+    unreadable: str | None = None
+
+
+def _extend_gitignore(root: Path, lanes: tuple) -> _GitignoreStep:
     """Ignore what adopting crapkit will write: the store, and each lane's
     artifact. Without this the consumer's next `git status` is a wall of
     untracked coverage output nobody asked for. A nested configuration under a
-    root whose .gitignore already ignores the store writes nothing (ADR 0002)."""
-    from ..scaffold import gitignore_update
+    root whose .gitignore already ignores the store writes nothing (ADR 0002).
+    What it did comes back as a _GitignoreStep, for the caller to print or to
+    refuse with.
+
+    git reads .gitignore as bytes, and so does this: every byte already there
+    stays, a cp1252 comment included, and the entries take the file's own line
+    ending. A UTF-16 file, which git cannot read, is left as it was and named."""
+    from ..repotext import utf16_marked
 
     if _store_ignored_above(root):
-        return
+        return _GitignoreStep([])
     path = root / ".gitignore"
-    current = path.read_text(encoding="utf-8") if path.is_file() else ""
+    raw = path.read_bytes() if path.is_file() else b""
+    if utf16_marked(raw):
+        return _GitignoreStep([], _unreadable_gitignore(raw, lanes))
+    extended, added = _extended_gitignore(raw, lanes)
+    if added:
+        path.write_bytes(extended)
+    return _GitignoreStep(added)
+
+
+def _print_gitignore_step(step: _GitignoreStep) -> None:
+    if step.unreadable:
+        print(f"crapkit: {step.unreadable}", file=sys.stderr)
+    if step.added:
+        print(f"added to .gitignore: {', '.join(step.added)}")
+
+
+def _extended_gitignore(raw: bytes, lanes: tuple) -> tuple[bytes, list[str]]:
+    """`raw` with crapkit's entries appended in the line ending it already uses.
+    The lines are compared as git reads them, past a UTF-8 BOM; the file's own
+    bytes are kept, and only the appended tail is new."""
+    from ..repotext import lenient
+    from ..scaffold import gitignore_update
+
+    current = lenient(raw)
     text, added = gitignore_update(current, lanes)
-    if not added:
-        return
-    path.write_text(text, encoding="utf-8", newline="\n")
-    print(f"added to .gitignore: {', '.join(added)}")
+    newline = "\r\n" if b"\r\n" in raw else "\n"
+    return raw + text[len(current):].replace("\n", newline).encode("utf-8"), added
+
+
+def _unreadable_gitignore(raw: bytes, lanes: tuple) -> str:
+    from ..repotext import utf16_cause
+    from ..scaffold import gitignore_entries
+
+    return (f"left .gitignore as it was: it is UTF-16 (first bytes {raw[:2].hex(' ')}, "
+            f"{utf16_cause(raw)}), which git cannot read; save it as UTF-8 "
+            f"and add {', '.join(gitignore_entries(lanes))}")
 
 
 def _refuse_claimed_by_ancestor(root: Path) -> None:
@@ -515,16 +627,38 @@ def _refuse_claimed_by_ancestor(root: Path) -> None:
                           f"(scope {scope!r}); edit that configuration instead")
 
 
+def _finish_init(root: Path) -> int:
+    """A second init over a crapkit.toml an earlier run wrote. Before 0.8.1 init
+    wrote crapkit.toml first, so a run that died on the .gitignore step left a
+    config the next init refused to touch, and .crapkit/ was never ignored.
+    The missing .gitignore entries come from the lanes crapkit.toml declares
+    now; crapkit.toml itself is left byte for byte. A UTF-16 .gitignore is the
+    step it cannot finish, so the refusal names that file and nothing else.
+    With nothing missing, this is the refusal it always was."""
+    step = _extend_gitignore(root, _load_repo_config(root).lanes)
+    if step.unreadable:
+        raise ConfigError(step.unreadable)
+    if not step.added:
+        raise ConfigError(f"crapkit.toml already exists in {root} - edit it instead")
+    print("crapkit.toml was already there and init left it as it was; it finished the step "
+          "an earlier run left undone")
+    _print_gitignore_step(step)
+    return 0
+
+
 def cmd_init(args: argparse.Namespace) -> int:
+    """Every read comes first, so a file init cannot read stops it before it
+    writes anything. Then .gitignore, then crapkit.toml: a run stopped between
+    the two leaves no config, and the next init starts over."""
     from ..scaffold import (detect_lanes, live_lanes, pytest_testpaths, sniff_scopes,
                             starter_toml)
 
-    root = Path(args.repo or ".").resolve()  # init writes where the user stands; it adopts nothing
+    root = _init_root(args.repo)  # init writes where the user stands; it adopts nothing
     toml_path = root / "crapkit.toml"
     if toml_path.is_file():
-        raise ConfigError(f"crapkit.toml already exists in {root} — edit it instead")
+        return _finish_init(root)
     _refuse_claimed_by_ancestor(root)
-    files = ls_files(root)
+    files = _init_files(root)
     scopes = sniff_scopes(files)
     if not scopes:
         raise ConfigError(_no_scopes_reason(root))
@@ -540,11 +674,14 @@ def cmd_init(args: argparse.Namespace) -> int:
     text = starter_toml(scopes, lanes, interpreter=interpreter,
                         testpaths=pytest_testpaths(_marker_texts(root)),
                         tracked=files, package_json=packages)
-    load_config_text(text)  # self-check: never write a config crapkit cannot read back
+    # Self-check: never write a config crapkit cannot read back. The probe asks
+    # the lanes as they load, with the launcher token read for this OS.
+    written = load_config_text(text)
+    gitignore = _extend_gitignore(root, live_lanes(lanes, scopes))
     toml_path.write_text(text, encoding="utf-8", newline="\n")
     _print_init_summary(scopes, lanes, packages)
-    _warn_missing_pytest_cov(root, live_lanes(lanes, scopes))
-    _extend_gitignore(root, live_lanes(lanes, scopes))
+    _warn_missing_pytest_cov(root, written.lanes)
+    _print_gitignore_step(gitignore)
     return 0
 
 
@@ -554,7 +691,7 @@ def _unknown_key_text(unknown) -> str:
     from ..doctor import table_label, valid_keys
 
     noun = "keys" if unknown.table else "tables"
-    return (f"unknown key {unknown.path} — crapkit ignores it (typo?); "
+    return (f"unknown key {unknown.path} - crapkit ignores it (typo?); "
             f"{table_label(unknown.table)} accepts these {noun}: "
             f"{', '.join(valid_keys(unknown.table))}")
 
@@ -604,7 +741,7 @@ def _doctor_unclaimed(unclaimed: tuple[str, ...]) -> list[Finding]:
     if not unclaimed:
         return [Finding("ok", "every tracked source file belongs to a scope")]
     return [Finding("FAIL", f"{len(unclaimed)} tracked file(s) match a scope language but "
-                            f"no scope path: {', '.join(unclaimed)} — add a [[scope]] "
+                            f"no scope path: {', '.join(unclaimed)} - add a [[scope]] "
                             "claiming them, or an [exclude] glob (docs/configuration.md)")]
 
 
@@ -622,7 +759,7 @@ def _uncovered_scopes(cfg) -> list[str]:
 
 
 def _doctor_uncovered(cfg) -> list[Finding]:
-    return [Finding("FAIL", f"scope {name!r} is in no lane's scopes list — its functions "
+    return [Finding("FAIL", f"scope {name!r} is in no lane's scopes list - its functions "
                             "can only score no-lane (declare a lane, or "
                             "coverage_optional = true)")
             for name in _uncovered_scopes(cfg)]
@@ -634,17 +771,58 @@ def _doctor_oversized(oversized: tuple[tuple[str, int], ...]) -> list[Finding]:
             for path, size in oversized]
 
 
+def _utf16_mark(path: Path) -> bytes:
+    """The UTF-16 byte-order mark `path` opens with, or b"" for none."""
+    from ..repotext import utf16_marked
+
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(2)
+    except OSError:
+        return b""
+    return head if utf16_marked(head) else b""
+
+
+def _doctor_utf16_sources(root: Path, by_scope: dict) -> list[Finding]:
+    """A note, never a failure: crapkit scores a source that opens with a
+    UTF-16 byte-order mark, and git diffs it as binary (`Binary files ...
+    differ`). One note per byte order, since only the little-endian one is
+    PowerShell 5.1's default. One file read of two bytes per scoped source."""
+    from ..repotext import utf16_cause
+
+    marked: dict[bytes, list[str]] = {}
+    for path in sorted(f for files in by_scope.values() for f in files):
+        marked.setdefault(_utf16_mark(root / path), []).append(path)
+    marked.pop(b"", None)
+    return [Finding("note", f"{len(paths)} source file(s) open with a UTF-16 byte-order mark, "
+                            f"{utf16_cause(mark)}: {', '.join(paths)}. crapkit "
+                            "scores them, but git diffs them as binary; save them as UTF-8 "
+                            "(PowerShell: Set-Content -Encoding utf8) to diff them as text")
+            for mark, paths in sorted(marked.items(), reverse=True)]
+
+
+def _init_files(root: Path) -> list[str]:
+    """The tracked files init sniffs scopes from. No scope exists yet to take
+    an unreadable name, so each one is named left out and the config is still
+    written; the first command that loads it decides the claim."""
+    files = ls_files(root)
+    _say_left_out(tuple(sorted({path for path in files if not readable(path)})))
+    return [path for path in files if readable(path)]
+
+
 def _doctor_scopes(root: Path, cfg, files: list[str], show_files: bool) -> list[Finding]:
-    universe = scan_files(files, cfg, size_of=_file_sizer(root))
+    universe = _scan(root, files, cfg)
+    _say_left_out(universe.unreadable)
     return (_doctor_scope_files(universe.by_scope, cfg, show_files)
             + _doctor_unclaimed(universe.unclaimed)
             + _doctor_uncovered(cfg)
-            + _doctor_oversized(universe.oversized))
+            + _doctor_oversized(universe.oversized)
+            + _doctor_utf16_sources(root, universe.by_scope))
 
 
 def _lane_problem(root: Path, lane) -> str | None:
     if not launch_spec(root, lane).cwd.is_dir():
-        return f"lane {lane.name!r}: cwd {lane.cwd!r} does not exist"
+        return f"lane {lane.name!r}: cwd {quoted_path(lane.cwd)} does not exist"
     return None
 
 
@@ -667,9 +845,9 @@ def _segment_problems(name: str, spec: LaunchSpec, tokens: list[str]) -> list[st
     of its own, and asking from there failed every repo but the server's."""
     if not tokens:
         return []
-    runner = ([f"lane {name!r}: executable {tokens[0]!r} does not resolve on PATH"]
+    runner = ([f"lane {name!r}: executable {quoted_path(tokens[0])} does not resolve on PATH"]
               if spec.resolve(tokens[0]) is None else [])
-    return runner + [f"lane {name!r}: command names {tok!r}, which does not exist"
+    return runner + [f"lane {name!r}: command names {quoted_path(tok)}, which does not exist"
                      for tok in tokens[1:] if _missing_named_script(spec.cwd, tok)]
 
 
@@ -683,7 +861,7 @@ def _lane_command_problems(root: Path, lane) -> list[str]:
     looked past the first word, so a dead runner after `&&` passed doctor, and
     it read a quoted `-k "tests/gone.py or x"` as a test file the repo owes."""
     spec = launch_spec(root, lane)
-    return [problem for segment in config.shell_segments(lane.command)
+    return [problem for segment in shell_segments(lane.command)
             for problem in _segment_problems(lane.name, spec, segment)]
 
 
@@ -698,7 +876,7 @@ def _lane_start_problem(root: Path, lane) -> str | None:
     if not dead:
         return None
     word, code = dead
-    return (f"lane {lane.name!r}: {_shell_label()} cannot run {word!r} (exit {code}) — "
+    return (f"lane {lane.name!r}: {_shell_label()} cannot run {quoted_path(word)} (exit {code}) - "
             "the lane cannot start, so its scopes can only ever score no-lane")
 
 
@@ -708,13 +886,24 @@ def _doctor_lane_summary(cfg) -> Finding:
     if cfg.lanes:
         return Finding("ok", f"{len(cfg.lanes)} lane(s) declared")
     if cfg.lane_less_scopes:
-        return Finding("note", "no [[lane]] declared — inventory works; coverage needs one")
+        return Finding("note", "no [[lane]] declared - inventory works; coverage needs one")
     return Finding("ok", "no [[lane]] declared: every scope is cc-only, so none is needed")
 
 
 def _lane_problems_of(root: Path, lane) -> list[str]:
-    return [p for p in (_lane_problem(root, lane), *_lane_command_problems(root, lane),
+    return [p for p in (_lane_problem(root, lane), *_output_directories(root, lane),
+                        *_lane_command_problems(root, lane),
                         _lane_start_problem(root, lane)) if p]
+
+
+def _output_directories(root: Path, lane) -> list[str]:
+    """A declared output that names a directory. The runner clears each declared
+    path before an attempt and reads the one file there, so the lane fails every
+    run, and doctor passed it."""
+    outputs = (("artifact", lane.artifact), ("results_artifact", lane.results_artifact))
+    return [f"lane {lane.name!r}: {key} {quoted_path(path)} names a directory, and a lane "
+            "output is one file; point it at the report file the command writes inside it"
+            for key, path in outputs if path and (root / path).is_dir()]
 
 
 def _lane_findings(cfg, by_lane: list[tuple]) -> list[Finding]:
@@ -726,10 +915,12 @@ def _doctor_lanes(root: Path, cfg) -> list[Finding]:
     """The lane checks, then the probe of every lane that passed them. A lane
     with a problem of its own is not probed: the dead-interpreter FAIL already
     names the word, and init's note would say it again one line down."""
+    from ..doctor import unreadable_payloads
+
     by_lane = [(lane, _lane_problems_of(root, lane)) for lane in cfg.lanes]
     healthy = [lane for lane, problems in by_lane if not problems]
-    return (_lane_findings(cfg, by_lane)
-            + _doctor_results_artifacts(cfg) + _doctor_lane_probes(root, healthy))
+    return (_lane_findings(cfg, by_lane) + _doctor_results_artifacts(cfg)
+            + list(unreadable_payloads(cfg.lanes)) + _doctor_lane_probes(root, healthy))
 
 
 # One probe answers three questions about the python a lane names: where the
@@ -737,28 +928,30 @@ def _doctor_lanes(root: Path, cfg) -> list[Finding]:
 # doctor, because `no problems found` on a lane running the system python
 # while the repo's own venv held the plugin is the report this came from.
 _RUNNER_MARKER = "CRAPKIT_RUNNER_REPORT "
-_VERSION_PROBE = ('-c "import sys, pytest, pytest_cov; '
+_VERSION_PROBE = ('-c "import sys, pytest, pytest_cov, coverage; '
                   f"print('{_RUNNER_MARKER}' + sys.executable, "
-                  'pytest.__version__, pytest_cov.__version__)"')
+                  'pytest.__version__, pytest_cov.__version__, coverage.__version__)"')
 
 
-def _runner_versions(report: str) -> tuple[str, str, str] | None:
+def _runner_versions(report: str) -> tuple[str, str, str, str] | None:
     line = next((line[len(_RUNNER_MARKER):] for line in report.splitlines()
                  if line.startswith(_RUNNER_MARKER)), "")
-    parts = line.rsplit(None, 2)
-    return (parts[0], parts[1], parts[2]) if len(parts) == 3 else None
+    parts = line.rsplit(None, 3)
+    return (parts[0], parts[1], parts[2], parts[3]) if len(parts) == 4 else None
 
 
 @lru_cache(maxsize=None)
-def _runner_report(word: str, spec: LaunchSpec) -> tuple[str, str, str] | None:
-    """(executable, pytest version, pytest-cov version) the interpreter word
-    answers through the lane's shell, from the lane's directory and with its
-    environment, or None when it cannot say. Memoized on the word and the
+def _runner_report(word: str, spec: LaunchSpec) -> tuple[str, str, str, str] | None:
+    """(executable, pytest, pytest-cov and coverage.py versions) the interpreter
+    word answers through the lane's shell, from the lane's directory and with
+    its environment, or None when it cannot say. Memoized on the word and the
     launch spec for the reason `_start_probe` is: one fact per child, however
-    many lanes start it the same way. The path may hold spaces, so the two
-    versions are split off the right."""
+    many lanes start it the same way. The path may hold spaces, so the three
+    versions are split off the right. pytest-cov imports coverage, so asking
+    for it costs no import the probe did not already pay."""
     from tempfile import TemporaryFile
     from ..procs import run_bounded
+    from ..repotext import lenient
 
     try:
         with TemporaryFile() as output:
@@ -766,7 +959,7 @@ def _runner_report(word: str, spec: LaunchSpec) -> tuple[str, str, str] | None:
                                _PROBE_TIMEOUT_SECONDS, stream=output,
                                **spec.popen_kwargs({"PYTHONIOENCODING": "utf-8"}))
             output.seek(0)
-            report = output.read().decode("utf-8", errors="replace")
+            report = lenient(output.read())
     except OSError:
         return None
     return _runner_versions(report) if code == 0 else None
@@ -816,7 +1009,8 @@ def _first_run_failure(spec: LaunchSpec, lane) -> list[Finding]:
 
 def _lane_probe_findings(root: Path, lane) -> list[Finding]:
     """The interpreter and plugin versions a healthy lane resolves to, plus a
-    WARN when that interpreter is foreign; init's first-run note as a FAIL when
+    FAIL when its coverage.py predates function regions and a WARN when that
+    interpreter is foreign; init's first-run note as a FAIL when
     the interpreter cannot say; a note when no python heads the lane. The
     version report goes first: it imports pytest_cov on its way, so it answers
     the first-run question too, and a healthy lane costs one interpreter start
@@ -828,10 +1022,22 @@ def _lane_probe_findings(root: Path, lane) -> list[Finding]:
     report = _runner_report(word, spec)
     if report is None:
         return _first_run_failure(spec, lane)
-    executable, pytest_version, cov_version = report
-    resolved = Finding("ok", f"lane {lane.name!r}: {word} -> {executable} "
-                             f"(pytest {pytest_version}, pytest-cov {cov_version})")
-    return [resolved, *_foreign_interpreter(lane.name, executable)]
+    executable, pytest_version, plugin_version, coverage_version = report
+    resolved = Finding("ok", f"lane {lane.name!r}: {word} -> {executable} (pytest {pytest_version}, "
+                             f"pytest-cov {plugin_version}, coverage {coverage_version})")
+    return [resolved, *_coverage_floor(lane.name, executable, coverage_version),
+            *_foreign_interpreter(lane.name, executable)]
+
+
+def _coverage_floor(name: str, executable: str, version: str) -> tuple[Finding, ...]:
+    """The FAIL for a lane whose coverage.py writes no function start lines, with
+    the install line spelled for the interpreter that lane runs."""
+    from ..coverage_py import REGIONS_FLOOR
+    from ..doctor import coverage_floor_gap
+    from ..launchers import pip_install
+
+    upgrade = pip_install(executable, f'"coverage>={REGIONS_FLOOR}"', _shell_quote(executable))
+    return coverage_floor_gap(name, executable, version, upgrade)
 
 
 def _doctor_lane_probes(root: Path, lanes) -> list[Finding]:
@@ -870,7 +1076,7 @@ def _doctor_artifact_litter(cfg) -> list[Finding]:
     before its lanes wrote under .crapkit/, over tree hygiene."""
     from ..doctor import artifact_litter, scope_top_dirs
 
-    return [Finding("WARN", f"lane {item.lane!r} writes {item.path} at the repo root — "
+    return [Finding("WARN", f"lane {item.lane!r} writes {item.path} at the repo root - "
                             f"point it under .crapkit/ (for example .crapkit/cov/{item.lane}/) "
                             "to keep the tree clean")
             for item in artifact_litter(cfg.lanes, scope_top_dirs(cfg.scopes))]
@@ -899,9 +1105,17 @@ def _lizard_version() -> str | None:
 
 
 def _doctor_tools() -> list[Finding]:
+    """lizard's version, or a FAIL naming the install for the python running
+    crapkit. `pip install lizard` landed in whatever environment the shell's pip
+    belongs to, and a `uv tool install` of crapkit runs in a venv uv made, which
+    holds no pip of its own."""
+    from ..launchers import pip_install
+
     version = _lizard_version()
     if version is None:
-        return [Finding("FAIL", "lizard is not importable — pip install lizard")]
+        install = pip_install(sys.executable, "lizard", _shell_quote(sys.executable))
+        return [Finding("FAIL", f"lizard is not importable by the python running crapkit "
+                                f"({sys.executable}) - run `{install}`, or reinstall crapkit")]
     return [Finding("ok", f"lizard {version}")]
 
 
@@ -938,9 +1152,48 @@ def _doctor_unmeasured(root: Path, cfg, files: list[str]) -> list[Finding]:
     counts = store.count_by_path(run["id"], flag="untested",
                                  skip_scopes=cfg.coverage_optional_scopes)
     return [Finding("WARN", f"{g.directory}: {g.functions} function(s) all flagged untested "
-                            f"while {g.example_test} exists — tests exist but no lane "
+                            f"while {g.example_test} exists - tests exist but no lane "
                             "measures them")
             for g in unmeasured_directories(counts, files)]
+
+
+def _doctor_unread(root: Path, cfg, files: list[str]) -> list[Finding]:
+    """WARN, never FAIL: each file the newest coverage run could not read and no
+    reader can read now. The commit gate refuses it once staged, so the user
+    meets it here and not at a refused commit. A file the run scored a
+    function in was read, so only the files it scored nothing in are read
+    again, and a file fixed since then is no longer named."""
+    from ..merge import UNREAD_ADVICE
+
+    scored = _newest_scored_paths(root)
+    if scored is None:
+        return []
+    unread = _unread_now(root, sorted(_scoped_files(root, cfg, files) - scored))
+    return [Finding("WARN", f"{path} could not be read, so the commit gate refuses it when "
+                            f"staged: {why}; {UNREAD_ADVICE}")
+            for path, why in sorted(unread.items())]
+
+
+def _newest_scored_paths(root: Path) -> set[str] | None:
+    """The paths the newest coverage run scored a function in; None with no such run."""
+    store = _store_if_any(root)
+    run = _newest_coverage_run(store) if store else None
+    if run is None:
+        return None
+    return {path for path, *_ in store.count_by_path(run["id"], flag="untested")}
+
+
+def _scoped_files(root: Path, cfg, files: list[str]) -> set[str]:
+    return {f for scoped in _scan(root, files, cfg).by_scope.values() for f in scoped}
+
+
+def _unread_now(root: Path, paths: list[str]) -> dict[str, str]:
+    """{path: the reader's reason} for each of `paths` no reader can read."""
+    from ..analyze import analyze_source, read_source, unread_reasons
+
+    present = [p for p in paths if (root / p).is_file()]
+    return unread_reasons({p: analyze_source(p, read_source(str(root / p)), note=False)
+                           for p in present})
 
 
 def _hook_modes(root: Path) -> dict[str, str]:
@@ -967,12 +1220,13 @@ def _doctor_hook_modes(root: Path) -> list[Finding]:
     """WARN, never FAIL: on Windows the bit is unreadable from the filesystem and
     the hook still runs, so a Windows author must not be blocked by it. On Linux
     and macOS git skips a 100644 hook without a word, which is how crapkit's own
-    contributor gate armed nothing."""
+    contributor gate armed nothing. The fix command quotes the path the way the
+    reader's shell needs it, so a hooks directory with a space stays one path."""
     from ..doctor import non_executable_hooks
 
-    return [Finding("WARN", f"{path} is not executable in the index — core.hooksPath "
+    return [Finding("WARN", f"{path} is not executable in the index - core.hooksPath "
                             "is set, so Unix clones silently skip it; fix with "
-                            f"`git update-index --chmod=+x {path}` and commit")
+                            f"`git update-index --chmod=+x {shell_arg(path)}` and commit")
             for path in non_executable_hooks(_hook_modes(root))]
 
 
@@ -1092,14 +1346,176 @@ def _doctor_commit_graph(root: Path) -> list[Finding]:
         return []
     return [Finding("WARN", "the commit-graph carries no changed-path Bloom filters, so every "
                             "per-file history walk (churn, brief, explain --history) opens "
-                            "every tree it passes — fix with `git commit-graph write "
+                            "every tree it passes - fix with `git commit-graph write "
                             "--reachable --changed-paths`")]
+
+
+_UTF8_NAMES = frozenset({"utf-8", "utf8"})
+
+
+def _doctor_commit_encoding(root: Path) -> list[Finding]:
+    """A note, never a failure: i18n.commitEncoding only labels a commit, it
+    does not convert what the client typed. Git for Windows passes a message
+    and a name as UTF-8, so under ISO-8859-1 git stores UTF-8 bytes labelled
+    Latin-1, and every reader that asks for UTF-8, crapkit included, gets
+    `José` back as `JosÃ©`: one author counted twice in churn."""
+    from ..gitio import config_value
+
+    value = config_value(root, "i18n.commitEncoding")
+    if not value or value.lower() in _UTF8_NAMES:
+        return []
+    return [Finding("note", f"i18n.commitEncoding is {value}: git labels each new commit "
+                            f"{value} and crapkit reads commits back as UTF-8, so a name or "
+                            "subject a client wrote in UTF-8 (Git for Windows does) comes out "
+                            f"garbled, its accented letters read as {value} characters, in "
+                            "churn and history; unset it (git config --unset "
+                            f"i18n.commitEncoding) unless this repo's clients write {value}")]
+
+
+def _doctor_container(cfg) -> list[Finding]:
+    """A coverage.py lane `crapkit coverage` refuses in this container (WARN)."""
+    from ..doctor import container_lane_findings, container_marker
+
+    marker = container_marker(os.environ, Path("/.dockerenv").exists())
+    return list(container_lane_findings(cfg.lanes, marker))
+
+
+def _text_at(path: Path) -> str:
+    from ..repotext import lenient
+
+    try:
+        return lenient(path.read_bytes())
+    except OSError:
+        return ""
+
+
+def _hooks_path_setting(root: Path) -> tuple[str, str]:
+    """(scope, value) of core.hooksPath, or ("", "") when unset."""
+    try:
+        answer = _git(root, "config", "--show-scope", "--get", "core.hooksPath")
+    except GitError:
+        return "", ""
+    scope, _, value = answer.strip().partition("\t")
+    return scope, value
+
+
+def _absolute(root: Path, *rev_parse: str) -> Path:
+    return Path(_git(root, "rev-parse", "--path-format=absolute", *rev_parse).strip()).resolve()
+
+
+def _shown(top: Path, path: Path) -> str:
+    """A path as a reader types it at the git top: relative when it sits under
+    the top, which is also how git reads a relative core.hooksPath."""
+    try:
+        return path.relative_to(top).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _husky_delegate(effective: Path) -> Path:
+    """husky 9 points core.hooksPath at .husky/_, and its stub there runs
+    .husky/pre-commit, the file a user edits. Any other hook is its own."""
+    return effective.parent.parent / effective.name if effective.parent.name == "_" else effective
+
+
+def _hook_route(root: Path, top: Path):
+    """The pre-commit file git spawns here, what it and husky's delegate say,
+    and the core.hooksPath setting behind it. Raises GitError outside a
+    repository."""
+    from ..doctor import HookRoute
+
+    effective = _absolute(root, "--git-path", "hooks/pre-commit")
+    edit = _husky_delegate(effective)
+    text = _text_at(effective) + (_text_at(edit) if edit != effective else "")
+    return HookRoute(_shown(top, effective), text, _shown(top, edit), *_hooks_path_setting(root))
+
+
+def _tracked_hooks(top: Path) -> list[str]:
+    """Every committed file named pre-commit, as paths from the top."""
+    listed = _git(top, "ls-files", "-z", "--", ":(glob)**/pre-commit")
+    return [path for path in listed.split("\0") if path]
+
+
+def _gate_hooks(root: Path, top: Path) -> tuple:
+    """The repo's own .git/hooks/pre-commit and every committed pre-commit,
+    each with the git config line that points git at its directory."""
+    from ..doctor import GateHook
+
+    default = _absolute(root, "--git-common-dir") / "hooks" / "pre-commit"
+    local = GateHook(_shown(top, default), _text_at(default),
+                     f"git config --local core.hooksPath {_shell_quote(_shown(top, default.parent))}")
+    return (local, *(GateHook(path, _text_at(top / path),
+                              f"git config core.hooksPath {_shell_quote(posixpath.dirname(path) or '.')}")
+                     for path in _tracked_hooks(top)))
+
+
+def _doctor_silent_gates(root: Path) -> list[Finding]:
+    """A gate that is set up and never judges anything (WARN): a crapkit hook
+    git is not sent to, and a pre-commit config naming the gate that nothing
+    installed. pre-commit run in CI is a gate: outside a commit, with nothing
+    staged, the hook judges every tracked file."""
+    from ..doctor import skipped_gates
+
+    try:
+        top = _absolute(root, "--show-toplevel")
+        route, hooks = _hook_route(root, top), _gate_hooks(root, top)
+    except GitError:
+        return []
+    precommit = _text_at(top / ".pre-commit-config.yaml")
+    return list(skipped_gates(route, hooks, framework="crapkit-gate" in precommit))
+
+
+def _merge_attribute(root: Path, path: str) -> str:
+    """The value of the merge attribute git gives `path`, "unspecified" when
+    none. Raises GitError outside a repository."""
+    answer = _git(root, "check-attr", "merge", "--", path)
+    return answer.strip().rpartition(": ")[2] or "unspecified"
+
+
+def _doctor_merge_driver(root: Path, cfg) -> list[Finding]:
+    """The marks file routed to a merge driver this clone never defined (WARN)."""
+    from ..doctor import undefined_merge_driver
+    from ..gitio import config_value
+
+    try:
+        driver = _merge_attribute(root, cfg.ratchet_file)
+    except GitError:
+        return []
+    return list(undefined_merge_driver(cfg.ratchet_file, driver,
+                                       config_value(root, f"merge.{driver}.driver")))
+
+
+def _doctor_marks_stamp(root: Path, cfg) -> list[Finding]:
+    """The marks file verify refuses for its metric stamp. Right after an
+    upgrade that moves the analysis version, verify exits 3 before any lane
+    runs, and doctor said `no problems found`.
+
+    Marks an older metric stamped WARN: the upgrade guide runs doctor first
+    and resolves its failures before it measures, reviews and re-seeds, so a
+    FAIL stopped the guide at its first step and sent the user to re-seed
+    before the review. Marks a newer crapkit or lizard stamped FAIL, since
+    only an upgrade of this install clears them, and so does a marks file
+    crapkit cannot read, which stops verify too."""
+    from ..ratchet import metric_version, newer_tools
+    from ..ratchetfile import RatchetFile
+
+    try:
+        marks = RatchetFile.read(root / cfg.ratchet_file)
+    except ToolError as exc:
+        return [Finding("FAIL", str(exc))]
+    conflict = marks.stamp_conflict(metric_version())
+    if not conflict:
+        return []
+    level = "FAIL" if newer_tools(marks.metric_stamp, metric_version()) else "WARN"
+    return [Finding(level, f"`{_self()} verify` refuses {cfg.ratchet_file} at exit 3: {conflict}")]
 
 
 def _doctor_findings(root: Path, cfg, raw: dict, files: list[str],
                      show_files: bool) -> list[Finding]:
+    named = [f for f in files if readable(f)]
     return (_doctor_keys(raw)
             + _doctor_scopes(root, cfg, files, show_files)
+            + _doctor_path_names(cfg, raw, files)
             + _doctor_lanes(root, cfg)
             + _doctor_inputs(root, cfg.lanes)
             + _doctor_stamps(root, cfg.lanes)
@@ -1108,9 +1524,35 @@ def _doctor_findings(root: Path, cfg, raw: dict, files: list[str],
             + _doctor_hook_modes(root)
             + _doctor_hook_encoding(root)
             + _doctor_commit_graph(root)
+            + _doctor_commit_encoding(root)
+            + _doctor_container(cfg)
+            + _doctor_silent_gates(root)
+            + _doctor_merge_driver(root, cfg)
+            + _doctor_marks_stamp(root, cfg)
+            + _doctor_launchers()
             + _doctor_tools()
-            + _doctor_scoped_tests(cfg, files)
-            + _doctor_unmeasured(root, cfg, files))
+            + _doctor_scoped_tests(cfg, named)
+            + _doctor_unmeasured(root, cfg, named)
+            + _doctor_unread(root, cfg, named))
+
+
+def _written_globs(raw: dict, cfg) -> tuple[tuple[str, str], ...]:
+    """Each [exclude] glob as crapkit.toml holds it, paired with the glob the
+    loader reads, leaving out init's default set: those guard trees a repo may
+    never track, and matching nothing is them doing their job."""
+    from ..scaffold import DEFAULT_EXCLUDES
+
+    written = raw.get("exclude", {}).get("globs", ())
+    return tuple((glob, read) for glob, read in zip(written, cfg.exclude_globs)
+                 if read not in DEFAULT_EXCLUDES)
+
+
+def _doctor_path_names(cfg, raw: dict, files: list[str]) -> list[Finding]:
+    """An [exclude] glob that matches no tracked file, and a tracked name
+    holding `\\` (both WARN)."""
+    from ..doctor import backslash_names, unmatched_globs
+
+    return [*unmatched_globs(_written_globs(raw, cfg), files), *backslash_names(files)]
 
 
 def _doctor_inputs(root: Path, lanes) -> list[Finding]:
@@ -1158,19 +1600,33 @@ def _newest_run_report(store: SnapshotStore | None) -> dict | None:
             "verdict_ok": runs[-1]["verdict_ok"]}
 
 
-def _lane_report(root: Path, lane, stamp: dict) -> dict:
+def _lane_report(root: Path, lane, stamps) -> dict:
+    stamp = stamps.entry(lane.artifact)
     return {"artifact": lane.artifact,
             "artifact_present": (root / lane.artifact).is_file(),
             "commit": stamp.get("commit"),
             "name": lane.name,
+            "refusal": _lane_refusal(lane, stamps),
             "seconds": stamp.get("seconds")}
 
 
 def _lane_reports(root: Path, cfg) -> list[dict]:
-    from ..lanes import read_stamps, stamp_for
+    from ..lane_stamps import read
 
-    stamps = read_stamps(root)
-    return [_lane_report(root, lane, stamp_for(stamps, lane.artifact)) for lane in cfg.lanes]
+    stamps = read(root)
+    return [_lane_report(root, lane, stamps) for lane in cfg.lanes]
+
+
+def _lane_refusal(lane, stamps) -> str | None:
+    """Why --reuse-artifacts refuses the lane's artifact, or None when it would
+    score it. It is the question reuse itself asks (lane_stamps.Stamps.refusal),
+    so both give one answer for a leftover, touched or not, and for an artifact
+    whose record crapkit cannot read. An artifact on disk used to read as the
+    lane's healthy output even when its last attempt wrote nothing."""
+    cause = stamps.refusal(lane.artifact).cause(lane.artifact)
+    if not cause:
+        return None
+    return f"{cause}; --reuse-artifacts will not score it until a run of the lane writes it again"
 
 
 def _unreadable_stamp_note(key: str, writers: dict[str, str]) -> str:
@@ -1180,19 +1636,42 @@ def _unreadable_stamp_note(key: str, writers: dict[str, str]) -> str:
     writer = writers.get(key)
     fix = (f"lane {writer!r} replaces it on its next successful run, or delete the entry"
            if writer else "no declared lane writes this key, so delete the entry")
-    return (f".crapkit/artifacts.json: the entry for {key!r} is not an object, so crapkit "
-            f"reads it as no stamp (no commit, no duration); {fix}")
+    from ..lane_stamps import STAMPS_FILE
+
+    return (f"{STAMPS_FILE}: the entry for {key!r} is not an object, so crapkit "
+            f"reads it as no stamp (no commit, no duration) and `--reuse-artifacts` refuses the "
+            f"lane while it stands; {fix}")
 
 
 def _doctor_stamps(root: Path, lanes) -> list[Finding]:
-    """WARN, never FAIL: every reader already takes a mangled entry as no stamp.
-    Named anyway, because the file is hand-edited and the reader has to find the
-    line doctor skipped."""
-    from ..lanes import read_stamps, unreadable_stamps
+    """WARN, never FAIL: every reader already takes a mangled entry, or a file
+    it cannot read, as no stamp. Named anyway, because the file is hand-edited
+    and the reader has to find the line doctor skipped. A refused leftover is a
+    WARN too: the lane's next run clears it."""
+    from ..lane_stamps import read
 
+    stamps = read(root)
+    if stamps.unreadable:
+        return [Finding("WARN", _unreadable_stamps_file_note(stamps.unreadable))]
     writers = {lane.artifact: lane.name for lane in lanes}
-    return [Finding("WARN", _unreadable_stamp_note(key, writers))
-            for key in unreadable_stamps(read_stamps(root))]
+    mangled = [Finding("WARN", _unreadable_stamp_note(key, writers)) for key in stamps.mangled()]
+    return mangled + _refusal_findings(lanes, stamps)
+
+
+def _refusal_findings(lanes, stamps) -> list[Finding]:
+    """One WARN per lane whose artifact --reuse-artifacts refuses."""
+    refusals = ((lane, _lane_refusal(lane, stamps)) for lane in lanes)
+    return [Finding("WARN", f"lane {lane.name!r}: {refusal}") for lane, refusal in refusals
+            if refusal]
+
+
+def _unreadable_stamps_file_note(fault: str) -> str:
+    from ..lane_stamps import STAMPS_FILE
+
+    return (f"{STAMPS_FILE} cannot be read ({fault}), so crapkit reads it as no stamps: "
+            "--reuse-unchanged reruns every lane and --reuse-artifacts refuses every lane's "
+            "artifact, since it cannot tell a failed attempt's leftover; the next lane run "
+            "writes the file again, or delete it")
 
 
 def _doctor_report(root: Path, cfg, findings: list[Finding]) -> dict:
@@ -1221,11 +1700,20 @@ def _resource_policy(cfg) -> dict:
             "test_retention_count": 0}
 
 
+def _doctor_verdict(findings: list[Finding]) -> str:
+    """The closing line, with the WARN count: a container's lane WARN closed
+    on a bare "no problems found", the one line a skimming reader reads."""
+    problems, warnings = len(_at_level(findings, "FAIL")), len(_at_level(findings, "WARN"))
+    verdict = f"doctor: {problems} problem(s)" if problems else "doctor: no problems found"
+    if not warnings:
+        return verdict
+    return f"{verdict}, {warnings} warning{'s' if warnings > 1 else ''} above"
+
+
 def _print_findings(findings: list[Finding]) -> None:
     for f in findings:
         print(f"{f.level:<4} {f.text}" if f.level else f.text)
-    problems = _at_level(findings, "FAIL")
-    print("doctor: no problems found" if not problems else f"doctor: {len(problems)} problem(s)")
+    print(_doctor_verdict(findings))
 
 
 def _emit_doctor(root: Path, cfg, findings: list[Finding], as_json: bool) -> None:
@@ -1239,36 +1727,21 @@ def _emit_doctor(root: Path, cfg, findings: list[Finding], as_json: bool) -> Non
     _print_findings(findings)
 
 
-def _junit_seconds(path: Path) -> float | None:
-    from ..junitparse import suite_seconds
-
-    if not path.is_file():
-        return None
-    try:
-        return suite_seconds(path.read_text(encoding="utf-8"))
-    except ToolError:
-        return None
-
-
-def _lane_seconds(root: Path, lane, stamps: dict) -> float | None:
-    """What this lane costs, best signal first: the duration its own run
-    recorded, found the way the start order finds it, else the wall time its
-    junit report claims. None means this lane has never left a cost signal on
-    disk — which is not the same as costing 0."""
-    from ..lanes import recorded_seconds
-
-    recorded = recorded_seconds(stamps, lane)
-    if recorded is not None:
-        return recorded
-    return _junit_seconds(root / lane.results_artifact) if lane.results_artifact else None
-
-
-def _lane_durations(root: Path, cfg) -> tuple[float, ...]:
-    from ..lanes import read_stamps
+def _lane_durations(root: Path, cfg) -> tuple[tuple[float, ...], tuple[str, ...]]:
+    """The durations on disk, and the names of the lanes that left none. A lane
+    with no cost signal is named, never summed as 0 and never dropped unsaid. Each lane's
+    cost is read the way the start order reads it (lanes.lane_seconds)."""
+    from ..lanes import lane_seconds, read_stamps
 
     stamps = read_stamps(root)
-    measured = [_lane_seconds(root, lane, stamps) for lane in cfg.lanes]
-    return tuple(s for s in measured if s is not None)
+    known, unknown = [], []
+    for lane in cfg.lanes:
+        seconds = lane_seconds(root, stamps, lane)
+        if seconds is None:
+            unknown.append(lane.name)
+        else:
+            known.append(seconds)
+    return tuple(known), tuple(unknown)
 
 
 def _doctor_tune(root: Path, cfg) -> int:
@@ -1281,24 +1754,34 @@ def _doctor_tune(root: Path, cfg) -> int:
         print(f"{finding.level} {finding.text}", file=sys.stderr)
     cpus, _ = available_cpus()
     knobs = suggest_knobs(cpus=cpus, lanes=len(cfg.lanes), shared=shared_coverage_data(cfg.lanes))
-    for line in tune_lines(cpus=cpus, knobs=knobs, durations=_lane_durations(root, cfg)):
+    durations, unmeasured = _lane_durations(root, cfg)
+    for line in tune_lines(cpus=cpus, knobs=knobs, durations=durations, unmeasured=unmeasured):
         print(line)
     return 0
 
 
-def _plugin_json(path: Path):
-    """One JSON file off an installed plugin, or None.
+def _plugin_json(path: Path) -> dict | None:
+    """One JSON object off an installed plugin, or None.
 
-    Missing, unreadable and half-written all read the same, because doctor's job
-    here is to name the file rather than to raise inside it. A plugin cache is
-    written by an installer this process does not control.
+    Missing, unreadable, half-written and not an object all read the same,
+    because doctor's job here is to name the file rather than to raise inside
+    it. A plugin cache is written by an installer this process does not
+    control.
+
+    Read the way Claude Code reads it, since that is the reader this check
+    answers for: a byte that is not UTF-8 as U+FFFD, and a byte-order mark as
+    the JSON error it is to Node (`claude plugin validate` refuses one). A
+    strict read called a manifest Claude Code loads missing.
     """
     import json
 
+    from ..repotext import plain_utf8
+
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(plain_utf8(path.read_bytes()))
     except (OSError, ValueError):
         return None
+    return value if isinstance(value, dict) else None
 
 
 def _hook_handlers(hooks: dict) -> list[dict]:
@@ -1307,16 +1790,39 @@ def _hook_handlers(hooks: dict) -> list[dict]:
             for matcher in event for handler in matcher.get("hooks", [])]
 
 
+def _handler_words(handler: dict) -> list[str]:
+    """The words one handler starts: its `args` in exec form, else its
+    `command` split the way the shell that runs a shell-form hook splits it.
+    Raises ValueError on a shape no harness could run."""
+    import shlex
+
+    words = handler["args"] if "args" in handler else shlex.split(handler.get("command", ""))
+    if not isinstance(words, list) or any(not isinstance(word, str) for word in words):
+        raise ValueError("hook args must be a list of strings")
+    return words
+
+
 def _named_protocol(handler: dict) -> str | None:
     """The `--protocol` value one handler spawns crapkit with, or None.
 
-    Paired off the arg list rather than indexed past the flag: a handler whose
-    args end at `--protocol` is malformed, and reading it must not raise.
+    Read off `args` in exec form and off the command string in shell form,
+    spelled `--protocol N` or `--protocol=N` as argparse takes either. Paired
+    off the word list rather than indexed past the flag: a handler whose words
+    end at `--protocol` is malformed, and reading it must not raise.
     """
-    args = handler.get("args", [])
-    if not isinstance(args, list) or any(not isinstance(arg, str) for arg in args):
-        raise ValueError("hook args must be a list of strings")
-    return dict(zip(args, args[1:])).get("--protocol")
+    words = _handler_words(handler)
+    inline = next((word.partition("=")[2] for word in words if word.startswith("--protocol=")), None)
+    return inline or dict(zip(words, words[1:])).get("--protocol")
+
+
+def _exec_form(root: Path) -> bool:
+    """Does any of the plugin's hooks pass `args`? Only those reach crapkit
+    through a field Claude Code below 2.1.139 drops."""
+    hooks = _plugin_json(root / "hooks" / "hooks.json")
+    try:
+        return any("args" in handler for handler in _hook_handlers(hooks))
+    except (AttributeError, TypeError):
+        return False
 
 
 def _hook_protocols(root: Path) -> tuple[str, ...] | None:
@@ -1339,7 +1845,19 @@ def _manifest_field(root: Path, field: str) -> str | None:
 
 
 def _manifest_version(root: Path) -> str | None:
-    return _manifest_field(root, "version")
+    """The manifest's version when it is a string, else None: a number or a
+    list there ranks no install and matches no CLI, and ranking by it raised."""
+    version = _manifest_field(root, "version")
+    return version if isinstance(version, str) and version else None
+
+
+def _manifest_fault(root: Path) -> str:
+    """Why the manifest gives no version, in doctor.plugin_handshake's words:
+    no file, a file that is not a JSON object, or an object with no version."""
+    path = root / ".claude-plugin" / "plugin.json"
+    if not path.is_file():
+        return "missing"
+    return "unversioned" if isinstance(_plugin_json(path), dict) else "not-an-object"
 
 
 # Claude Code keeps an install at <config>/plugins/cache/<marketplace>/<plugin>/
@@ -1388,51 +1906,253 @@ def _newest_root(roots: list[Path]) -> Path | None:
 
 def _plugins_dir() -> Path:
     """Where Claude Code keeps plugins: under CLAUDE_CONFIG_DIR, else ~/.claude."""
+    from ..userhome import user_home
+
     base = os.environ.get("CLAUDE_CONFIG_DIR")
-    return (Path(base) if base else Path.home() / ".claude") / "plugins"
+    return (typed_path(base) if base else user_home() / ".claude") / "plugins"
+
+
+def _plugin_entries(recorded) -> dict:
+    """installed_plugins.json's `plugins` object, or {} for any other shape."""
+    entries = recorded.get("plugins") if isinstance(recorded, dict) else None
+    return entries if isinstance(entries, dict) else {}
+
+
+def _install_path(entry) -> str:
+    path = entry.get("installPath") if isinstance(entry, dict) else None
+    return path if isinstance(path, str) else ""
+
+
+def _listed_installs(installs) -> list:
+    """The installs one plugin id records. Claude Code writes V2, a list of
+    installs; an older one wrote V1, one object, and a newer one converts it
+    only when it loads the file."""
+    return installs if isinstance(installs, list) else [installs]
+
+
+def _crapkit_install_lists(recorded) -> list:
+    return [installs for key, installs in _plugin_entries(recorded).items()
+            if key.startswith("crapkit@")]
+
+
+def _crapkit_records(recorded) -> list[dict]:
+    """Every install installed_plugins.json records for crapkit, V1 or V2; an
+    entry that is not an object records nothing."""
+    return [e for installs in _crapkit_install_lists(recorded) for e in _listed_installs(installs)
+            if isinstance(e, dict)]
 
 
 def _recorded_roots(recorded) -> list[Path]:
-    """Install directories installed_plugins.json records for crapkit."""
-    entries = recorded.get("plugins", {}) if isinstance(recorded, dict) else {}
-    return [Path(e["installPath"]) for key, installs in entries.items()
-            if key.startswith("crapkit@") for e in installs if e.get("installPath")]
+    """Install directories installed_plugins.json records for crapkit.
+
+    An entry of any shape but a string installPath records nothing, and the
+    cache scan beside this still finds the install: V1 and hand-edited files
+    ended the command meant to diagnose the plugin in a traceback."""
+    return [Path(path) for path in map(_install_path, _crapkit_records(recorded)) if path]
+
+def _newest_first(root: Path) -> tuple:
+    return _version_key(_manifest_version(root)), str(root)
 
 
-def _installed_crapkit_roots(plugins: Path) -> list[Path]:
-    """Every crapkit install under Claude Code's plugin directory: what the
-    installer recorded plus what the cache holds, so a stale record and a
-    missing record alone cannot hide the plugin."""
+def _recorded_installs(plugins: Path) -> list[Path]:
+    """Every install installed_plugins.json records that is still on disk,
+    newest version first. Each is a plugin some session runs: a user install
+    made at one version and a project install made at a later one are two
+    cache directories, and both run."""
     recorded = _recorded_roots(_plugin_json(plugins / "installed_plugins.json"))
-    cached = _manifest_roots(plugins)
-    return [r for r in dict.fromkeys(recorded + cached)
-            if (r / ".claude-plugin" / "plugin.json").is_file()]
+    live = [r for r in dict.fromkeys(recorded) if (r / ".claude-plugin" / "plugin.json").is_file()]
+    return sorted(live, key=_newest_first, reverse=True)
 
 
-def _resolve_plugin_root(arg: str) -> tuple[Path | None, str]:
-    """The plugin root to check, and where it was looked for.
+def _newest(roots: list[Path]) -> list[Path]:
+    newest = _newest_root(roots)
+    return [newest] if newest else []
 
-    An explicit PATH with no manifest at or under it resolves to itself, so
-    the handshake names the missing file at the path the operator typed.
+
+def _codex_home() -> Path:
+    """Where Codex keeps its state: CODEX_HOME, else ~/.codex."""
+    from ..userhome import user_home
+
+    base = os.environ.get("CODEX_HOME")
+    return Path(base) if base else user_home() / ".codex"
+
+
+class _Found(NamedTuple):
+    """A plugin root to check, and why a root the search found is that one."""
+    root: Path
+    why: str = ""
+
+
+class _PluginRoots(NamedTuple):
+    """The plugin roots to check, none when none was found, and where they
+    were looked for."""
+    roots: tuple[_Found, ...]
+    looked_in: str
+
+
+_IN_PLACE = " (Claude Code loads a plugin from a local directory marketplace in place)"
+
+
+def _resolve_plugin_root(arg: str) -> _PluginRoots:
+    """The plugin roots to check, and where they were looked for.
+
+    An explicit PATH resolves to the newest install at or under it, or to
+    itself when it holds no manifest, so the handshake names the missing file
+    at the path the operator typed. With none, every install Claude Code
+    recorded, else the newest in its cache, else the newest in Codex's.
     """
-    if arg:
-        under = Path(arg)
-        return _newest_root(_manifest_roots(under)) or under, str(under)
-    plugins = _plugins_dir()
-    return _newest_root(_installed_crapkit_roots(plugins)), str(plugins)
+    if not arg:
+        return _default_plugin_root()
+    under = typed_path(arg)
+    return _PluginRoots((_Found(_newest_root(_manifest_roots(under)) or under),), str(under))
+
+
+def _where_it_loads(root: Path) -> _Found:
+    """The copy Claude Code runs for the install at `root`. It runs a plugin
+    from a marketplace added as a local directory in place, so for that one it
+    is the directory, not its cache copy."""
+    listed = _marketplace_copy(root)
+    return _Found(listed[1], _IN_PLACE) if listed and listed[0] == "directory" else _Found(root)
+
+
+def _default_plugin_root() -> _PluginRoots:
+    """Every install Claude Code recorded; the newest in its cache when no
+    record names one on disk; else the newest in Codex's cache. A cached
+    version no record names is one `claude plugin update` left behind, and no
+    session runs it."""
+    plugins, codex = _plugins_dir(), _codex_home()
+    found = (_recorded_installs(plugins) or _newest(_manifest_roots(plugins))
+             or _newest(_manifest_roots(codex)))
+    return _PluginRoots(tuple(dict.fromkeys(map(_where_it_loads, found))), f"{plugins} or {codex}")
+
+
+def _claude_plugins_of(root: Path) -> Path | None:
+    """The plugins directory an install at <plugins>/cache/<marketplace>/
+    <plugin>/<version> sits in, else None."""
+    parents = root.parents
+    if len(parents) < 4 or parents[2].name != "cache" or parents[3].name != "plugins":
+        return None
+    return parents[3]
+
+
+def _listed_plugins(clone: Path) -> list[dict]:
+    listing = _plugin_json(clone / ".claude-plugin" / "marketplace.json")
+    listed = listing.get("plugins", []) if isinstance(listing, dict) else []
+    return [entry for entry in listed if isinstance(entry, dict)] if isinstance(listed, list) else []
+
+
+def _listed_source(clone: Path, name: str) -> str | None:
+    """The relative source the marketplace at `clone` lists for plugin `name`."""
+    source = next((p.get("source") for p in _listed_plugins(clone) if p.get("name") == name), None)
+    return source if isinstance(source, str) else None
+
+
+def _marketplace_entry(root: Path) -> dict:
+    """known_marketplaces.json's record of the marketplace an install came from."""
+    plugins = _claude_plugins_of(root)
+    known = _plugin_json(plugins / "known_marketplaces.json") if plugins else None
+    entry = known.get(root.parents[1].name) if isinstance(known, dict) else None
+    return entry if isinstance(entry, dict) else {}
+
+
+def _marketplace_copy(root: Path) -> tuple[str, Path] | None:
+    """(the marketplace's source kind, its own copy of this plugin) for an
+    install in Claude Code's cache, else None."""
+    entry = _marketplace_entry(root)
+    clone = entry.get("installLocation")
+    source = _listed_source(Path(clone), root.parent.name) if isinstance(clone, str) and clone else None
+    kind = entry.get("source", {}).get("source", "") if isinstance(entry.get("source"), dict) else ""
+    return (kind, Path(clone) / source) if source else None
+
+
+def _directory_entry(entry) -> bool:
+    source = entry.get("source") if isinstance(entry, dict) else None
+    return isinstance(source, dict) and source.get("source") == "directory"         and isinstance(entry.get("installLocation"), str)
+
+
+def _directory_marketplaces() -> list[Path]:
+    """Every marketplace known_marketplaces.json records as a local directory."""
+    known = _plugin_json(_plugins_dir() / "known_marketplaces.json")
+    entries = known.values() if isinstance(known, dict) else ()
+    return [Path(entry["installLocation"]) for entry in entries if _directory_entry(entry)]
+
+
+def _same_directory(a: Path, b: Path) -> bool:
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
+def _git_commands(marketplace: Path, root: Path) -> tuple[str | None, str | None]:
+    """The commands that update a marketplace directory that is a git checkout
+    and restore a file of the plugin at `root` inside it; none for a directory
+    that is no checkout."""
+    if not (marketplace / ".git").exists():
+        return None, None
+    return (f"git -C {_shell_quote(str(marketplace))} pull",
+            f"git -C {_shell_quote(str(root))} checkout --")
+
+
+def _in_place(root: Path):
+    """The local directory marketplace whose crapkit plugin is `root`, which
+    Claude Code loads in place, or None."""
+    from ..doctor import InPlace
+
+    for marketplace in _directory_marketplaces():
+        source = _listed_source(marketplace, "crapkit")
+        if source and _same_directory(marketplace / source, root):
+            return InPlace(str(marketplace), *_git_commands(marketplace, root))
+    return None
 
 
 def _probed_cli_version(executable: str) -> str | None:
-    """The launcher's declared version, or None when it cannot answer."""
+    """The launcher's declared version, or None when it cannot answer.
+
+    Read as bytes and decoded here: on Windows a text-mode read decodes in
+    subprocess's reader thread, so a byte that is not UTF-8 printed that
+    thread's traceback into doctor's stderr and never reached an except."""
     import subprocess
 
+    from ..repotext import lenient
+
     try:
-        done = subprocess.run([executable, "--version"], capture_output=True, encoding="utf-8",
+        done = subprocess.run([executable, "--version"], capture_output=True,
                               timeout=_PROBE_TIMEOUT_SECONDS)
-    except (OSError, subprocess.SubprocessError, UnicodeError):
+    except (OSError, subprocess.SubprocessError):
         return None
-    answer = (done.stdout or done.stderr).split() if done.returncode == 0 else []
-    return answer[1] if len(answer) == 2 and answer[0] == "crapkit" else None
+    return _declared_version(lenient(done.stdout or done.stderr)) if done.returncode == 0 else None
+
+
+def _declared_version(answer: str) -> str | None:
+    """The version in `crapkit X.Y.Z`. One holding U+FFFD, a byte that was not
+    UTF-8, is no version: printed, it named a CLI nothing on the machine is."""
+    words = answer.split()
+    readable = len(words) == 2 and words[0] == "crapkit" and "\ufffd" not in words[1]
+    return words[1] if readable else None
+
+
+def _path_launchers() -> list[str]:
+    """Every crapkit launcher on this PATH, in order, less any environment a
+    one-command runner (uvx, `uv run --with`, `pipx run`) built, which that
+    runner put on doctor's PATH and nothing else on the machine inherits."""
+    from ..launchers import path_launchers
+
+    return path_launchers(os.environ.get("PATH", ""))
+
+
+@lru_cache(maxsize=None)
+def _launcher_report(path: str) -> tuple[tuple[str, str | None], ...]:
+    """(launcher, version) for every launcher when PATH holds more than one,
+    else (). Memoized on PATH: one machine fact, and a version costs a spawn."""
+    found = _path_launchers()
+    return tuple((launcher, _probed_cli_version(launcher)) for launcher in found) \
+        if len(found) > 1 else ()
+
+
+def _doctor_launchers() -> list[Finding]:
+    """Two or more crapkit launchers on PATH: a WARN naming each with its
+    version, or a note while they agree."""
+    from ..doctor import launcher_skew
+
+    return list(launcher_skew(_launcher_report(os.environ.get("PATH", ""))))
 
 
 @lru_cache(maxsize=None)
@@ -1447,35 +2167,132 @@ def _spawned_cli() -> tuple[str, str | None] | None:
     over: inside a project `.venv` with no `crapkit` on PATH it printed nothing
     and exited 0 while every edit fired a command that cannot start, and beside
     an older pipx copy it called the two versions equal while the hook spawned
-    the older one.
+    the older one. Under uvx it found the launcher uvx had put on its own PATH
+    and on no other, and passed a plugin whose hooks could not start: PATH is
+    read without this process's own cached environment.
+
+    Under uvx, `uv run --with` or `pipx run` the PATH doctor inherits starts with
+    the environments that runner built for this one command. The plugin's hooks
+    never see them, so they are left out: `uvx crapkit doctor --plugin-root`
+    found crapkit there and passed while `claude mcp list` failed with ENOENT,
+    and `uv run --with crapkit` did the same from uv's builds-v0 bucket.
 
     Memoized because the answer is one machine fact and `doctor --plugin-root`
     would otherwise spawn it once per call.
     """
-    import shutil
+    found = _path_launchers()
+    return (found[0], _probed_cli_version(found[0])) if found else None
 
-    executable = shutil.which("crapkit")
-    return (executable, _probed_cli_version(executable)) if executable else None
+
+def _launcher_dirs() -> list[Path]:
+    """Where this interpreter puts a console script: its own scheme's scripts
+    directory (a venv's bin or Scripts), then the user scheme's, which is where
+    `pip install --user` writes (~/.local/bin, %APPDATA%\\Python\\PythonXY\\Scripts)."""
+    import sysconfig
+
+    user = sysconfig.get_preferred_scheme("user")
+    return [Path(sysconfig.get_path("scripts")), Path(sysconfig.get_path("scripts", user))]
+
+
+def _unlisted_launcher() -> Path | None:
+    """The directory holding this crapkit's own launcher. Asked only once PATH
+    answered no `crapkit`, so PATH does not list it."""
+    name = "crapkit.exe" if os.name == "nt" else "crapkit"
+    return next((directory for directory in _launcher_dirs() if (directory / name).is_file()), None)
 
 
 def _no_crapkit_on_path() -> str:
     """The FAIL for a machine where nothing the plugin declares can start. It
     names both files that spawn the bare name, because the reader is about to
-    look for a plugin problem and the problem is an install location."""
-    return ("crapkit doctor: FAIL no `crapkit` on PATH — the plugin's hooks/hooks.json and "
+    look for a plugin problem and the problem is an install location. Under a
+    one-command runner it names the environment that runner's tool built, the
+    one crapkit this process did find, and the install that stays. Otherwise it
+    names the directory this crapkit's launcher sits in when there is one; under
+    a runner that directory is the runner's own environment, which the tool
+    deletes or rebuilds, so it is never named there."""
+    from ..launchers import ephemeral_runner, install_line
+
+    builder = ephemeral_runner(sys.prefix)
+    if builder:
+        return (f"crapkit doctor: FAIL no `crapkit` on PATH outside the environment {builder} "
+                f"built for this one command ({sys.prefix}), and the plugin's hooks never "
+                "inherit that one: its hooks/hooks.json and .mcp.json both spawn the bare name, "
+                "so every PostToolUse edit fires a command that cannot start and the MCP server "
+                "never comes up. Install crapkit where the hook's PATH can see it "
+                f"({install_line(builder)}), then run this check again.")
+    found = _unlisted_launcher()
+    where = (f" This crapkit's launcher is in {found}, which PATH does not list: add that "
+             "directory to PATH, then restart the agent.") if found else ""
+    return ("crapkit doctor: FAIL no `crapkit` on PATH - the plugin's hooks/hooks.json and "
             ".mcp.json both spawn that bare name, so every PostToolUse edit fires a command "
             "that cannot start and the MCP server never comes up. Install it where the "
             "PATH the hook inherits can see it (`pipx install crapkit`), or point the "
-            "plugin at the environment holding it.")
+            "plugin at the environment holding it." + where)
 
 
-def _name_found_root(root: Path, looked_in: str) -> None:
+# The README's install lines: Claude Code's sparse, Codex's also pinned to the
+# tag of this CLI's release, since an unpinned Codex marketplace follows main
+# and moves the plugin past the CLI at the next Codex start.
+_INSTALL_PLUGIN = (
+    "Claude Code installs it with `claude plugin marketplace add JeanFrancoisGagne/crapkit "
+    "--sparse .claude-plugin plugin`, then `claude plugin install crapkit@crapkit`; Codex with "
+    "`{codex_add}`, then `codex plugin add crapkit@crapkit`. For a plugin kept anywhere else, "
+    "pass --plugin-root PATH."
+)
+
+
+def _install_plugin() -> str:
+    from ..doctor import CODEX_MARKETPLACE_ADD
+
+    return _INSTALL_PLUGIN.format(codex_add=CODEX_MARKETPLACE_ADD.format(version=__version__))
+
+
+def _name_found_root(found: _Found, looked_in: str) -> None:
     """A root the search found, not one the operator typed: the glob reaches
     three levels under the named directory, so a source checkout can win over an
     install. Naming it is how the reader knows which tree the verdict is about.
     """
-    if str(root) != looked_in:
-        print(f"crapkit doctor: checking {root}")
+    if str(found.root) != looked_in:
+        print(f"crapkit doctor: checking {found.root}{found.why}")
+
+
+@lru_cache(maxsize=None)
+def _claude_code_version() -> tuple[str, str] | None:
+    """The `claude` on PATH and what its `--version` printed, or None when
+    PATH holds none or it cannot answer. Memoized: one machine fact."""
+    import shutil
+    import subprocess
+
+    from ..repotext import lenient
+
+    executable = shutil.which("claude")
+    if executable is None:
+        return None
+    try:
+        done = subprocess.run([executable, "--version"], capture_output=True,
+                              timeout=_PROBE_TIMEOUT_SECONDS)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return executable, lenient(done.stdout).strip()
+
+
+def _claude_code_drops_args(root: Path) -> bool:
+    """Would a Claude Code below the floor drop this install's hook args? Only
+    for an install Claude Code runs (Codex runs none of its hooks) whose hooks
+    pass any: a shell-form hook runs as written."""
+    from ..doctor import plugin_harness
+
+    return plugin_harness(str(root), os.environ.get("CODEX_HOME")) == "claude" and _exec_form(root)
+
+
+def _claude_code_floor(root: Path) -> list[str]:
+    """The line for a Claude Code on PATH too old to pass the plugin's hook
+    args, when this install's hooks depend on them."""
+    from ..doctor import claude_code_floor_gap
+
+    found = _claude_code_version() if _claude_code_drops_args(root) else None
+    line = claude_code_floor_gap(*found) if found else None
+    return [line] if line else []
 
 
 def _doctor_plugin(plugin_root: str) -> int:
@@ -1491,30 +2308,115 @@ def _doctor_plugin(plugin_root: str) -> int:
     from the `crapkit` on PATH, because that bare name is what the plugin's
     hooks and its MCP server spawn — see `_spawned_cli`.
     """
-    from ..doctor import plugin_handshake
-    from .claude_hook import PROTOCOL
+    found = _resolve_plugin_root(plugin_root)
+    if not found.roots:
+        print(f"crapkit doctor: no installed crapkit plugin under {found.looked_in}. {_install_plugin()}")
+        return 1
+    for each in found.roots:
+        _name_found_root(each, found.looked_in)
+    return _print_problems(_spawn_failure() or _roots_lines(found.roots))
 
-    root, looked_in = _resolve_plugin_root(plugin_root)
-    if root is None:
-        print(f"crapkit doctor: no installed crapkit plugin under {looked_in} (install with "
-              "`claude plugin install crapkit@crapkit`, or pass --plugin-root PATH)")
-        return 1
-    _name_found_root(root, looked_in)
-    spawned = _spawned_cli()
-    if spawned is None:
-        print(_no_crapkit_on_path())
-        return 1
-    executable, cli_version = spawned
-    if cli_version is None:
-        print(f"crapkit doctor: FAIL {executable} did not answer `crapkit --version`. "
-              "Repair this launcher or install crapkit on the PATH the plugin inherits.")
-        return 1
-    lines = plugin_handshake(where=str(root), version=_manifest_version(root),
-                             cli_version=cli_version, cli_where=executable,
-                             protocols=_hook_protocols(root), supported=PROTOCOL)
+
+def _roots_lines(roots: tuple[_Found, ...]) -> list[str]:
+    """Every root's disagreements, each once: the Claude Code floor is one
+    machine fact, whichever install it came up under."""
+    return list(dict.fromkeys(line for each in roots for line in _plugin_lines(each.root)))
+
+
+def _print_problems(lines: list[str]) -> int:
     for line in lines:
         print(line)
     return 1 if lines else 0
+
+
+def _spawn_failure() -> list[str]:
+    """The FAIL for a `crapkit` the plugin cannot start or that answers no
+    version, else nothing: there is no CLI to compare the plugin with."""
+    spawned = _spawned_cli()
+    if spawned is None:
+        return [_no_crapkit_on_path()]
+    executable, cli_version = spawned
+    if cli_version is None:
+        from ..launchers import reinstall_command
+
+        return [f"crapkit doctor: FAIL {executable} gave no readable answer to `crapkit --version`. "
+                f"Reinstall the crapkit it belongs to with "
+                f"`{reinstall_command(executable, _shell_quote)}`, then run this check again."]
+    return []
+
+
+def _plugin_lines(root: Path) -> list[str]:
+    """Every disagreement between the plugin at `root` and the crapkit its
+    hooks spawn, each repair spelled for the harness that installed the plugin,
+    each scope that holds it, and the installer that owns the launcher; then an
+    install whose files the marketplace has moved past at one version, and the
+    Claude Code floor."""
+    from ..doctor import plugin_handshake, plugin_harness
+    from ..launchers import upgrade_command
+    from .claude_hook import PROTOCOL
+
+    executable, cli_version = _spawned_cli()
+    handshake = plugin_handshake(where=str(root), version=_manifest_version(root),
+                                 cli_version=cli_version, cli_where=executable,
+                                 protocols=_hook_protocols(root), supported=PROTOCOL,
+                                 harness=plugin_harness(str(root), os.environ.get("CODEX_HOME")),
+                                 cli_upgrade=upgrade_command(executable, _shell_quote),
+                                 scopes=_install_scopes(root), in_place=_in_place(root),
+                                 manifest_fault=_manifest_fault(root))
+    return handshake + _stale_copy(root) + _claude_code_floor(root)
+
+
+def _same_bytes(a: Path, b: Path) -> bool:
+    try:
+        return a.read_bytes() == b.read_bytes()
+    except OSError:
+        return False
+
+
+def _differing_files(source: Path, install: Path) -> tuple[str, ...]:
+    """The marketplace copy's files the install lacks or holds other bytes
+    for, sorted. Files only the install holds are Claude Code's own (.in_use)."""
+    files = (path.relative_to(source) for path in source.rglob("*") if path.is_file())
+    return tuple(sorted(rel.as_posix() for rel in files if not _same_bytes(source / rel, install / rel)))
+
+
+def _scope_of(record: dict):
+    """The scope one installed_plugins.json record names, with its project
+    directory when it has one, or None for a record naming no scope."""
+    from ..doctor import InstallScope
+
+    scope, project = record.get("scope"), record.get("projectPath")
+    if not isinstance(scope, str):
+        return None
+    return InstallScope(scope, project if isinstance(project, str) and project else None)
+
+
+def _install_scopes(root: Path) -> tuple:
+    """Every scope installed_plugins.json records this install under, in its
+    order. Claude Code keeps one cache directory per version, so a user install
+    and project installs of one version share it. Empty for an install no
+    record names, or one outside Claude Code's cache."""
+    plugins = _claude_plugins_of(root)
+    recorded = _plugin_json(plugins / "installed_plugins.json") if plugins else None
+    same = (e for e in _crapkit_records(recorded)
+            if os.path.normcase(str(e.get("installPath", ""))) == os.path.normcase(str(root)))
+    return tuple(filter(None, map(_scope_of, same)))
+
+
+def _stale_copy(root: Path) -> list[str]:
+    """The line for a Claude Code install whose files differ from its
+    marketplace's copy at one version. A local directory marketplace loads in
+    place, so its cache copy is never the one that runs."""
+    from ..doctor import stale_copy
+
+    listed = _marketplace_copy(root)
+    if listed is None or listed[0] == "directory":
+        return []
+    source = listed[1]
+    line = stale_copy(where=str(root), version=_manifest_version(root), source=str(source),
+                      source_version=_manifest_version(source), scopes=_install_scopes(root),
+                      differing=_differing_files(source, root))
+    return [line] if line else []
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -1532,7 +2434,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 1 if _at_level(findings, "FAIL") else 0
 
 
+def _refuse_upgraded() -> None:
+    """A rescore after `pip install -U` would import the new release's modules
+    into this process, and the watcher died with a traceback from inside them:
+    stop and name the restart instead."""
+    installed = upgraded_to()
+    if installed:
+        raise CrapkitError(f"crapkit was upgraded from {__version__} to {installed} while "
+                           f"`crapkit watch` ran, and this process still runs {__version__}'s "
+                           "code, which cannot load the new files; restart `crapkit watch`")
+
+
 def _watch_rescore(root: Path, moved: list[str]) -> None:
+    _refuse_upgraded()
     from ..procs import run_owned
 
     present = [f for f in moved if (root / f).is_file()]
@@ -1545,9 +2459,49 @@ def _watch_rescore(root: Path, moved: list[str]) -> None:
 
 
 def _watched_files(root: Path, cfg) -> list[str]:
-    """Every tracked file a scope claims, flat — the whole subject of one poll."""
-    by_scope = assign_files(ls_files(root), cfg, size_of=_file_sizer(root))
-    return [f for files in by_scope.values() for f in files]
+    """Every file a scope claims, tracked or not yet added, ignored ones left
+    out, flat: the whole subject of one poll. Listed again each poll, so a
+    file created in a scope while the watch runs is rescored too. The first
+    poll's scan names the unreadable names it left out (cmd_watch). Raises
+    GitError."""
+    return _flat(_watched_scan(root, cfg))
+
+
+def _watched_scan(root: Path, cfg):
+    """The scan of every file under the declared scope paths: git looks for new
+    files there only, since over the whole tree of a 33k-file repo that search
+    took 0.88 s a poll, under its scopes 0.27 s. A claimed name that is not
+    UTF-8 is refused and an unclaimed one is left out, as at every scan."""
+    from ..lane_changes import visible_paths
+
+    declared = tuple(dict.fromkeys(path for scope in cfg.scopes for path in scope.paths))
+    return _scan(root, list(visible_paths(root, declared)), cfg)
+
+
+def _flat(universe) -> list[str]:
+    return [f for files in universe.by_scope.values() for f in files]
+
+
+class _Watching(NamedTuple):
+    """What one poll hands the next: the files it listed, what it saw, and
+    the git error its listing hit, "" when git listed them."""
+    files: list[str]
+    seen: Snapshot
+    fault: str
+
+
+def _relisted(root: Path, cfg, state: _Watching) -> tuple[list[str], str]:
+    """This poll's files. When git cannot list them, the last poll's files, and
+    the error named on the first poll that hits it, not on every one after."""
+    try:
+        return _watched_files(root, cfg), ""
+    except GitError as exc:
+        fault = str(exc)
+    if fault != state.fault:
+        print(f"crapkit watch: could not list the files your scopes claim ({fault}); "
+              "fix what git reports. Until git lists them, each poll reads the last list "
+              "and asks git again", flush=True)
+    return state.files, fault
 
 
 def _watch_cycles(cycles: int | None):
@@ -1565,36 +2519,36 @@ def _watch_cycles(cycles: int | None):
 
 def _watch_banner(watched: int, interval: float, cycles: int | None) -> str:
     """The first line, naming how this run ends. Telling an operator to press
-    ctrl-c on a `--cycles 3` run describes a loop that is not the one running."""
+    ctrl-c on a `--cycles 3` run describes a loop that is not the one running.
+    `watched` counts every file a scope claims, untracked ones included."""
     stop = "ctrl-c to stop" if cycles is None else f"{cycles} poll(s) then stop"
-    return f"watching {watched} tracked files every {interval}s - {stop}"
+    return f"watching {watched} file(s) in scope every {interval}s - {stop}"
 
 
-def _watch_cycle(root: Path, files: list[str], prev: dict[str, float],
-                 interval: float) -> dict[str, float]:
-    """One poll: wait, re-stat, rescore whatever moved; the new snapshot out."""
+def _watch_cycle(root: Path, cfg, state: _Watching, interval: float) -> _Watching:
+    """One poll: wait, list the files again, rescore whatever holds new bytes;
+    what the next poll starts from out."""
     import time
 
-    from ..watch import changed_paths, snapshot_mtimes
-
     time.sleep(interval)
-    cur = snapshot_mtimes(root, files)
-    moved = changed_paths(prev, cur)
+    files, fault = _relisted(root, cfg, state)
+    seen, moved = poll(root, files, state.seen)
     if moved:
         _watch_rescore(root, moved)
-    return cur
+    return _Watching(files, seen, fault)
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
-    from ..watch import snapshot_mtimes
-
     root = _command_root(args.repo)
-    files = _watched_files(root, _load_repo_config(root))
-    prev = snapshot_mtimes(root, files)
-    print(_watch_banner(len(prev), args.interval, args.cycles), flush=True)
+    cfg = _load_repo_config(root)
+    universe = _watched_scan(root, cfg)
+    _say_left_out(universe.unreadable)
+    files = _flat(universe)
+    state = _Watching(files, snapshot(root, files), "")
+    print(_watch_banner(len(state.seen.mtimes), args.interval, args.cycles), flush=True)
     try:
         for _ in _watch_cycles(args.cycles):
-            prev = _watch_cycle(root, files, prev, args.interval)
+            state = _watch_cycle(root, cfg, state, args.interval)
     except KeyboardInterrupt:
         pass
     return 0

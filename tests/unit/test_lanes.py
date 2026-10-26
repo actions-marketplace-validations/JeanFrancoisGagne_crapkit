@@ -109,8 +109,8 @@ def test_the_stale_artifact_refusal_still_carries_the_log_and_its_tail(tmp_path)
 
 
 def test_a_rerun_that_writes_the_same_bytes_is_still_this_run_s_artifact(tmp_path):
-    """Freshness is the mtime, not the content: a runner that rewrites an
-    identical report bumps it, so a byte-identical rerun must stay green."""
+    """The declared file sits aside while the attempt runs, so a runner that
+    rewrites an identical report wrote it, and a byte-identical rerun stays green."""
     (tmp_path / "cov.json").write_text(ISTANBUL, encoding="utf-8")
     script = tmp_path / "write.py"
     script.write_text(f"open('cov.json', 'w', encoding='utf-8').write({ISTANBUL!r})\n",
@@ -337,6 +337,26 @@ def test_a_quoted_interpreter_path_reaches_the_hint_as_one_word(tmp_path):
         _raise_no_artifact(tmp_path, lane, log, 4)
 
     assert "C:/Program Files/py/python.exe" in str(raised.value)
+
+
+def test_the_install_line_names_the_file_a_lane_path_resolves_to(tmp_path):
+    r"""`.venv\Scripts\python.exe -m pip install pytest-cov` ran nowhere but the
+    lane's directory, and in Git Bash nowhere at all: bash read the backslashes
+    as escapes. The install line names the file the lane's word resolves to."""
+    from crapkit.invocation import interpreter_word
+    from crapkit.lanes import _raise_no_artifact
+
+    python = tmp_path / ".venv" / "Scripts" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"")
+    word = str(Path(".venv", "Scripts", "python.exe"))
+    lane = Lane(name="py", command=f"{word} -m pytest --cov", artifact=".crapkit/cov/py.json",
+                parser="coveragepy", scopes=("src",))
+    log = _plant_log(tmp_path, _NO_COV)
+    with pytest.raises(ToolError) as raised:
+        _raise_no_artifact(tmp_path, lane, log, 4)
+
+    assert f"(`{interpreter_word(str(python))} -m pip install pytest-cov`)" in str(raised.value)
 
 
 def _cov_hint(tmp_path, command: str) -> str:

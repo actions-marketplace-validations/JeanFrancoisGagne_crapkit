@@ -9,6 +9,10 @@ import base64
 import shlex
 from types import SimpleNamespace
 
+import pytest
+
+from uvx_process import as_uvx
+
 from crapkit import packet
 from crapkit.score import ScoredRow
 
@@ -155,6 +159,17 @@ def test_windows_commands_quote_shell_operators_and_hide_expansion_text(monkeypa
                       "$LASTEXITCODE = 1; & $command.Source 'test-scoped' 'src/a''%VAR%.py'; exit $LASTEXITCODE")
 
 
+def test_windows_commands_print_a_long_flag_bare_and_quote_the_stop_parsing_token(monkeypatch):
+    """The MCP server's `truncated.full` spells a tool's argv, flags included:
+    `--top 50` reads as written in both shells, and `--%` would stop
+    PowerShell from parsing the rest."""
+    monkeypatch.setattr(packet, "os", SimpleNamespace(name="nt"))
+    assert (packet.console_command(["worklist", "--top", "50", "--json", "--repo", "C:\\r"])
+            == "crapkit worklist --top 50 --json --repo C:\\r")
+    assert packet.console_command(["worklist", "--%"]).startswith(
+        "powershell -NoProfile -NonInteractive -EncodedCommand ")
+
+
 def test_windows_commands_escape_a_double_quote_for_powershell_to_pass_on(monkeypatch):
     """Windows PowerShell 5.1 escapes no quote inside a native argument, so the
     script carries the C runtime's escapes: a backslash before the quote, and
@@ -166,6 +181,68 @@ def test_windows_commands_escape_a_double_quote_for_powershell_to_pass_on(monkey
     script = base64.b64decode(encoded.removeprefix(prefix)).decode("utf-16le")
     assert script.endswith(r"""& $command.Source 'explain' 'src/cls.py' 'g( s = \"a\\\\\" )'; """
                            "exit $LASTEXITCODE")
+
+
+@pytest.mark.parametrize("os_name", ["posix", "nt"])
+def test_an_argument_every_shell_reads_in_double_quotes_prints_one_form_on_both_oses(
+        monkeypatch, os_name):
+    """A line made on Linux is pasted into cmd.exe too, which reads `'` as part
+    of the argument: sh, bash, PowerShell and cmd.exe all read these double
+    quotes literally."""
+    monkeypatch.setattr(packet, "os", SimpleNamespace(name=os_name))
+
+    assert packet.console_command(["explain", "pkg/cé.py", "accent"]) == 'crapkit explain "pkg/cé.py" accent'
+    assert packet.commands("src/a b.py", True)["gate"] == 'crapkit rescore "src/a b.py" --gate'
+    assert packet.commands("-a.py", True)["gate"] == 'crapkit rescore --gate -- "-a.py"'
+
+
+def test_an_argument_sh_rewrites_in_double_quotes_keeps_the_posix_form(monkeypatch):
+    monkeypatch.setattr(packet, "os", SimpleNamespace(name="posix"))
+
+    assert (packet.console_command(["explain", "app/users.$id.tsx", "loader( )"])
+            == "crapkit explain 'app/users.$id.tsx' 'loader( )'")
+    assert packet.console_command(["explain", "", "a\tb"]) == "crapkit explain '' 'a\tb'"
+
+
+def test_a_backslash_path_stays_bare_on_windows(monkeypatch):
+    monkeypatch.setattr(packet, "os", SimpleNamespace(name="nt"))
+
+    assert packet.console_command(["rescore", "src\\a.py", "--gate"]) == "crapkit rescore src\\a.py --gate"
+
+
+def test_a_typographic_double_quote_takes_the_encoded_form_on_windows(monkeypatch):
+    """PowerShell ends a double-quoted string at a typographic quote."""
+    monkeypatch.setattr(packet, "os", SimpleNamespace(name="nt"))
+
+    for quote in "“”„":
+        command = packet.console_command(["explain", "src/a.py", f"f( s = {quote}x )"])
+        assert command.startswith(packet.ENCODED_PREFIX), command
+
+
+def test_a_packet_built_under_uvx_runs_every_command_through_uvx(tmp_path, monkeypatch):
+    """uvx puts no `crapkit` on PATH. A packet a uvx run built handed its agent
+    four commands, and the agent's shell answered each with 127."""
+    as_uvx(tmp_path, monkeypatch)
+    monkeypatch.setattr(packet, "os", SimpleNamespace(name="posix"))
+
+    out = packet.commands("core/alpha.py", True)
+
+    assert out["gate"] == "uvx crapkit rescore core/alpha.py --gate"
+    assert out["scoped_tests"] == "uvx crapkit test-scoped core/alpha.py"
+    assert out["verify"] == "uvx crapkit verify"
+    assert out["refresh"] == "uvx crapkit coverage --reuse-unchanged"
+
+
+def test_a_windows_packet_under_uvx_starts_uvx_and_hands_it_crapkit(tmp_path, monkeypatch):
+    as_uvx(tmp_path, monkeypatch)
+    monkeypatch.setattr(packet, "os", SimpleNamespace(name="nt"))
+
+    assert packet.commands("src/a & b.py", True)["gate"] == 'uvx crapkit rescore "src/a & b.py" --gate'
+    encoded = packet.commands("src/a'%VAR%.py", True)["scoped_tests"]
+    script = base64.b64decode(encoded.removeprefix(packet.ENCODED_PREFIX)).decode("utf-16le")
+    assert script == ("$command = Get-Command uvx -CommandType Application -TotalCount 1 -ErrorAction Stop; "
+                      "$LASTEXITCODE = 1; & $command.Source 'crapkit' 'test-scoped' 'src/a''%VAR%.py'; "
+                      "exit $LASTEXITCODE")
 
 
 # --- regrowth: complexity that came back --------------------------------------
@@ -250,6 +327,22 @@ def test_coupling_ranks_before_it_cuts():
     out = packet.coupling_partners(RANKED, "core/alpha.py", lambda p: False, top=1)
 
     assert [p["path"] for p in out] == ["tests/test_alpha.py"]
+
+
+@pytest.mark.parametrize("partner, is_test", [
+    ("tests/test_alpha.py", True), ("core/Tests/AlphaTests.swift", True),
+    ("core/alpha_test.go", True), ("core/alpha_test.py", True), ("core/alpha.spec.ts", True),
+    ("core/test_deploy.sh", False), ("core/beta.py", False)])
+def test_a_coupled_partner_is_a_test_by_the_rule_init_and_doctor_read(partner, is_test):
+    """docs/agent-json.md: `is_test` says the partner is a test file. brief read a
+    name rule of its own, which missed the Go and pytest `_test` suffix that the
+    default exclude globs drop, and called core/test_deploy.sh a test while the
+    scored corpus scores it as source."""
+    from crapkit.cli.queue import _brief_coupling
+
+    ranked = [{"files": ["core/alpha.py", partner], "support": 6, "confidence": 1.0}]
+
+    assert _brief_coupling(ranked, "core/alpha.py")[0]["is_test"] is is_test
 
 
 def test_a_twin_the_dup_module_did_not_flag_is_not_contained():

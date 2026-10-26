@@ -15,7 +15,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from conftest import cli_runner
+from conftest import cli_runner, install_for_pytest_cov
 
 # PYTHONPATH shims reach only a new interpreter, so this file keeps the child.
 run_cli = cli_runner(spawn=True)
@@ -25,7 +25,9 @@ _TEST = "from pkg.x import g\n\n\ndef test_g():\n    assert g(0) == 0\n"
 _PYPROJECT = '[project]\nname = "app"\n\n[tool.pytest.ini_options]\npythonpath = ["."]\n'
 _TESTPATHS = _PYPROJECT + 'testpaths = ["tests"]\n'
 _APP_TS = "export function f(a: number) { return a ? 1 : 2; }\n"
-_LAUNCHER = r"(python3?|py|[^\s]+python(\.exe)?)"
+# The python init names: its launcher token (`{python}`, `{python:.venv}`),
+# or the one name that resolves on a machine where the token's does not.
+_LAUNCHER = r"(\{python(:[^\s{}]+)?\}|python3?|py|[^\s]+python(\.exe)?)"
 
 
 def _commit_all(repo: Path, message: str) -> None:
@@ -142,7 +144,7 @@ def test_doctor_names_the_interpreter_and_plugin_versions_the_lane_resolves_to(t
 
     assert res.returncode == 0, res.stdout + res.stderr
     (line,) = [ln for ln in res.stdout.splitlines() if ln.startswith("ok   lane 'py'")]
-    assert re.fullmatch(rf"ok   lane 'py': {_LAUNCHER} -> .+ \(pytest [\d.]+\S*, pytest-cov [\d.]+\S*\)",
+    assert re.fullmatch(rf"ok   lane 'py': {_LAUNCHER} -> .+ \(pytest [\d.]+\S*, pytest-cov [\d.]+\S*, coverage [\d.]+\S*\)",
                         line), line
     assert "no problems found" in res.stdout
 
@@ -168,7 +170,7 @@ def test_doctor_fails_with_inits_own_sentence_when_pytest_cov_cannot_import(tmp_
     assert res.returncode == 1, res.stdout + res.stderr
     (line,) = [ln for ln in res.stdout.splitlines() if "pytest_cov" in ln]
     assert line.startswith("FAIL lane 'py' names"), line
-    assert "pip install pytest-cov" in line
+    assert install_for_pytest_cov(line) in line, line
     assert "no problems found" not in res.stdout
 
 

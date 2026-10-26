@@ -26,6 +26,7 @@ from .locks import exclusive_lock
 _OWN_GROUP = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
               if os.name == "nt" else {"start_new_session": True})
 
+_PROC = Path("/proc")
 _OWNER_INPUTS = set()
 _OWNER_INPUTS_LOCK = threading.RLock()
 
@@ -137,14 +138,15 @@ class _LocalOwner(ProcessOwner):
 class _GuardianOwner(ProcessOwner):
     """The client of a guardian process that holds the locks and the trees."""
 
-    def __init__(self, process):
+    def __init__(self, process, log=None):
         super().__init__()
         self.process = process
+        self.log = log
 
     def receive(self) -> dict:
         line = self.process.stdout.readline()
         if not line:
-            raise ToolError("measurement owner stopped before confirming ownership")
+            raise self._stopped("before confirming ownership")
         result = json.loads(line)
         if not result.get("ok"):
             raise ToolError(result.get("error", "measurement owner refused the operation"))
@@ -156,11 +158,69 @@ class _GuardianOwner(ProcessOwner):
             self.process.stdin.flush()
             self.receive()
         except OSError as error:
-            raise ToolError("measurement owner stopped during command registration") from error
+            raise self._stopped("during command registration") from error
 
     def check(self) -> None:
         if self.process.poll() is not None:
-            raise ToolError("measurement owner stopped before publication")
+            raise self._stopped("before publication")
+
+    def _stopped(self, when: str) -> ToolError:
+        """The exit-5 line for every way the guardian can vanish, naming the
+        log its stderr went to and whether it wrote there."""
+        said = "" if self.log is None else self.log.said()
+        return ToolError(f"measurement owner stopped {when}{said}")
+
+
+class _OwnerLog:
+    """Where a guardian's stderr goes: appended to `_log_path`, and nowhere
+    when that file cannot be opened, since an owner that cannot log still
+    guards. Opened in append mode because owners of other commands on the
+    same checkout write to it too."""
+
+    def __init__(self, paths):
+        try:
+            self.path = _log_path(paths)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.stream = open(self.path, "ab")
+        except (OSError, RuntimeError):
+            self.stream = None
+        self.start = self.stream.tell() if self.stream else 0
+
+    def target(self):
+        """What Popen takes as the guardian's stderr."""
+        return self.stream or subprocess.DEVNULL
+
+    def close(self) -> None:
+        """The guardian holds its own descriptor once it has started."""
+        if self.stream:
+            self.stream.close()
+
+    def said(self) -> str:
+        """The clause that ends the exit-5 line. A killed guardian writes
+        nothing, and an older owner's traceback above this one's start is not
+        its cause."""
+        if self.stream is None:
+            return ""
+        if _size(self.path) > self.start:
+            return f"; its error is at the end of {self.path}"
+        return f"; it wrote nothing to {self.path}"
+
+
+def _log_path(paths) -> Path:
+    """`owner.log` in the `.crapkit` directory nearest one of the owner's
+    locks, which is the checkout it guards. An owner holding no lock there (a
+    scoped test run, the MCP server, a probe) logs beside the measurement
+    locks in the per-user cache."""
+    states = (parent for path in paths for parent in Path(path).parents if parent.name == ".crapkit")
+    state = next(states, None)
+    return (state or Path.home() / ".cache" / "crapkit") / "owner.log"
+
+
+def _size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 @contextmanager
@@ -182,6 +242,19 @@ def own_processes(paths, *, optional: bool = False, label: str = "measurement"):
         yield owner
 
 
+def helper_flags() -> tuple[str, ...]:
+    """The interpreter options a helper crapkit starts takes, so it hands the OS
+    the bytes this process would for the same text.
+
+    A helper gets its command and its lease paths as text and spells them for
+    the OS itself. Under a Latin-1 locale crapkit runs in UTF-8 mode (the
+    restart cli.main makes), and a helper started without the flag spelled
+    `café` as b"caf\\xe9": the command's argument named no file, and the owner
+    locked a file beside the one this process meant. A lane's own command is
+    not a helper and keeps the locale it was given."""
+    return ("-X", "utf8") if sys.flags.utf8_mode else ()
+
+
 @contextmanager
 def _external_owner(paths, *, optional: bool = False, label: str = "measurement"):
     """Own measurement outputs across caller crashes and command cleanup."""
@@ -189,13 +262,18 @@ def _external_owner(paths, *, optional: bool = False, label: str = "measurement"
     bootstrap = ("import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); "
                  "runpy.run_module('crapkit._process_owner', run_name='__main__')")
     package_root = str(Path(__file__).resolve().parent.parent)
+    log = _OwnerLog(paths)
     with _OWNER_INPUTS_LOCK:
-        process = subprocess.Popen([sys.executable, "-c", bootstrap, package_root, json.dumps(options)],
-                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                   stderr=subprocess.DEVNULL, text=True, encoding="utf-8", **_OWN_GROUP)
+        try:
+            process = subprocess.Popen([sys.executable, *helper_flags(), "-c", bootstrap, package_root,
+                                        json.dumps(options)],
+                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=log.target(), text=True, encoding="utf-8", **_OWN_GROUP)
+        finally:
+            log.close()
         raw_input = process.stdin.buffer.raw
         _OWNER_INPUTS.add(raw_input)
-    owner = _GuardianOwner(process)
+    owner = _GuardianOwner(process, log)
     try:
         owner.held = owner.receive()["held"]
         yield owner
@@ -242,27 +320,50 @@ def _family(path):
 
 
 def _group_exists(pid: int) -> bool:
+    """Whether the kernel still knows the group. Only ESRCH says it is gone:
+    Darwin answers EPERM when the only member left is the unreaped leader, and
+    a group whose members the caller may not signal answers EPERM everywhere,
+    so _group_active decides both."""
     try:
         os.killpg(pid, 0)
     except ProcessLookupError:
         return False
+    except PermissionError:
+        pass
     return True
 
 
 def _proc_group_member(path: Path, pid: str) -> bool:
+    """Read as bytes: the name in parentheses is whatever the process set,
+    cut at 15 bytes, and only the ASCII fields after it are read."""
     try:
-        fields = path.read_text().rsplit(")", 1)[1].split()
+        fields = path.read_bytes().rsplit(b")", 1)[1].split()
     except (OSError, IndexError):
         return False
-    return fields[2] == pid and fields[0] not in ("Z", "X")
+    return fields[2] == pid.encode() and fields[0] not in (b"Z", b"X")
+
+
+def _proc_stat_records() -> list[Path]:
+    """Each /proc/<pid>/stat, named from one listing of /proc and never
+    statted: Python 3.11's glob stats each record it names, and a process that
+    exits in between answers ESRCH, which pathlib raised, so a lane stopped
+    while any process on the host exited failed with `[Errno 3] No such
+    process`. `_proc_group_member` reads a record that is gone as no member."""
+    return [_PROC / name / "stat" for name in os.listdir(_PROC) if name.isdigit()]
 
 
 def _group_active(pid: int) -> bool:
-    """Wait for descriptor closure; zombies cannot keep writing or own locks."""
+    """Wait for descriptor closure; zombies cannot keep writing or own locks.
+    ps is spelled where macOS and the BSDs ship it, since the caller's PATH
+    may hold no ps."""
     if sys.platform.startswith("linux"):
-        return any(_proc_group_member(path, str(pid))
-                   for path in Path("/proc").glob("[0-9]*/stat"))
-    result = subprocess.run(["ps", "-A", "-o", "pgid=", "-o", "stat="],
+        return any(_proc_group_member(path, str(pid)) for path in _proc_stat_records())
+    return _ps_group_active(pid)
+
+
+def _ps_group_active(pid: int) -> bool:
+    """`_group_active` where no /proc holds the table: one `ps` listing."""
+    result = subprocess.run(["/bin/ps", "-A", "-o", "pgid=", "-o", "stat="],
                             capture_output=True, text=True, check=True)
     return any(group == str(pid) and not state.startswith("Z")
                for group, state in (line.split() for line in result.stdout.splitlines()))
@@ -331,5 +432,29 @@ def main(options: dict) -> None:
         _reply({"error": str(error)})
 
 
+def _utf8_channel() -> None:
+    """The channel is UTF-8 JSON lines whatever the environment says. This
+    child inherits the caller's environment, and PYTHONIOENCODING=utf-8-sig
+    opened its first reply with a byte-order mark while utf-16 and utf-32 wrote
+    bytes the caller's UTF-8 reader could not parse, so `coverage` exited 1
+    before a lane ran. Nothing has been read or written yet, so both streams
+    can still change codec."""
+    sys.stdin.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8")
+
+
+def _logged_main(argv: list[str]) -> None:
+    """Run the guardian. An error it did not expect goes to its stderr, which
+    the caller points at owner.log, under a dated line naming this process:
+    owners of several commands append to one log."""
+    try:
+        main(json.loads(argv[1]))
+    except Exception:
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        print(f"{stamp} measurement owner {os.getpid()} stopped:", file=sys.stderr, flush=True)
+        raise
+
+
 if __name__ == "__main__":
-    main(json.loads(sys.argv[1]))
+    _utf8_channel()
+    _logged_main(sys.argv)

@@ -1,0 +1,1191 @@
+"""tools/accuracy/mutation.py: a calc run judges only what its stored verdicts do not carry.
+
+A weekly or diff run used to judge every mutant of its scope, or of the
+functions since() named, whatever an earlier run had judged at the same text:
+four diff runs on 2026-10-01 judged the same 1,089 mutants at heads where 0 of
+their 93 functions differed, and the weekly costs about 2,024 container-minutes
+a run. Each receipt now stores what each function's verdicts rest on, and a run
+judges a function only when one of those moved.
+
+Every rule is checked both ways: a changed input reruns exactly the functions
+it reaches (with the canary, which every judging run adds), and an unchanged
+input reruns nothing, with the carried verdicts equal to a cold run's. mutmut
+and the stage are stood in for (FakeMutmut); the last test runs mutmut itself
+in the accuracy image.
+"""
+from __future__ import annotations
+
+import copy
+import datetime
+import fnmatch
+import functools
+import importlib.util
+import json
+from pathlib import Path
+import sys
+import types
+
+import pytest
+
+REPO = Path(__file__).resolve().parents[3]
+
+
+def _load():
+    spec = importlib.util.spec_from_file_location("accuracy_mutation_carry",
+                                                  REPO / "tools" / "accuracy" / "mutation.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+mutation = _load()
+
+SCORE = ("def crap(ccn, cov):\n    return ccn * ccn * (1 - cov) ** 3 + ccn\n\n\n"
+         "def grade(value):\n    return value > 5\n")
+DIGEST = ("LIMIT = 3\n\n\ndef totals(rows):\n    return sum(rows[:LIMIT])\n\n\n"
+          "class Shown:\n    @property\n    def size(self):\n        return self\n")
+FILES = {
+    "src/crapkit/score.py": SCORE,
+    "src/crapkit/digest.py": DIGEST,
+    "src/crapkit/helper.py": "def helper():\n    return 1\n",
+    "tests/conftest.py": "import pytest\n",
+    "tests/unit/test_score.py": "def test_crap():\n    pass\n\n\ndef test_grade():\n    pass\n",
+    "tests/unit/test_digest.py": "def test_totals():\n    pass\n",
+    "tests/unit/data/rows.txt": "1\n2\n",
+    "README.md": "readme\n",
+}
+MODULES = ["src/crapkit/digest.py", "src/crapkit/score.py"]
+CRAP, GRADE = ("src/crapkit/score.py", "crap"), ("src/crapkit/score.py", "grade")
+TOTALS, SIZE = ("src/crapkit/digest.py", "totals"), ("src/crapkit/digest.py", "Shown.size")
+EVERY = [CRAP, GRADE, TOTALS, SIZE]
+# What mutmut makes of FILES: Shown.size is a property, so it makes no mutant of it.
+CODES = {CRAP: {"crapkit.score.x_crap__mutmut_1": 1, "crapkit.score.x_crap__mutmut_2": 1},
+         GRADE: {"crapkit.score.x_grade__mutmut_1": 1},
+         TOTALS: {"crapkit.digest.x_totals__mutmut_1": 1, "crapkit.digest.x_totals__mutmut_2": 3}}
+T_CRAP, T_GRADE = "tests/unit/test_score.py::test_crap", "tests/unit/test_score.py::test_grade"
+T_TOTALS = "tests/unit/test_digest.py::test_totals"
+MAP = {"crapkit.score.x_crap": [T_CRAP], "crapkit.score.x_grade": [T_GRADE],
+       "crapkit.digest.x_totals": [T_TOTALS]}
+NOTHING = {"reads": [], "dirs": [], "spawns": []}
+REACH = {"outside": dict(NOTHING),
+         "tests": {T_CRAP: dict(NOTHING), T_GRADE: dict(NOTHING),
+                   T_TOTALS: {"reads": ["tests/unit/data/rows.txt"], "dirs": ["tests/unit/data"],
+                              "spawns": []}}}
+
+
+def _tree(files: dict[str, str], modes: dict[str, str] | None = None):
+    """A tree of `files`, each entry its git mode (100644 unless `modes` names
+    another) and the sha256 of its text standing in for the blob id."""
+    modes = modes or {}
+    entries = {path: f"{modes.get(path, '100644')} {mutation._sha(text)}"
+               for path, text in files.items()}
+    texts = {mutation._sha(text): text for text in files.values()}
+    return mutation.Tree(entries, texts.__getitem__)
+
+
+def _put(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(json.dumps(data).encode())
+
+
+def _globs(*functions) -> list[str]:
+    return sorted(mutation.mutmut_glob(*function) for function in functions)
+
+
+class FakeMutmut:
+    """Stands in for mutmut_in: answers each mutant the globs name with its exit code
+    in `codes`, and leaves what mutmut and the launcher leave in the stage: the
+    stats map, the reach record and each module's meta file."""
+
+    def __init__(self):
+        self.codes, self.map, self.reach = copy.deepcopy(CODES), copy.deepcopy(MAP), copy.deepcopy(REACH)
+        self.calls, self.complete, self.stats, self.failures = [], True, True, []
+
+    def __call__(self, stage, globs, env, children, budget=None):
+        self.calls.append(sorted(globs))
+        if self.stats:  # False: the cap stopped mutmut inside its stats pass
+            self.write_stats(stage)
+        for module in MODULES:
+            placed = {mutation.mangled(*function).rpartition(".")[2]: "h"
+                      for function in self.codes if function[0] == module}
+            _put(stage / "mutants" / f"{module}.meta", {"hash_by_function_name": placed})
+        return self.rows(globs), self.complete
+
+    def write_stats(self, stage):
+        """What mutmut's stats pass and the launcher leave when the pass ends."""
+        _put(stage / mutation.STATS_MAP, {"tests_by_mangled_function_name": self.map})
+        _put(stage / mutation.REACH_FILE, self.reach)
+        (stage / mutation.STATS_FAILURES).write_bytes(
+            "".join(f"{node}\n" for node in self.failures).encode())
+
+    def rows(self, globs):
+        return [self.row(function, name, code) for function, named in self.codes.items()
+                for name, code in named.items()
+                if any(fnmatch.fnmatchcase(name, glob) for glob in globs)]
+
+    @staticmethod
+    def row(function, name, code):
+        status = mutation.STATUS_BY_EXIT[code]
+        return mutation.Result(name, *function, status, "" if status in mutation.KILLED else name)
+
+
+class World:
+    """A repo, a stage and receipts under tmp_path, with HEAD's files in `files`."""
+
+    def __init__(self, tmp_path: Path, monkeypatch):
+        self.files, self.modes, self.env = dict(FILES), {}, "env-1"
+        self.trees: dict[str, dict] = {}  # another commit's files, by the revision that names it
+        self.now = datetime.datetime(2026, 10, 1, 12, 0, tzinfo=datetime.timezone.utc)
+        self.repo, self.mutmut = tmp_path / "repo", FakeMutmut()
+        self.stage = self.repo / mutation.CALC_STAGE
+        self.stage.mkdir(parents=True)
+        self.tables = tables = tmp_path / "tables"
+        tables.mkdir()
+        for name, columns in (("survivors.tsv", mutation.SURVIVOR_COLUMNS),
+                              ("equivalent.tsv", mutation.EQUIVALENT_COLUMNS),
+                              ("floors.tsv", mutation.FLOOR_COLUMNS)):
+            mutation.write_table(tables / name, columns, [])
+        for name, value in (("REPO", self.repo), ("TABLES", tables), ("mutmut_in", self.mutmut)):
+            monkeypatch.setattr(mutation, name, value)
+        monkeypatch.setattr(mutation, "weekly_modules", lambda: list(MODULES))
+        monkeypatch.setattr(mutation, "calc_functions", lambda root=None: {})
+        monkeypatch.setattr(mutation, "stage_deselected", lambda: [])
+        monkeypatch.setattr(mutation, "_prepare_stage", lambda targets, where, deselect=(): self.stage)
+        monkeypatch.setattr(mutation, "head_tree",
+                            lambda repo, rev="HEAD": _tree(self.trees.get(rev, self.files), self.modes))
+        monkeypatch.setattr(mutation, "env_key", lambda stage: self.env)
+        monkeypatch.setattr(mutation, "_now", lambda: self.now)
+        monkeypatch.setattr(mutation, "_git", lambda repo, *args: "f" * 40 + "\n")
+
+    def run(self, *argv: str) -> int:
+        self.now += datetime.timedelta(minutes=1)
+        return mutation.main(list(argv) or ["weekly", "--shard", "1", "--of", "1"])
+
+    def judged(self) -> list[str] | None:
+        """The globs the last run handed mutmut, or None when it started no mutmut."""
+        return self.mutmut.calls.pop() if self.mutmut.calls else None
+
+    def receipt(self, name: str = "weekly-1.json") -> dict:
+        return json.loads((self.repo / mutation.RECEIPTS / name).read_bytes())
+
+    def verdicts(self, name: str = "weekly-1.json") -> dict[str, str]:
+        return {row["name"]: row["status"] for row in self.receipt(name)["results"]}
+
+
+@pytest.fixture
+def world(tmp_path, monkeypatch) -> World:
+    return World(tmp_path, monkeypatch)
+
+
+def _first_run(world: World) -> dict[str, str]:
+    assert world.run() == 0
+    assert world.judged() == _globs(*EVERY)
+    return world.verdicts()
+
+
+# --- the skip direction: nothing moved, nothing is judged ----------------------------------------
+
+def test_a_second_weekly_run_at_an_unchanged_tree_judges_no_mutant(world, capsys):
+    first = _first_run(world)
+
+    assert world.run() == 0
+
+    assert world.judged() is None
+    assert world.verdicts() == first
+    assert "mutation: 4 function(s) carry their stored verdicts; judging 0" in capsys.readouterr().out
+
+
+def test_a_carried_verdict_equals_what_a_cold_run_judges(world, capsys):
+    _first_run(world)
+    world.files["src/crapkit/score.py"] = SCORE.replace("value > 5", "value >= 5")
+    world.run()
+    carried = world.verdicts()
+    world.judged()
+
+    assert world.run("weekly", "--shard", "1", "--of", "1", "--cold") == 0
+
+    assert world.judged() == _globs(*EVERY)
+    assert world.verdicts() == carried
+    assert world.receipt()["cold_mismatch"] == []
+
+
+def test_a_diff_run_judges_nothing_at_a_tree_the_weekly_run_judged(world):
+    _first_run(world)
+
+    assert world.run("diff") == 0
+
+    assert world.judged() is None
+    assert world.receipt(f"diff-{'f' * 12}.json")["complete"] is True
+
+
+# --- the rerun direction: each input reruns exactly what it reaches ----------------------------------
+
+def _edit(world: World, path: str, text: str | None) -> None:
+    if text is None:
+        del world.files[path]
+    else:
+        world.files[path] = text
+
+
+@pytest.mark.parametrize("path, text, judged", [
+    ("src/crapkit/score.py", SCORE.replace("value > 5", "value >= 5"), [GRADE]),
+    ("tests/unit/test_digest.py", "def test_totals():\n    assert True\n", [TOTALS]),
+    ("tests/unit/data/rows.txt", "1\n2\n3\n", [TOTALS]),
+    ("tests/unit/data/more.txt", "4\n", [TOTALS]),
+    ("tests/unit/test_digest.py", None, [TOTALS]),
+    ("src/crapkit/helper.py", "def helper():\n    return 2\n", [GRADE, TOTALS]),
+    ("tests/conftest.py", "import os\n", [GRADE, TOTALS]),
+    ("src/crapkit/digest.py", DIGEST.replace("LIMIT = 3", "LIMIT = 4"), [GRADE, TOTALS, SIZE]),
+    ("src/crapkit/digest.py", DIGEST.replace("return self", "return None"), [GRADE, TOTALS, SIZE]),
+    ("README.md", "changed\n", []),
+    ("tests/unit/test_new.py", "def test_new():\n    pass\n", []),
+], ids=["function-body", "covering-test-module", "file-a-covering-test-reads",
+        "folder-a-covering-test-lists", "covering-test-module-removed", "unmapped-src-module",
+        "conftest", "module-code-outside-functions", "function-mutmut-keeps-no-map-for",
+        "file-no-test-reads", "new-test-module-and-every-verdict-a-kill"])
+def test_a_changed_input_reruns_exactly_the_functions_it_reaches(world, path, text, judged):
+    """The canary, score.crap, is judged with whatever is judged; a function with
+    no mutant (Shown.size) carries while its key holds, since a mutmut that made no
+    mutant of its text makes none again."""
+    _first_run(world)
+    _edit(world, path, text)
+
+    world.run()
+
+    assert world.judged() == (_globs(CRAP, *judged) if judged else None)
+
+
+def test_the_run_says_what_carried_and_why_each_other_function_is_judged(world, capsys):
+    _first_run(world)
+    capsys.readouterr()
+    world.files["src/crapkit/score.py"] = SCORE.replace("value > 5", "value >= 5")
+
+    world.run()
+
+    said = capsys.readouterr().out
+    assert "mutation: 2 function(s) carry their stored verdicts; judging 2\n" in said
+    assert ("mutation: judging 1 function(s): its text, or its module's code outside any "
+            "function, changed\n") in said
+    assert "mutation: judging 1 function(s): a cold run, or the canary\n" in said
+
+
+def test_a_function_a_covering_test_also_runs_reruns_with_it(world):
+    world.mutmut.map["crapkit.score.x_grade"].append(T_TOTALS)
+    _first_run(world)
+    world.files["src/crapkit/score.py"] = SCORE.replace("value > 5", "value >= 5")
+
+    world.run()
+
+    assert world.judged() == _globs(CRAP, GRADE, TOTALS)
+
+
+def test_a_changed_environment_reruns_everything(world, capsys):
+    _first_run(world)
+    world.env = "env-2"
+
+    world.run()
+
+    assert world.judged() == _globs(*EVERY)
+    assert "the environment changed" in capsys.readouterr().out
+
+
+def test_a_verdict_past_28_days_is_judged_again_and_one_inside_carries(world):
+    _first_run(world)
+    world.now += datetime.timedelta(days=27, hours=23)
+    world.run()
+    assert world.judged() is None
+
+    world.now += datetime.timedelta(days=1)
+    world.run()
+
+    assert world.judged() == _globs(*EVERY)
+
+
+def test_a_survivor_carries_only_to_the_tree_it_was_judged_at(world):
+    """A new or moved test may reach a survivor anywhere, so its verdict holds only
+    at its own tree; a kill stays a kill whatever test is added."""
+    world.mutmut.codes[GRADE]["crapkit.score.x_grade__mutmut_1"] = 0
+    world.run()
+    world.judged()
+    world.run()
+    assert world.judged() is None
+
+    world.files["README.md"] = "changed\n"
+    world.run()
+
+    assert world.judged() == _globs(CRAP, GRADE)
+
+
+@pytest.mark.parametrize("code", [36, -24, -11, -9], ids=["timeout", "sigxcpu", "sigsegv",
+                                                          "sigkill"])
+def test_an_unfinished_mutant_is_judged_again_by_every_run(world, code):
+    """Only the verdicts of test processes that exited carry: one a signal ended
+    is a timeout or mutmut's `segfault`, judged again by every run."""
+    world.mutmut.codes[GRADE]["crapkit.score.x_grade__mutmut_1"] = code
+    world.run()
+    world.judged()
+
+    world.run()
+
+    assert world.judged() == _globs(CRAP, GRADE)
+
+
+def test_a_test_that_starts_a_program_voids_its_functions_on_any_change(world):
+    world.mutmut.reach["tests"][T_GRADE]["spawns"] = ["python3"]
+    _first_run(world)
+    world.run()
+    assert world.judged() is None
+
+    world.files["README.md"] = "changed\n"
+    world.run()
+
+    assert world.judged() == _globs(CRAP, GRADE)
+
+
+def test_a_mode_change_alone_reruns_the_functions_of_a_test_that_starts_a_program(world):
+    """A test that runs a tracked script changes outcome on its executable bit, and
+    the tree's key held only each file's blob: a 100644 to 100755 change moved
+    nothing, and the kill carried."""
+    world.mutmut.reach["tests"][T_GRADE]["spawns"] = ["sh"]
+    world.modes["README.md"] = "100644"
+    _first_run(world)
+    world.run()
+    assert world.judged() is None
+
+    world.modes["README.md"] = "100755"
+    world.run()
+
+    assert world.judged() == _globs(CRAP, GRADE)
+
+
+def test_the_head_tree_keys_each_entry_on_its_mode_and_its_blob(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_repo(repo, {"run.sh": "echo hi\n", "README.md": "readme\n"})
+    before = mutation.head_tree(repo)
+    mutation._git(repo, "commit", "-q", "--allow-empty", "-m", "same tree")
+    assert mutation.head_tree(repo).ident == before.ident
+
+    mutation._git(repo, "update-index", "--chmod=+x", "run.sh")
+    mutation._git(repo, "commit", "-qm", "executable")
+    after = mutation.head_tree(repo)
+
+    assert mutation.moved_paths(before.blobs, after.blobs) == ["run.sh"]
+    assert after.text("run.sh") == before.text("run.sh") == "echo hi\n"
+
+
+def test_a_file_the_suite_reads_outside_any_test_voids_every_function_with_mutants(world):
+    world.mutmut.reach["outside"]["reads"] = ["README.md"]
+    _first_run(world)
+    world.run()
+    assert world.judged() is None
+
+    world.files["README.md"] = "changed\n"
+    world.run()
+
+    assert world.judged() == _globs(CRAP, GRADE, TOTALS)
+
+
+def test_a_covering_test_with_no_reach_record_stores_nothing_for_its_function(world):
+    del world.mutmut.reach["tests"][T_TOTALS]
+    _first_run(world)
+
+    world.run()
+
+    assert world.judged() == _globs(CRAP, TOTALS)
+
+
+def test_a_run_whose_reach_record_broke_stores_only_its_functions_with_no_mutant(world):
+    world.mutmut.reach = {"broken": True}
+    _first_run(world)
+
+    world.run()
+
+    assert world.judged() == _globs(CRAP, GRADE, TOTALS)
+
+
+def test_a_diff_run_judges_what_does_not_carry_where_since_named_nothing(world):
+    """since() read only the diff of calc modules, so a run after a test-only change
+    judged no mutant; the stored carry reruns the function that test covers."""
+    _first_run(world)
+    world.files["tests/unit/test_digest.py"] = "def test_totals():\n    assert 1\n"
+
+    assert world.run("diff") == 0
+
+    assert world.judged() == _globs(CRAP, TOTALS)
+    receipt = world.receipt(f"diff-{'f' * 12}.json")
+    assert sorted(map(tuple, receipt["judged"])) == sorted([CRAP, TOTALS])
+    assert sorted(map(tuple, receipt["functions"])) == sorted(EVERY)
+
+
+def test_a_diff_run_its_cap_stopped_is_incomplete_and_keeps_the_verdicts_it_has(world, capsys):
+    world.mutmut.complete = False
+
+    assert world.run("diff", "--cap-minutes", "1") == 1
+
+    assert "incomplete: the 1-minute cap stopped the run" in capsys.readouterr().out
+    world.mutmut.complete = True
+    world.run("diff")
+    assert world.judged() == _globs(CRAP, SIZE)
+
+
+def test_an_incomplete_diff_run_says_what_the_mutants_it_judged_show(world, capsys):
+    """Job 110631509678 judged 3,966 of 9,627 mutants before the cap and printed only
+    that the cap stopped it; its receipt sat in the actions cache. Whether the
+    mutants it judged hold a new survivor, and whether its stats run left a test
+    out, is what the 0.9.0 launch reads off such a run."""
+    world.mutmut.complete = False
+    world.mutmut.codes[GRADE]["crapkit.score.x_grade__mutmut_1"] = 0
+    world.mutmut.codes[TOTALS]["crapkit.digest.x_totals__mutmut_1"] = 0
+    world.mutmut.codes[TOTALS]["crapkit.digest.x_totals__mutmut_2"] = None
+    mutation.write_table(world.tables / "survivors.tsv", mutation.SURVIVOR_COLUMNS, [
+        {"module": TOTALS[0], "function": TOTALS[1], "diff_sha256": "crapkit.digest.x_totals__mutmut_1",
+         "reason": "r", "added": "d"}])
+    world.mutmut.failures = ["tests/unit/t.py::a", "tests/unit/t.py::b"]
+
+    assert world.run("diff", "--cap-minutes", "78") == 1
+
+    said = capsys.readouterr().out
+    assert said.endswith(
+        "mutation: incomplete: the 78-minute cap stopped the run\n"
+        "mutation: incomplete: it judged 4 of 5 mutant(s); 2 stats failure(s)\n"
+        "mutation: incomplete: new survivor src/crapkit/score.py grade "
+        "crapkit.score.x_grade__mutmut_1: kill it with a test, or add a survivors.tsv row with its "
+        "reason\n"
+        "mutation: incomplete: 1 new survivor(s) and 1 listed one(s) among the mutants it judged\n"
+        "mutation: incomplete: 0 new survivor(s) among the verdicts it carried\n")
+    assert world.receipt(f"diff-{'f' * 12}.json")["incomplete"] == {
+        "mutants": 5, "judged": 4, "stats_failures": 2, "listed_survivors": 1,
+        "new_survivors": [["src/crapkit/score.py", "grade", "crapkit.score.x_grade__mutmut_1"]],
+        "carried_new_survivors": []}
+
+
+def test_an_incomplete_diff_run_with_no_new_survivor_names_none(world, capsys):
+    world.mutmut.complete = False
+
+    assert world.run("diff") == 1
+
+    said = capsys.readouterr().out
+    assert "mutation: incomplete: it judged 5 of 5 mutant(s); 0 stats failure(s)\n" in said
+    assert "new survivor src" not in said
+    assert ("mutation: incomplete: 0 new survivor(s) and 0 listed one(s) among the mutants it "
+            "judged\n") in said
+    incomplete = world.receipt(f"diff-{'f' * 12}.json")["incomplete"]
+    assert (incomplete["stats_failures"], incomplete["new_survivors"]) == (0, [])
+    assert incomplete["carried_new_survivors"] == []
+    assert said.endswith("mutation: incomplete: 0 new survivor(s) among the verdicts it carried\n")
+
+
+def test_an_incomplete_diff_run_names_a_new_survivor_it_carried(world, capsys):
+    """A surviving verdict carries at the tree it was judged at. On a second capped
+    night at an unchanged main the survivor is a carried row, not a judged one, and
+    the run would fail on it with no cap, so the report names it."""
+    world.mutmut.complete = False
+    world.mutmut.codes[GRADE]["crapkit.score.x_grade__mutmut_1"] = 0
+    world.mutmut.codes[TOTALS] = dict.fromkeys(CODES[TOTALS])  # the cap came before totals
+    assert world.run("diff", "--cap-minutes", "78") == 1
+    world.judged()
+    capsys.readouterr()
+    world.mutmut.codes[TOTALS] = copy.deepcopy(CODES[TOTALS])
+
+    assert world.run("diff", "--cap-minutes", "78") == 1
+
+    said = capsys.readouterr().out
+    assert "mutation: 1 function(s) carry their stored verdicts" in said
+    assert said.endswith(
+        "mutation: incomplete: the 78-minute cap stopped the run\n"
+        "mutation: incomplete: it judged 4 of 4 mutant(s); 0 stats failure(s)\n"
+        "mutation: incomplete: 0 new survivor(s) and 0 listed one(s) among the mutants it judged\n"
+        "mutation: incomplete: carried new survivor src/crapkit/score.py grade "
+        "crapkit.score.x_grade__mutmut_1: kill it with a test, or add a survivors.tsv row with its "
+        "reason\n"
+        "mutation: incomplete: 1 new survivor(s) among the verdicts it carried\n")
+    receipt = world.receipt(f"diff-{'f' * 12}.json")
+    incomplete = receipt["incomplete"]
+    assert incomplete["carried_new_survivors"] == [
+        ["src/crapkit/score.py", "grade", "crapkit.score.x_grade__mutmut_1"]]
+    # The two lists together are the new set a run with no cap would fail on.
+    rows = [mutation.Result(**row) for row in receipt["results"]]
+    named = incomplete["new_survivors"] + incomplete["carried_new_survivors"]
+    assert sorted(map(tuple, named)) == list(mutation.gate(rows, [], [], canary=False).new)
+
+
+def test_an_incomplete_run_its_cap_stopped_inside_the_stats_pass_knows_no_failure_count(
+        world, capsys):
+    """A list an earlier stats pass left in the stage says nothing about this tree, and
+    no list at all is no proof that no test failed."""
+    world.mutmut.complete, world.mutmut.stats = False, False
+    world.mutmut.codes = {function: dict.fromkeys(names) for function, names in CODES.items()}
+    (world.stage / mutation.STATS_FAILURES).write_bytes(b"tests/unit/t.py::a\n")
+
+    assert world.run("diff") == 1
+
+    said = capsys.readouterr().out
+    assert ("mutation: incomplete: it judged 0 of 5 mutant(s); its stats pass did not finish, so "
+            "no count of its stats failures exists\n") in said
+    assert "failed with no mutant active" not in said
+    receipt = world.receipt(f"diff-{'f' * 12}.json")
+    # The receipt's own list agrees: [] would read as zero failures, and a capped run is read
+    # for exactly that count.
+    assert (receipt["stats_failures"], receipt["incomplete"]["stats_failures"]) == (None, None)
+
+
+def test_a_capped_diff_run_keeps_its_receipt_when_a_table_will_not_read(world, capsys):
+    """The report reads the survivor tables. A malformed one refuses the report, as it
+    refuses a complete run's gate, and the verdicts the run judged stay in the receipt
+    the Actions cache keeps."""
+    world.mutmut.complete = False
+    (world.tables / "survivors.tsv").write_bytes(b"module\tfunction\n")
+
+    assert world.run("diff", "--cap-minutes", "78") == 1
+
+    receipt = world.receipt(f"diff-{'f' * 12}.json")
+    assert (receipt["complete"], "incomplete" in receipt) == (False, False)
+    assert len(receipt["results"]) == 5
+    said = capsys.readouterr()
+    assert said.out.endswith("mutation: incomplete: the 78-minute cap stopped the run\n")
+    assert "survivors.tsv: the header must be" in said.err
+
+
+def test_a_cold_run_that_judges_a_carried_verdict_otherwise_voids_every_older_receipt(
+        world, capsys):
+    _first_run(world)
+    world.run("diff")
+    world.mutmut.codes[TOTALS]["crapkit.digest.x_totals__mutmut_1"] = 0
+
+    assert world.run("weekly", "--shard", "1", "--of", "1", "--cold") == 1
+
+    assert world.receipt()["cold_mismatch"] == ["crapkit.digest.x_totals__mutmut_1"]
+    assert ("crapkit.digest.x_totals__mutmut_1: a fresh judgement differs from its carried "
+            "verdict") in capsys.readouterr().out
+    receipts = mutation.loaded(world.repo / mutation.RECEIPTS)
+    assert [receipt["kind"] for receipt in mutation.trusted(receipts)] == ["weekly"]
+
+
+# --- covered: the release row reads the stored verdicts ---------------------------------------------
+#
+# `covered` asked for every weekly shard at one head and a diff receipt holding
+# each changed function's text, and never read a verdict: at c3fa1d42 the 8 weekly
+# receipts held 1,017 survivors on neither table and the row passed. It also read
+# 3 of 93 functions as gaps only because mutmut makes no mutant of them.
+
+def _covered(world: World, *more: str) -> int:
+    return mutation.main(["covered", "--receipts", str(world.repo / mutation.RECEIPTS), *more])
+
+
+def test_covered_passes_when_every_function_holds_a_verdict_that_carries(world, capsys):
+    _first_run(world)
+    capsys.readouterr()
+
+    assert _covered(world) == 0
+
+    said = capsys.readouterr().out
+    assert ("mutation: src/crapkit/digest.py:Shown.size holds no mutant mutmut makes, so it counts "
+            "as covered\n") in said
+    assert "no stored verdict" not in said
+
+
+def test_covered_names_each_function_whose_verdicts_do_not_carry_and_why(world, capsys):
+    _first_run(world)
+    world.files["src/crapkit/score.py"] = SCORE.replace("value > 5", "value >= 5")
+    world.files["tests/unit/data/rows.txt"] = "9\n"
+    capsys.readouterr()
+
+    assert _covered(world) == 1
+
+    said = capsys.readouterr().out
+    assert ("mutation: src/crapkit/score.py:grade has no stored verdict that carries to HEAD: its "
+            "text, or its module's code outside any function, changed\n") in said
+    assert ("mutation: src/crapkit/digest.py:totals has no stored verdict that carries to HEAD: "
+            "tests/unit/data/rows.txt, which a test that reaches it reads, changed\n") in said
+    assert "score.py:crap has no" not in said
+
+
+def test_covered_fails_on_a_survivor_the_tables_do_not_list(world, capsys):
+    world.mutmut.codes[GRADE]["crapkit.score.x_grade__mutmut_1"] = 0
+    world.run()
+    capsys.readouterr()
+
+    assert _covered(world) == 1
+
+    assert ("mutation: new survivor src/crapkit/score.py grade crapkit.score.x_grade__mutmut_1: kill "
+            "it with a test") in capsys.readouterr().out
+
+
+def test_covered_fails_on_a_floor_the_stored_verdicts_miss(world, capsys):
+    """The survivor is listed, so only the floor can fail the row."""
+    world.mutmut.codes[GRADE]["crapkit.score.x_grade__mutmut_1"] = 0
+    world.run()
+    mutation.write_table(world.tables / "survivors.tsv", mutation.SURVIVOR_COLUMNS, [
+        {"module": GRADE[0], "function": GRADE[1], "diff_sha256": "crapkit.score.x_grade__mutmut_1",
+         "reason": "r", "added": "d"}])
+    mutation.write_table(world.tables / "floors.tsv", mutation.FLOOR_COLUMNS, [
+        {"group": "core", "paths": "src/crapkit/score.py", "floor": "95", "source": "s"}])
+    capsys.readouterr()
+
+    assert _covered(world) == 1
+
+    assert "mutation: floor core: 66.67% (2/3), floor 95.0% BELOW" in capsys.readouterr().out
+
+
+def test_covered_takes_an_unfinished_verdict_only_at_the_tree_it_was_judged_at(world, capsys):
+    world.mutmut.codes[GRADE]["crapkit.score.x_grade__mutmut_1"] = 36
+    world.run()
+    assert _covered(world) == 0
+
+    world.files["README.md"] = "changed\n"
+    capsys.readouterr()
+
+    assert _covered(world) == 1
+    assert ("mutation: src/crapkit/score.py:grade has no stored verdict that carries to HEAD: a "
+            "surviving or unfinished mutant's verdict holds only at the tree it was judged at, and "
+            "README.md changed\n") in capsys.readouterr().out
+
+
+def test_covered_counts_no_function_a_mutant_was_never_judged_in(world, capsys):
+    world.mutmut.codes[GRADE]["crapkit.score.x_grade__mutmut_1"] = None
+    world.run()
+    capsys.readouterr()
+
+    assert _covered(world) == 1
+    assert ("mutation: src/crapkit/score.py:grade has no stored verdict that carries to HEAD: no "
+            "stored verdict names it\n") in capsys.readouterr().out
+
+
+def test_covered_reads_the_environment_of_the_newest_run(world):
+    """The row runs on the release machine, outside the image: it takes the newest
+    receipt's environment, so verdicts from an older image never mix in."""
+    _first_run(world)
+    world.env = "env-2"
+    world.files["src/crapkit/score.py"] = SCORE.replace("value > 5", "value >= 5")
+    world.mutmut.complete = False
+    world.run("diff")
+    world.mutmut.calls.clear()
+
+    assert _covered(world) == 1
+
+    world.mutmut.complete = True
+    world.run("diff")
+    assert world.judged() == _globs(CRAP, SIZE)
+    assert _covered(world) == 0
+
+
+
+def test_covered_at_the_parent_judges_a_release_commit_by_its_code(world, capsys, monkeypatch):
+    """Stage 1 bumps __version__ in src/crapkit/__init__.py and the version lines of
+    README.md on the tag commit, which no mutation run can judge: it exists only on
+    the releasing machine. Judged at that commit, the moved .py voided every function
+    with mutants. The release stage names the parent, whose tree the verdicts were
+    judged at, when the tag commit changes only the release files."""
+    world.files["src/crapkit/__init__.py"] = '__version__ = "0.8.1"\n'
+    _first_run(world)
+    world.trees["HEAD~1"] = dict(world.files)
+    world.files.update({"src/crapkit/__init__.py": '__version__ = "0.9.0"\n', "README.md": "crapkit 0.9.0\n"})
+    capsys.readouterr()
+
+    assert _covered(world) == 1
+    assert "src/crapkit/__init__.py changed, and no map says which tests reach its code" in capsys.readouterr().out
+    assert _covered(world, "--at", "HEAD~1") == 0
+    monkeypatch.setenv(mutation.AT_ENV, "HEAD~1")
+    assert _covered(world) == 0
+    capsys.readouterr()
+
+    world.trees["HEAD~1"]["src/crapkit/score.py"] = SCORE.replace("value > 5", "value >= 5")
+
+    assert _covered(world) == 1
+    assert "score.py:grade has no stored verdict" in capsys.readouterr().out
+
+
+def test_covered_with_no_stored_verdict_is_an_infra_miss_that_names_the_download(world, capsys):
+    assert _covered(world) == 3
+    assert "gh run download" in capsys.readouterr().err
+
+
+def test_env_prints_the_environment_key_a_run_here_stores(world, capsys):
+    """CI keys its receipt cache on this line, so a run restores only receipts
+    whose verdicts can carry to it."""
+    assert world.run("env") == 0
+    assert capsys.readouterr().out == "env-1\n"
+    assert world.judged() is None
+
+    world.run()
+
+    assert world.receipt()["env"] == "env-1"
+
+
+# --- the pieces ----------------------------------------------------------------------------------
+
+def test_a_function_key_holds_its_decorators_and_its_module_s_code_outside_functions():
+    facts = mutation.module_facts(DIGEST)
+    key = mutation.function_key(facts, "totals")
+
+    assert mutation.function_key(mutation.module_facts(DIGEST.replace("LIMIT = 3", "LIMIT = 4")),
+                                 "totals") != key
+    assert mutation.function_key(mutation.module_facts(DIGEST.replace("@property", "@cached")),
+                                 "Shown.size") != mutation.function_key(facts, "Shown.size")
+    assert mutation.function_key(mutation.module_facts(DIGEST + "\n"), "totals") != key
+    assert mutation.function_key(mutation.module_facts(DIGEST), "totals") == key
+
+
+def test_the_code_outside_functions_keeps_imports_constants_and_class_lines():
+    assert mutation.outside_code(DIGEST) == "LIMIT = 3\n\n\n\n\nclass Shown:\n"
+
+
+@pytest.mark.parametrize("statuses, kind", [
+    ((), "none"), (("killed", "caught by type check"), "killed"), (("killed", "survived"), "alive"),
+    (("no tests",), "alive"), (("skipped",), "alive"), (("killed", "timeout"), "unfinished"),
+    (("segfault",), "unfinished"), (("killed", "not checked"), ""), (("suspicious",), "")])
+def test_a_function_s_verdicts_are_stored_by_their_kind(statuses, kind):
+    rows = [mutation.Result(f"m.x_f__mutmut_{n}", "m.py", "f", status)
+            for n, status in enumerate(statuses)]
+
+    assert mutation.verdict_kind(rows) == kind
+
+
+@pytest.mark.parametrize("path, test", [
+    ("tests/unit/test_score.py", True), ("tests/accuracy/p/score_test.py", True),
+    ("tests/conftest.py", False), ("tests/accuracy/kit/exact.py", False),
+    ("src/crapkit/test_x.py", False), ("tests/unit/test_data.txt", False)])
+def test_a_test_module_is_one_pytest_collects_tests_from(path, test):
+    assert mutation.is_test_module(path) is test
+
+
+def test_no_receipt_older_than_a_cold_mismatch_is_trusted_and_tools_receipts_never_are():
+    receipts = [{"kind": "diff", "created": "2026-10-01T10:00:00Z"},
+                {"kind": "weekly", "created": "2026-10-01T11:00:00Z", "cold_mismatch": ["m"]},
+                {"kind": "diff", "created": "2026-10-01T12:00:00Z"},
+                {"kind": "tools", "created": "2026-10-01T13:00:00Z"}]
+
+    assert mutation.trusted(receipts) == receipts[1:3]
+
+
+# --- the environment key: the variables the suite reads --------------------------------------------
+
+READERS = {
+    "src/crapkit/timing.py": 'import os\nSTRICT = os.environ.get("CRAPKIT_STRICT_TIMING")\n',
+    "tests/accuracy/kit/tiers.py": 'GUARD_PROBES_ENV = "CRAPKIT_ACCURACY_GUARD_PROBES"\n',
+    "tests/unit/test_seed.py": 'import os\n\n\ndef test_seed():\n    os.getenv("PYTHONHASHSEED")\n',
+    "tests/unit/test_scratch.py": ('import os\n\n\ndef test_scratch():\n'
+                                   '    os.environ["TMPDIR"], os.environ["CRAPKIT_ACCURACY_SOURCE"]\n'
+                                   '    os.environ.get("CRAPKIT_ACCURACY_CHECKOUT")\n'),
+    "docs/example.py": 'import os\nos.environ.get("CRAPKIT_ONLY_IN_DOCS")\n',
+}
+READ_BY_THE_SUITE = ["CRAPKIT_STRICT_TIMING", "CRAPKIT_ACCURACY_GUARD_PROBES", "PYTHONHASHSEED"]
+# Read by Python and pytest themselves, never by a line of src/ or tests/.
+READ_BY_THE_RUNTIME = ["PYTEST_ADDOPTS", "PYTEST_PLUGINS", "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+                       "PYTHONWARNINGS", "PYTHONOPTIMIZE", "PYTHONDEVMODE", "PYTHONSAFEPATH",
+                       "PYTHONIOENCODING", "PYTHONUTF8", "LANG", "LC_ALL", "LC_CTYPE"]
+NOT_KEYED = ["CRAPKIT_NOBODY_READS", "CRAPKIT_ONLY_IN_DOCS", "CRAPKIT_ACCURACY_TIER"]
+# Scratch paths key on whether they are set, never on where they point.
+SCRATCH = ["TMPDIR", "CRAPKIT_ACCURACY_CHECKOUT"]
+
+
+@pytest.fixture
+def keyed_stage(tmp_path, monkeypatch):
+    """A stage whose src/ and tests/ read READ_BY_THE_SUITE, with every one of those
+    and NOT_KEYED unset, and the package lists held still."""
+    (tmp_path / "pyproject.toml").write_bytes(b"[tool.mutmut]\n")
+    for path, text in READERS.items():
+        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / path).write_bytes(text.encode())
+    for name in READ_BY_THE_SUITE + READ_BY_THE_RUNTIME + NOT_KEYED + SCRATCH:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(mutation, "installed", lambda: ["pytest==9"])
+    monkeypatch.setattr(mutation, "system_packages", lambda: "")
+    return tmp_path
+
+
+@pytest.mark.parametrize("name", READ_BY_THE_SUITE + READ_BY_THE_RUNTIME)
+def test_a_variable_the_suite_reads_moves_the_environment_key(keyed_stage, monkeypatch, name):
+    """A run with CRAPKIT_ACCURACY_GUARD_PROBES set, or another Hypothesis seed,
+    judges other tests than the run its verdicts carry from. So does one where
+    PYTHONWARNINGS=error or PYTEST_ADDOPTS reaches mutmut's pytest: calc_env
+    passes the whole environment through."""
+    unset = mutation.env_key(keyed_stage)
+    monkeypatch.setenv(name, "1")
+    one = mutation.env_key(keyed_stage)
+    monkeypatch.setenv(name, "2")
+
+    assert len({unset, one, mutation.env_key(keyed_stage)}) == 3
+
+
+@pytest.mark.parametrize("name", NOT_KEYED)
+def test_a_variable_no_test_reads_keeps_the_key(keyed_stage, monkeypatch, name):
+    """The tier is the push tier whatever the caller's."""
+    before = mutation.env_key(keyed_stage)
+    monkeypatch.setenv(name, str(keyed_stage / "elsewhere"))
+
+    assert mutation.env_key(keyed_stage) == before
+
+
+@pytest.mark.parametrize("name", [*SCRATCH, "CRAPKIT_ACCURACY_SOURCE"])
+def test_a_scratch_path_moving_elsewhere_keeps_the_key(keyed_stage, monkeypatch, name):
+    """Hashing where a scratch folder sits (the stage's path, the temp folder)
+    would give every machine its own key and carry nothing."""
+    monkeypatch.setenv(name, str(keyed_stage / "here"))
+    before = mutation.env_key(keyed_stage)
+    monkeypatch.setenv(name, str(keyed_stage / "elsewhere"))
+
+    assert mutation.env_key(keyed_stage) == before
+
+
+@pytest.mark.parametrize("name", SCRATCH)
+def test_a_scratch_path_set_or_unset_moves_the_key(keyed_stage, monkeypatch, name):
+    """CRAPKIT_ACCURACY_CHECKOUT, once set, sends action_path() to that checkout's
+    action.yml and code: a run with it set exercises other code than one without."""
+    unset = mutation.env_key(keyed_stage)
+    monkeypatch.setenv(name, str(keyed_stage / "here"))
+
+    assert mutation.env_key(keyed_stage) != unset
+
+
+def test_the_suite_s_variables_are_read_from_its_src_and_tests(keyed_stage):
+    names = set(mutation.suite_env_names(keyed_stage))
+
+    assert set(READ_BY_THE_SUITE + READ_BY_THE_RUNTIME + SCRATCH) <= names
+    assert not set(NOT_KEYED) & names
+
+
+def test_a_stats_map_made_at_another_tree_is_dropped_before_mutmut_runs(tmp_path):
+    """The stats run's list of failed tests goes with them: a run its cap stopped
+    inside the stats pass would otherwise print an older tree's list as its own."""
+    head = mutation.Head(_tree(FILES), "env-1", datetime.datetime.now(datetime.timezone.utc))
+    for name in (mutation.STATS_MAP, mutation.REACH_FILE, mutation.STATS_FAILURES):
+        _put(tmp_path / name, {})
+
+    mutation._stamp_stats(tmp_path, head)
+    mutation._fresh_stats(tmp_path, head)
+    assert (tmp_path / mutation.STATS_MAP).is_file() and (tmp_path / mutation.REACH_FILE).is_file()
+    assert (tmp_path / mutation.STATS_FAILURES).is_file()
+
+    mutation._fresh_stats(tmp_path, mutation.Head(_tree({**FILES, "README.md": "x\n"}), "env-1",
+                                                  head.now))
+    assert not (tmp_path / mutation.STATS_MAP).exists()
+    assert not (tmp_path / mutation.REACH_FILE).exists()
+    assert not (tmp_path / mutation.STATS_FAILURES).exists()
+
+
+# --- the launcher's reach record ----------------------------------------------------------------------
+
+def _launcher() -> dict:
+    namespace: dict = {}
+    exec(compile(mutation.LAUNCHER.split("if __name__")[0], "launcher", "exec"), namespace)
+    return namespace
+
+
+def _caller(name: str, filename: str, body: str, **names):
+    """A function whose frame looks like `name`'s code in `filename`."""
+    scope = {"__name__": name, **names}
+    exec(compile(f"def call(*args):\n    {body}\n", filename, "exec"), scope)
+    return scope["call"]
+
+
+@pytest.fixture
+def reach(tmp_path, monkeypatch):
+    launcher = _launcher()
+    (tmp_path / "mutants").mkdir()
+    monkeypatch.chdir(tmp_path / "mutants")
+    recorder = launcher["Reach"]((tmp_path / "mutants", tmp_path))
+    hook = _caller("test_score", "tests/unit/test_score.py",
+                   "recorder.audit(*args, sys._getframe())", recorder=recorder, sys=sys)
+    return types.SimpleNamespace(launcher=launcher, recorder=recorder, audit=hook, root=tmp_path)
+
+
+def _saved(reach, whole=True) -> dict:
+    reach.recorder.save(reach.root / mutation.REACH_FILE, whole)
+    return json.loads((reach.root / mutation.REACH_FILE).read_bytes())
+
+
+def test_each_read_goes_to_the_test_that_made_it_as_a_repo_path(reach):
+    reach.recorder.enter("mutants/tests/unit/test_score.py::test_crap")
+    reach.audit("open", (str(reach.root / "mutants" / "tests" / "data.txt"), "r", 0))
+    reach.audit("open", (str(reach.root / "src" / "crapkit" / "score.py"), "r", 0))
+    reach.audit("open", (str(reach.root.parent / "elsewhere.txt"), "r", 0))
+    reach.audit("open", (3, "r", 0))
+    reach.recorder.leave()
+    reach.audit("open", ("README.md", "r", 0))
+
+    saved = _saved(reach)
+
+    assert saved["outside"] == {"reads": ["README.md"], "dirs": [], "spawns": []}
+    assert saved["tests"] == {"tests/unit/test_score.py::test_crap": {
+        "reads": ["src/crapkit/score.py", "tests/data.txt"], "dirs": [], "spawns": []}}
+
+
+def test_a_test_that_reads_nothing_is_still_recorded(reach):
+    """A covering test with no record stores nothing for its function; one that read
+    nothing must say so."""
+    reach.recorder.enter("tests/unit/test_score.py::test_grade")
+    reach.recorder.leave()
+
+    assert _saved(reach)["tests"] == {"tests/unit/test_score.py::test_grade": NOTHING}
+
+
+def test_a_test_s_record_holds_every_file_and_folder_its_process_read_before_it_ended(reach):
+    """A read served from a cache in process memory (lru_cache, a module global, a
+    module imported once) raises no event, so it went on record only for the first
+    test that made it. Each test's record takes every read and listing its process
+    made up to its own end, and a cache can only hold what was read by then."""
+    reach.audit("open", ("README.md", "r", 0))
+    reach.recorder.enter(T_TOTALS)
+    reach.audit("open", ("tests/unit/data/rows.txt", "r", 0))
+    reach.audit("os.listdir", ("tests/unit/data",))
+    reach.audit("subprocess.Popen", (None, ["node"], None, None))
+    reach.recorder.leave()
+    reach.recorder.enter(T_GRADE)
+    reach.recorder.leave()
+    reach.audit("open", ("docs/late.md", "r", 0))
+
+    saved = _saved(reach)
+
+    assert saved["tests"][T_GRADE] == {"reads": ["README.md", "tests/unit/data/rows.txt"],
+                                       "dirs": ["tests/unit/data"], "spawns": []}
+    assert saved["tests"][T_TOTALS]["reads"] == ["README.md", "tests/unit/data/rows.txt"]
+    assert saved["outside"]["reads"] == ["README.md", "docs/late.md"]
+
+
+SHARED_LAUNCHER = _launcher()
+
+
+def test_a_function_whose_test_reads_a_file_through_a_cache_reruns_when_the_file_changes(
+        world, tmp_path, monkeypatch):
+    """Two tests share an lru_cache reader of rows.txt, and only the second covers
+    grade: an edit to rows.txt reruns grade, an edit to a file no test read reruns
+    nothing. The reads come from the launcher's real audit hook."""
+    data = tmp_path / "mutants" / "tests" / "unit" / "data" / "rows.txt"
+    data.parent.mkdir(parents=True)
+    data.write_bytes(b"1\n2\n")
+    monkeypatch.chdir(tmp_path / "mutants")
+    rows = functools.lru_cache(maxsize=None)(lambda: data.read_text())
+    recorder = SHARED_LAUNCHER["Reach"]((tmp_path / "mutants", tmp_path))
+    SHARED_LAUNCHER["listen"](recorder)
+    try:
+        for node in (T_TOTALS, T_GRADE, T_CRAP):
+            recorder.enter(node)
+            rows()
+            recorder.leave()
+    finally:
+        SHARED_LAUNCHER["listen"](None)
+    recorder.save(tmp_path / mutation.REACH_FILE, True)
+    world.mutmut.reach = json.loads((tmp_path / mutation.REACH_FILE).read_bytes())
+    _first_run(world)
+
+    world.files["README.md"] = "changed\n"
+    world.run()
+    assert world.judged() is None
+
+    world.files["tests/unit/data/rows.txt"] = "1\n2\n3\n"
+    world.run()
+    assert world.judged() == _globs(CRAP, GRADE, TOTALS)
+
+
+def test_pytest_s_and_mutmut_s_own_reads_are_not_a_test_s(reach):
+    reach.recorder.enter("tests/unit/test_score.py::test_crap")
+    for module in ("_pytest.assertion.rewrite", "pluggy._callers", "mutmut.__main__"):
+        _caller(module, f"{module}.py", "recorder.audit(*args, sys._getframe())",
+                recorder=reach.recorder, sys=sys)("open", ("tests/unit/test_score.py", "rb", 0))
+
+    assert _saved(reach)["tests"]["tests/unit/test_score.py::test_crap"] == NOTHING
+
+
+def test_an_import_counts_only_when_it_loads_a_test_module(reach):
+    """The carry rule keys every other .py file itself; a test module one test
+    imports from another is that test's to reach."""
+    get_data = _caller("importlib._bootstrap_external", "<frozen importlib._bootstrap_external>",
+                       "recorder.audit(*args, sys._getframe())", recorder=reach.recorder, sys=sys)
+    importer = _caller("test_score", "tests/unit/test_score.py", "get_data(*args)",
+                       get_data=get_data)
+    reach.recorder.enter("tests/unit/test_score.py::test_crap")
+    importer("open", ("src/crapkit/score.py", "rb", 0))
+    importer("open", ("tests/unit/test_helpers.py", "rb", 0))
+    importer("open", ("tests/unit/helpers.py", "rb", 0))
+
+    assert _saved(reach)["tests"]["tests/unit/test_score.py::test_crap"]["reads"] == [
+        "tests/unit/test_helpers.py"]
+
+
+def test_a_listing_and_a_started_program_go_to_the_running_test(reach):
+    reach.recorder.enter("tests/unit/test_score.py::test_crap")
+    reach.audit("os.listdir", (None,))
+    reach.audit("os.scandir", ("tests/unit",))
+    reach.audit("subprocess.Popen", (None, ["git", "status"], str(reach.root.parent), None))
+    reach.audit("subprocess.Popen", (None, "git log", None, None))
+    reach.audit("subprocess.Popen", ("/usr/bin/python3.12", ["python"], None, None))
+    reach.audit("os.system", ("sh -c true",))
+    reach.audit("os.posix_spawn", ("/bin/NODE.EXE", ["node"], {}))
+
+    assert _saved(reach)["tests"]["tests/unit/test_score.py::test_crap"] == {
+        "reads": [], "dirs": ["", "tests/unit"], "spawns": ["git", "node", "python3.12", "sh"]}
+
+
+def test_a_fixture_wider_than_one_test_reads_for_every_test(reach):
+    plugin = reach.launcher["reach_plugin"](reach.recorder)
+    plugin.pytest_runtest_logstart("tests/unit/test_score.py::test_crap", None)
+    wide = plugin.pytest_fixture_setup(types.SimpleNamespace(scope="session"), None)
+    next(wide)
+    reach.audit("open", ("README.md", "r", 0))
+    with pytest.raises(StopIteration):
+        wide.send("value")
+    narrow = plugin.pytest_fixture_setup(types.SimpleNamespace(scope="function"), None)
+    next(narrow)
+    reach.audit("open", ("tests/unit/data/rows.txt", "r", 0))
+    with pytest.raises(StopIteration):
+        narrow.send("value")
+    plugin.pytest_runtest_logfinish("tests/unit/test_score.py::test_crap", None)
+
+    saved = _saved(reach)
+
+    assert saved["outside"]["reads"] == ["README.md"]
+    assert saved["tests"]["tests/unit/test_score.py::test_crap"]["reads"] == [
+        "README.md", "tests/unit/data/rows.txt"]
+
+
+def test_an_event_it_cannot_read_breaks_the_record_and_never_the_test(reach):
+    reach.audit("subprocess.Popen", (None, [], None, None))
+
+    assert _saved(reach) == {"broken": True}
+    assert mutation.load_reach(reach.root) is None
+
+
+def test_a_run_of_new_tests_adds_to_the_record_and_a_full_run_replaces_it(reach):
+    path = reach.root / mutation.REACH_FILE
+    _put(path, {"outside": {"reads": ["old.txt"], "dirs": [], "spawns": []},
+                "tests": {"tests/unit/test_old.py::t": NOTHING}})
+    reach.recorder.enter("tests/unit/test_score.py::test_crap")
+    reach.recorder.leave()
+
+    merged = _saved(reach, whole=False)
+    assert sorted(merged["tests"]) == ["tests/unit/test_old.py::t",
+                                       "tests/unit/test_score.py::test_crap"]
+    assert merged["outside"]["reads"] == ["old.txt"]
+    assert sorted(_saved(reach, whole=True)["tests"]) == ["tests/unit/test_score.py::test_crap"]
+
+
+def test_the_stats_run_records_reach_for_each_test_it_runs(tmp_path):
+    """run_stats hands pytest the reach plugin before the failures plugin, listens
+    for audit events only while the stats run lasts, and writes the record."""
+    launcher, heard = _launcher(), []
+    launcher.update(_run_stats=lambda self, *, tests: self.execute_pytest(["-x"], plugins=["stats"]),
+                    _state=lambda: types.SimpleNamespace(tests_by_mangled_function_name={}),
+                    FAILURES=tmp_path / "failures.txt", REACH=tmp_path / mutation.REACH_FILE,
+                    MUTANTS=tmp_path / "mutants", STAGE=tmp_path, listen=heard.append)
+    handed = []
+
+    class Runner:
+        def execute_pytest(self, params, plugins=(), **kwargs):
+            handed.append(plugins)
+            plugins[1].pytest_runtest_logstart("tests/unit/test_score.py::test_crap", None)
+            plugins[1].pytest_runtest_logfinish("tests/unit/test_score.py::test_crap", None)
+            return 0
+
+    assert launcher["run_stats"](Runner(), tests=[]) == 0
+
+    ((stats, plugin, failures),) = handed
+    assert (stats, type(failures).__name__) == ("stats", "Failures")
+    assert [type(item).__name__ for item in heard] == ["Reach", "NoneType"]
+    assert mutation.load_reach(tmp_path)["tests"] == {"tests/unit/test_score.py::test_crap": NOTHING}
+
+
+# --- mutmut itself, in the accuracy image -------------------------------------------------------------
+
+# A package of its own name, so no installed crapkit answers the tests' imports.
+REAL = {name: ("src/carrykit/" + name.partition(":")[0], name.partition(":")[2])
+        for name in ("score.py:crap", "score.py:grade", "digest.py:totals")}
+REAL_SCORE = ("def crap(ccn, cov):\n    return ccn * ccn * (1 - cov) ** 3 + ccn\n\n\n"
+              "def grade(value):\n    return 'high' if value > 5 else 'low'\n")
+REAL_DIGEST = ("from pathlib import Path\n\n\ndef totals(path):\n"
+               "    return sum(int(line) for line in Path(path).read_text().split())\n")
+REAL_TESTS = {
+    "tests/unit/test_score.py": (
+        "from carrykit.score import crap, grade\n\n\n"
+        "def test_crap():\n    assert crap(2, 0.0) == 6\n    assert crap(3, 0.5) == 4.125\n"
+        "    assert crap(1, 1.0) == 1\n\n\n"
+        "def test_grade():\n    assert grade(6) == 'high'\n    assert grade(5) == 'low'\n"),
+    "tests/unit/test_digest.py": (
+        "from pathlib import Path\n\nfrom carrykit.digest import totals\n\n\n"
+        "def test_totals():\n"
+        "    assert totals(Path(__file__).parent / 'data' / 'rows.txt') == 6\n"),
+    "tests/unit/data/rows.txt": "1\n2\n3\n",
+}
+
+
+def _git_repo(root: Path, files: dict[str, str]) -> None:
+    for args in (["init", "-q"], ["config", "user.name", "t"], ["config", "user.email", "t@t"],
+                 ["config", "commit.gpgsign", "false"]):
+        mutation._git(root, *args)
+    _commit(root, files)
+
+
+def _commit(root: Path, files: dict[str, str]) -> None:
+    for path, text in files.items():
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_bytes(text.encode())
+    mutation._git(root, "add", "-A")
+    mutation._git(root, "commit", "-qm", "c")
+
+
+@pytest.mark.nightly
+@pytest.mark.process
+@pytest.mark.platform("linux")
+def test_a_real_mutmut_run_carries_what_holds_and_judges_what_moved(tmp_path, monkeypatch, oracle):
+    """mutmut 3.8.0 and the launcher end to end on a small repo: the first weekly
+    run judges every mutant, a second judges none and stores the same verdicts, an
+    edit to the data file a test reads judges the functions of that test and of
+    every test its process ran after it, and a cold run at that tree judges what
+    the carry kept."""
+    oracle("mutmut")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_repo(repo, {"src/carrykit/__init__.py": "", "src/carrykit/score.py": REAL_SCORE,
+                     "src/carrykit/digest.py": REAL_DIGEST, "pyproject.toml": "[project]\nname = 'x'\n",
+                     ".gitignore": ".crapkit/\n", **REAL_TESTS})
+    tables = tmp_path / "tables"
+    tables.mkdir()
+    for name, columns in (("survivors.tsv", mutation.SURVIVOR_COLUMNS),
+                          ("equivalent.tsv", mutation.EQUIVALENT_COLUMNS),
+                          ("floors.tsv", mutation.FLOOR_COLUMNS)):
+        mutation.write_table(tables / name, columns, [])
+    for name, value in (("REPO", repo), ("TABLES", tables), ("CALC_TESTS", ("tests/unit",)),
+                        ("CANARY", REAL["score.py:crap"])):
+        monkeypatch.setattr(mutation, name, value)
+    monkeypatch.setattr(mutation, "weekly_modules", lambda: ["src/carrykit/digest.py",
+                                                             "src/carrykit/score.py"])
+    monkeypatch.setattr(mutation, "calc_functions", lambda root=None: {})
+    monkeypatch.setattr(mutation, "stage_deselected", lambda: [])
+    runs, real = [], mutation.mutmut_in
+    monkeypatch.setattr(mutation, "mutmut_in", lambda stage, globs, *rest: runs.append(
+        sorted(globs)) or real(stage, globs, *rest))
+    weekly = ["weekly", "--shard", "1", "--of", "1", "--max-children", "2"]
+    receipt = repo / mutation.RECEIPTS / "weekly-1.json"
+
+    def verdicts() -> dict:
+        return {row["name"]: row["status"] for row in json.loads(receipt.read_bytes())["results"]}
+
+    assert mutation.main(weekly) in (0, 1)
+    first = verdicts()
+    assert runs == [_globs(*REAL.values())]
+    assert first and set(first.values()) <= mutation.KILLED | mutation.ALIVE
+    (frame,) = json.loads(receipt.read_bytes())["carry"]["frames"].values()
+    assert frame["modules"]["src/carrykit/score.py"]["placed"] == ["crap", "grade"]
+    stored = json.loads(receipt.read_bytes())["carry"]["functions"]
+    assert stored["src/carrykit/digest.py:totals"]["reads"] == [
+        "tests/unit/data/rows.txt", "tests/unit/test_digest.py"]
+
+    assert mutation.main(weekly) in (0, 1)
+    assert len(runs) == 1 and verdicts() == first
+
+    _commit(repo, {".gitignore": ".crapkit/\n# no test reads this file\n"})
+    assert mutation.main(weekly) in (0, 1)
+    assert len(runs) == 1 and verdicts() == first
+
+    # test_score.py's tests run after test_digest.py read rows.txt in the same
+    # process, so a cache could serve them that read: grade reruns too.
+    _commit(repo, {"tests/unit/data/rows.txt": "1\n2\n3\n\n"})
+    assert mutation.main(weekly) in (0, 1)
+    assert runs[-1] == _globs(*REAL.values())
+    carried = verdicts()
+
+    assert mutation.main([*weekly, "--cold"]) in (0, 1)
+    assert verdicts() == carried
+    assert json.loads(receipt.read_bytes())["cold_mismatch"] == []

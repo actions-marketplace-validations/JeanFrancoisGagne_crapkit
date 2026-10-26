@@ -24,9 +24,13 @@ _SCHEMA = {'$schema': 'http://json-schema.org/draft-07/schema#',
                                                                      'coverage (default 6)'},
                                            'churn_window_months': {'type': 'integer',
                                                                    'minimum': 1,
-                                                                   'description': 'git log window for '
-                                                                                  'churn weighting '
-                                                                                  '(default 12)'},
+                                                                   'description': 'months of git '
+                                                                                  'history churn '
+                                                                                  'weighting reads, '
+                                                                                  'counted back from '
+                                                                                  'the commit date '
+                                                                                  'of HEAD (default '
+                                                                                  '12)'},
                                            'worklist_floor': {'type': 'integer',
                                                               'minimum': 1,
                                                               'description': 'minimum ccn for worklist '
@@ -56,7 +60,8 @@ _SCHEMA = {'$schema': 'http://json-schema.org/draft-07/schema#',
                                            'mutation_command': {'type': 'string',
                                                                 'description': 'suite run once per '
                                                                                'mutant; nonzero exit = '
-                                                                               'killed'},
+                                                                               'killed, exit 5 = no '
+                                                                               'verdict'},
                                            'mutation_timeout_seconds': {'type': 'integer',
                                                                         'minimum': 1,
                                                                         'description': 'per-mutant '
@@ -217,10 +222,12 @@ _SCHEMA = {'$schema': 'http://json-schema.org/draft-07/schema#',
                                                               'description': 'reruns after a timeout or '
                                                                              'missing artifact'},
                                                   'retest_command': {'type': 'string',
-                                                                     'description': '{tests} template '
-                                                                                    'rerunning just the '
-                                                                                    'newly-failed ids '
-                                                                                    'before exit 8'}}}},
+                                                                     'description': 'rerun template for '
+                                                                                    'newly failed tests '
+                                                                                    'before exit 8: '
+                                                                                    '{tests} (ids), '
+                                                                                    '{files} (vitest), '
+                                                                                    '{names} (pytest -k)'}}}},
                 'exclude': {'type': 'object',
                             'additionalProperties': False,
                             'properties': {'globs': {'type': 'array', 'items': {'type': 'string'}},

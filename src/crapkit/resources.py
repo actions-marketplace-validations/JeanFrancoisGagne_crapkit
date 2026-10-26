@@ -14,6 +14,9 @@ import socket
 
 from .errors import ToolError
 from .locks import exclusive_lock
+from .repopath import typed_path
+from .repotext import os_bytes
+from .userhome import user_home
 
 
 WORKER_MEMORY_MB = 35
@@ -70,9 +73,9 @@ def _positive_environment(name: str) -> int | None:
 def _budget_directory() -> Path:
     override = os.environ.get("CRAPKIT_RESOURCE_DIR")
     if override:
-        return Path(override).resolve()
-    host = hashlib.sha256(socket.gethostname().encode()).hexdigest()[:16]
-    return Path.home() / ".cache" / "crapkit" / "workers" / host
+        return typed_path(override).resolve()
+    host = hashlib.sha256(os_bytes(socket.gethostname())).hexdigest()[:16]
+    return user_home() / ".cache" / "crapkit" / "workers" / host
 
 
 def _worker_limit(requested: int, shared: int, memory: int | None, inherited: int | None) -> int:

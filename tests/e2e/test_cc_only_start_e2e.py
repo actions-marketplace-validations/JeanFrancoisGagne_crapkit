@@ -162,7 +162,8 @@ def test_the_readme_start_matches_the_commands_this_test_runs():
     the sequence must change this list, not silently narrow what runs below."""
     assert start_commands() == [["crapkit", "init"], ["crapkit", "doctor"],
                                 ["crapkit", "coverage"],
-                                ["crapkit", "worklist"], ["crapkit", "ratchet", "seed"]]
+                                ["crapkit", "worklist"], ["crapkit", "ratchet", "seed"],
+                                ["crapkit", "verify"]]
 
 
 def test_the_printed_start_runs_clean_on_a_go_only_repo(go_repo: Path):
@@ -201,7 +202,7 @@ def test_the_init_summary_does_not_send_a_go_repo_looking_for_a_lane(go_repo: Pa
 
 
 def test_doctor_does_not_call_the_missing_lane_a_gap(go_repo: Path):
-    """`no [[lane]] declared — inventory works; coverage needs one` is true of a
+    """`no [[lane]] declared - inventory works; coverage needs one` is true of a
     Python repo nobody wired and false here, where coverage needs none."""
     run_cli(go_repo, "init")
 
@@ -302,7 +303,7 @@ def _swap_lane_command(repo: Path) -> None:
     a declared-but-missing results file refuses the lane."""
     path = repo / "crapkit.toml"
     text = path.read_text(encoding="utf-8")
-    swapped = re.sub(r'^command = "(?:python3?|py) -m pytest .*"$', 'command = "python make_cov.py"',
+    swapped = re.sub(r'^command = "(?:\{python\}|python3?|py) -m pytest .*"$', 'command = "python make_cov.py"',
                      text, count=1, flags=re.M)
     assert swapped != text, "init stopped writing a pytest lane for a pyproject repo"
     swapped = re.sub(r'^results_artifact = .*\n', "", swapped, count=1, flags=re.M)

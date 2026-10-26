@@ -5,12 +5,14 @@ that exposes the read-side tools)."""
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
 from ..churn_log import log_lines
 from ..errors import ConfigError, CrapkitError
 from ..gitio import ls_files
+from ..gitpaths import shown
 from ..invocation import _self
 from ._shared import (_command_root, _file_sizer, _load_repo_config, _load_sources, _open_store,
                       _stand,
@@ -72,14 +74,15 @@ def _mutation_targets(root: Path, files: list | None, cwd: Path | None = None) -
     """path -> changed line set (None = whole file). Default is diff-scoped:
     only the working tree's changes vs HEAD grow mutants; `--files` are said
     from `cwd`, where the user stands."""
-    from ..diffparse import changed_ranges
+    from ..diffparse import worktree_ranges
     from ..gitio import diff_since
 
     if files:
         return {_repo_relative(f, root, cwd): None for f in files}
-    targets = {p: _range_lines(rs) for p, rs in changed_ranges(diff_since(root, "HEAD")).items()}
+    ranges = worktree_ranges(diff_since(root, "HEAD"), root)
+    targets = {p: _range_lines(rs) for p, rs in ranges.items()}
     if not targets:
-        raise CrapkitError("no changes vs HEAD to mutate — name files with --files")
+        raise CrapkitError("no changes vs HEAD to mutate - name files with --files")
     return targets
 
 
@@ -94,7 +97,8 @@ def _corpus_targets(root: Path, cfg, targets: dict) -> tuple[dict, list[str]]:
     """
     from ..mutate import OUTSIDE_CORPUS, partition_by_corpus
 
-    kept, outside = partition_by_corpus(targets, cfg, size_of=_file_sizer(root))
+    kept, unscored = partition_by_corpus(targets, cfg, size_of=_file_sizer(root))
+    outside = [shown(rel) for rel in unscored]  # a name that is not UTF-8 shows its bytes as \xNN
     for rel in outside:
         print(f"crapkit: not mutating {rel}: {OUTSIDE_CORPUS}", file=sys.stderr)
     return kept, outside
@@ -107,6 +111,7 @@ def _file_mutants(root: Path, rel: str, lines) -> list:
     dropping it silently would leave a score built on fewer files than it says.
     """
     from ..mutate import file_mutants, mutation_language, refusal
+    from ..repotext import source_text
 
     path = root / rel
     if not path.is_file():
@@ -116,7 +121,8 @@ def _file_mutants(root: Path, rel: str, lines) -> list:
     if reason:
         print(f"crapkit: not mutating {rel}: {reason}", file=sys.stderr)
         return []
-    text = path.read_text(encoding="utf-8", errors="replace")
+    # The text run_one applies the mutant to, lines ended the way read_text ends them.
+    text = source_text(path.read_bytes()).replace("\r\n", "\n").replace("\r", "\n")
     return [m._replace(path=rel) for m in file_mutants(text, lines, language)]
 
 
@@ -131,36 +137,77 @@ def _collect_mutants(root: Path, targets: dict, max_mutants: int) -> list:
     return out
 
 
-def _mutation_payload(survivors: list, total: int, outside: list[str]) -> dict:
-    return {"mutants": total, "killed": total - len(survivors), "survived": len(survivors),
-            "survivors": [m._asdict() for m in survivors], "outside_corpus": outside}
+def _mutation_counts(verdicts: list) -> dict:
+    """`killed` keeps its meaning, every mutant that did not survive, so killed +
+    survived is still mutants. `timed_out` and `no_verdict` are counts inside it:
+    kills no failing test decided. A no-verdict mutant leaves the score only
+    with JSON schema 2, which changes the meaning of `killed`."""
+    from collections import Counter
+
+    from ..mutate_pool import MutantVerdict as V
+
+    count = Counter(verdicts)
+    return {"killed": len(verdicts) - count[V.SURVIVED], "survived": count[V.SURVIVED],
+            "timed_out": count[V.TIMED_OUT], "no_verdict": count[V.NO_VERDICT]}
 
 
-def _print_mutation_text(survivors: list, total: int) -> None:
-    killed = total - len(survivors)
-    rate = f"{killed / total:.0%}" if total else "n/a"
-    print(f"mutation: {killed}/{total} killed ({rate})")
-    for m in survivors:
+def _survivors(mutants: list, verdicts: list) -> list:
+    from ..mutate_pool import MutantVerdict
+
+    return [m for m, verdict in zip(mutants, verdicts) if verdict is MutantVerdict.SURVIVED]
+
+
+def _mutation_payload(mutants: list, verdicts: list, outside: list[str]) -> dict:
+    return {"mutants": len(mutants), **_mutation_counts(verdicts),
+            "survivors": [m._asdict() for m in _survivors(mutants, verdicts)],
+            "outside_corpus": outside}
+
+
+def _unjudged_lines(counts: dict) -> list[str]:
+    """The kills the rate cannot show as plain ones: timeouts and no-verdict
+    mutants, both counted inside `killed`, each with where to look."""
+    lines = []
+    if counts["timed_out"]:
+        lines.append(f"  {counts['timed_out']} of the {counts['killed']} killed timed out past "
+                     "mutation_timeout_seconds; a timeout counts as killed")
+    if counts["no_verdict"]:
+        lines.append(f"  no verdict: {counts['no_verdict']} of the {counts['killed']} killed ran "
+                     "no test (exit 5), so no test caught them; check that mutation_command "
+                     "collects a test for them")
+    return lines
+
+
+def _print_mutation_text(mutants: list, verdicts: list) -> None:
+    counts = _mutation_counts(verdicts)
+    judged = counts["killed"] + counts["survived"]
+    rate = f"{counts['killed'] / judged:.0%}" if judged else "n/a"
+    print(f"mutation: {counts['killed']}/{judged} killed ({rate})")
+    for line in _unjudged_lines(counts):
+        print(line)
+    for m in _survivors(mutants, verdicts):
         print(f"  SURVIVED  {m.path}:{m.line}  [{m.op}]  {m.mutated.strip()}")
 
 
-def _print_mutation(as_json: bool, survivors: list, total: int, outside: list[str]) -> None:
+def _print_mutation(as_json: bool, mutants: list, verdicts: list, outside: list[str]) -> None:
     """A zero-mutant run whose files the corpus cut dropped says so on stdout:
     `0/0 killed` over a diff that held a test file read as a suite with nothing
     to prove, when it was a diff with nothing crapkit would mutate."""
     from ..mutate import OUTSIDE_CORPUS
 
     if as_json:
-        _print_json(_mutation_payload(survivors, total, outside))
-    elif outside and not total:
+        _print_json(_mutation_payload(mutants, verdicts, outside))
+    elif outside and not mutants:
         print(f"mutation: nothing to mutate; {OUTSIDE_CORPUS}: {', '.join(outside)}")
     else:
-        _print_mutation_text(survivors, total)
+        _print_mutation_text(mutants, verdicts)
 
 
 def cmd_mcp(args: argparse.Namespace) -> int:
     """Serve stdio from `--repo`, an exact root, or from the nearest crapkit.toml
-    at or above the directory the client started in (ADR 0002).
+    at or above the directory the client started in (ADR 0002). A client that
+    started the server in its plugin's install directory gets no walk from
+    there, and a server whose start serves nothing asks a roots-capable client
+    for its workspace folders.
 
     A client registered globally opens the server in every project, most of
     which have no crapkit.toml. Refusing to start there gave the client a server
@@ -168,12 +215,36 @@ def cmd_mcp(args: argparse.Namespace) -> int:
     A config that EXISTS and is broken still fails fast, before any client
     connects, because every tool would fail the same way anyway.
     """
-    from ..mcp_server import serve
+    from ..mcp_server import serve, started_in_plugin
 
-    root = _command_root(args.repo)
-    if (root / "crapkit.toml").is_file():
+    repo = _expanded_repo(args.repo)
+    plugin = repo is None and started_in_plugin(Path.cwd().resolve())
+    root = Path.cwd().resolve() if plugin else _command_root(repo)
+    if not plugin and (root / "crapkit.toml").is_file():
         _load_repo_config(root)
-    return serve(root)
+    return serve(root, plugin=plugin, exact=repo is not None)
+
+
+# `${workspaceFolder}`, `${userHome}`, `${env:NAME}`: the variables MCP client
+# configs are written with. The client expands them before it starts a server.
+_CLIENT_VARIABLE = re.compile(r"\$\{[^}]*\}")
+
+
+def _expanded_repo(repo: str | None) -> str | None:
+    """`--repo` when the client expanded it, else None: serve as if none was given.
+
+    Cursor's docs wire a server with `--repo ${workspaceFolder}`, and the Cursor
+    agent CLI passes that variable through unexpanded. Read as a path it named
+    `<cwd>/${workspaceFolder}`, and every tool answered `no crapkit.toml` there
+    while the client listed the server as ready. stderr is the server's log in
+    every client, so the fallback is said there."""
+    if repo is None or not _CLIENT_VARIABLE.search(repo):
+        return repo
+    print(f"crapkit mcp: --repo {repo!r} holds a variable the MCP client did not expand; "
+          f"serving the crapkit.toml at or above the directory the client started this server "
+          f"in ({Path.cwd()}) instead. Give --repo an absolute path, or drop it from the "
+          f"client's config.", file=sys.stderr)
+    return None
 
 
 def _drop_mutate_pool(root: Path) -> int:
@@ -198,13 +269,12 @@ def cmd_mutate(args: argparse.Namespace) -> int:
         return _drop_mutate_pool(root)
     cfg = _load_repo_config(root)
     if not cfg.mutation_command:
-        raise ConfigError("mutate needs [crapkit] mutation_command — the suite run once per mutant")
+        raise ConfigError("mutate needs [crapkit] mutation_command - the suite run once per mutant")
     targets, outside = _corpus_targets(root, cfg,
                                        _mutation_targets(root, args.files, cwd=_stand(args.repo)))
     mutants = _collect_mutants(root, targets, args.max_mutants)
     verdicts = run_mutants(root, cfg, mutants, reporter(len(mutants), sys.stderr))
-    survivors = [m for m, killed in zip(mutants, verdicts) if not killed]
-    _print_mutation(args.json, survivors, len(mutants), outside)
+    _print_mutation(args.json, mutants, verdicts, outside)
     return 0
 
 
@@ -232,7 +302,7 @@ def cmd_duplication(args: argparse.Namespace) -> int:
     runs = rowful_runs(store)
     if not runs:
         # the store opened, so what is missing is a run that scored anything
-        raise CrapkitError(f"no run with rows in {root} — run `{_self()} inventory` first")
+        raise CrapkitError(f"no run with rows in {root} - run `{_self()} inventory` first")
     rows = store.read_rows(runs[-1]["id"])
 
     # A loader, never a bound dict: whoever names those texts pins every byte of

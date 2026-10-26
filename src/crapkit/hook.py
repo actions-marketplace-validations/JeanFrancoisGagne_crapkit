@@ -17,18 +17,21 @@ commit`, so it holds three rules the batch commands do not:
 """
 from __future__ import annotations
 
+import sys
 import tempfile
 from itertools import chain
 from pathlib import Path
 from typing import NamedTuple
 
-from .analyze import analyze_jobs, analyze_source, decode_source
+from .analyze import analyze_jobs, analyze_sources, decode_source, unread_reasons
 from .config import Config
-from .diffparse import changed_ranges
+from .diffparse import changed_ranges, reader_ranges
 from .gitio import GitReads
+from .gitpaths import readable
+from .invariants import check_violations
 from .keys import key_names, key_of
 from .merge import FunctionRecord
-from .universe import _source_extensions, assign_files, exclude_matcher, excluded
+from .universe import _source_extensions, exclude_matcher, excluded, scan_files
 
 # A commit's worth of files, not an inventory's, and never more workers than a
 # commit can keep busy: each worker re-imports lizard, which is the whole cost of
@@ -49,6 +52,11 @@ class Violation(NamedTuple):
     # the ordinal counts every function of that name in the file, and a gate
     # handed only the breaching ones would number the second twin as the first.
     key_name: str = ""
+    # The ceiling the function was judged against: its scope's, which a scope
+    # `target` can set below the repo's. The refusal printed the repo target, so
+    # a ccn-6 breach of a target-5 scope read "exceed the complexity ceiling of
+    # 6". None only on a Violation built by hand with no scope behind it.
+    ceiling: int | None = None
 
 
 class StagedGate(NamedTuple):
@@ -56,6 +64,9 @@ class StagedGate(NamedTuple):
     violations: list[Violation]
     unscoped: list[str] = []  # staged source files no scope claims: ungated, but never silently
     records: tuple = ()  # full staged identities, including siblings below the ceiling
+    unread: dict = {}  # staged path -> why no reader could read it: judged nothing, so refused
+    unreadable: tuple[str, ...] = ()  # staged names that are not UTF-8 and no scope takes
+    whole: bool = False  # nothing was staged, so every tracked file was judged whole
 
 
 def _touches(record: FunctionRecord, ranges: list[tuple[int, int]]) -> bool:
@@ -95,8 +106,7 @@ def staged_records(blobs: dict[str, bytes], *, worker_budget: int = 0) -> dict[s
     materializes, because a worker process reads its own files.
     """
     if commit_sized(blobs):
-        return {rel: analyze_source(rel, decode_source(blob))
-                for rel, blob in sorted(blobs.items())}
+        return analyze_sources({rel: decode_source(blob) for rel, blob in sorted(blobs.items())})
     with tempfile.TemporaryDirectory() as tmp:
         jobs = _materialized(Path(tmp), blobs)
         return analyze_jobs(jobs, workers=min(len(jobs), _HOOK_MAX_WORKERS),
@@ -119,7 +129,7 @@ def _file_violations(rel: str, records: list, ranges, ceiling: int) -> list[Viol
     subset alone cannot say which twin a record is.
     """
     keys = key_names(records)
-    return [Violation(rel, rec.long_name, rec.start, rec.ccn, key_of(keys, rec)[1])
+    return [Violation(rel, rec.long_name, rec.start, rec.ccn, key_of(keys, rec)[1], ceiling)
             for rec in records if rec.ccn > ceiling and _touches(rec, ranges)]
 
 
@@ -130,14 +140,16 @@ def _touched_over_ceiling(records_by_path, ranges_by_path, checked_files, cfg, i
         violations.extend(_file_violations(rel, records_by_path[rel], ranges_by_path[rel],
                                            by_file[rel]))
     violations.sort(key=lambda v: (-v.ccn, v.path, v.start))
+    check_violations(violations, in_scope, cfg.ceiling_of)
     return violations
 
 
 def _gate_blind_to(path: str, checked: set[str], exts: tuple, match) -> bool:
     """A staged file the gate cannot judge but a scope language claims by
     extension. Files the config EXCLUDES (test trees, exclude globs) are
-    outside scopes on purpose and never a hole."""
-    return path not in checked and path.endswith(exts) and not excluded(path, match)
+    outside scopes on purpose and never a hole. An unreadable name is named
+    left out instead, once."""
+    return path not in checked and readable(path) and path.endswith(exts) and not excluded(path, match)
 
 
 def _unscoped_sources(staged: list[str], checked: set[str], cfg: Config) -> list[str]:
@@ -148,22 +160,50 @@ def _unscoped_sources(staged: list[str], checked: set[str], cfg: Config) -> list
     return sorted(f for f in staged if _gate_blind_to(f, checked, exts, match))
 
 
-def gate_staged(root: Path, cfg: Config, reads=None) -> StagedGate:
+def _claimed_files(in_scope: dict) -> list[str]:
+    """Every file some scope claims, once, sorted."""
+    return sorted({f for files in in_scope.values() for f in files})
+
+
+def gate_staged(root: Path, cfg: Config, reads=None, *, whole: bool = False) -> StagedGate:
     """`reads` is where the staged bytes come from: git processes the caller
     already started, or a spawn-on-demand pair when nobody did. The verdict is
-    the same either way."""
+    the same either way.
+
+    `whole` lets an empty staged diff judge every tracked file whole instead of
+    passing: the caller allows it outside a commit, where `pre-commit run
+    --all-files` stages nothing and a staged-only gate passed any breach already
+    committed. The blobs still come from the index, which then equals HEAD.
+    """
     reads = reads or GitReads(root)
-    ranges_by_path = changed_ranges(reads.staged_diff())
+    staged = changed_ranges(reads.staged_diff())
+    if staged or not whole:
+        return _gate_ranges(cfg, reads, staged, staged)
+    return _gate_ranges(cfg, reads, _whole_files(reads.tracked()), {})._replace(whole=True)
+
+
+def _whole_files(paths: list[str]) -> dict[str, list[tuple[int, int]]]:
+    """Every line of each file as its changed range, so every function is touched."""
+    return {path: [(1, sys.maxsize)] for path in paths}
+
+
+def _gate_ranges(cfg: Config, reads, ranges_by_path: dict, staged: dict) -> StagedGate:
+    """The functions `ranges_by_path` touches over their ceiling. Only files in
+    `staged` can be named as unscoped: the note is about a staged hole."""
     if not ranges_by_path:
         return StagedGate([])
-    in_scope = assign_files(sorted(ranges_by_path), cfg)
-    checked_files = sorted({f for files in in_scope.values() for f in files})
-    unscoped = _unscoped_sources(sorted(ranges_by_path), set(checked_files), cfg)
+    universe = scan_files(sorted(ranges_by_path), cfg)
+    in_scope = universe.by_scope
+    checked_files = _claimed_files(in_scope)
+    unscoped = _unscoped_sources(sorted(staged), set(checked_files), cfg)
     if not checked_files:
-        return StagedGate([], unscoped)
-    records_by_path = staged_records(reads.staged_blobs(checked_files),
-                                     worker_budget=cfg.analysis_worker_budget)
+        return StagedGate([], unscoped, unreadable=universe.unreadable)
+    blobs = reads.staged_blobs(checked_files)
+    records_by_path = staged_records(blobs, worker_budget=cfg.analysis_worker_budget)
+    # The staged blob is the diff's new side: its bytes place git's lines.
+    ranges_by_path = reader_ranges(ranges_by_path, blobs.get)
     return StagedGate(
         _touched_over_ceiling(records_by_path, ranges_by_path, checked_files, cfg, in_scope),
-        unscoped, tuple(chain.from_iterable(records_by_path.values()))
+        unscoped, tuple(chain.from_iterable(records_by_path.values())),
+        unread_reasons(records_by_path), universe.unreadable
     )

@@ -17,6 +17,7 @@ session works in does not hold those pages.
 | Before opening the file | `crapkit brief PATH NAME --json`, or the MCP `get_function_brief` tool where the server is registered |
 | Which house rules bind here | `notes.repo` and `notes.scope` in the packet |
 | An advisory fired on the edit you just made | Decompose that function now, not at the commit wall. The edit landed and nothing was blocked, but the gate refuses the same function later |
+| An advisory says a file could not be read | No function in it was judged, and the commit gate refuses the file once staged. Change what the `UNREAD` line's reason names, or list the file under `[exclude]` |
 | An advisory fired after a Bash command, not an edit | The same verdict, read off the working tree. See [After a shell write](#after-a-shell-write) |
 | Before committing | `crapkit rescore FILE --gate` |
 | The gate says a staged function carries a ratchet mark | Nothing. The repo signed for that function, so the commit gate skips it. `crapkit verify` still fails a mark that rises |
@@ -54,16 +55,34 @@ plugin registers `Edit|Write`. A clean tree, a file older than the window, or a 
 outside any repo all stay silent, so what an advisory names here is source written seconds
 ago, never the tree's standing debt.
 
+The hook remembers, per session, the bytes each advisory judged, so a touch, a same-bytes
+rewrite or a test run after your edit does not repeat an advisory you already heard. New
+bytes are judged again. Source that lands with an old mtime (a command that ran longer than
+the window, `cp -p`, `mv`, an unpacked archive) is never judged here; the commit gate
+catches it.
+
+An advisory that says `<file> could not be read` or `git could not report what changed in
+<file>` judged nothing in that file. It is not a pass: fix what its second line quotes, the
+reader's reason or git's error, before you trust silence from the hook on that file.
+
 ## Two fields decide whether a number is worth reading
 
-Read `stale` and `uncovered_lines_note` first. `stale: true` means the run predates HEAD:
-run `commands.refresh` before anything else. `uncovered_lines: null` means no artifact named
-lines for this file, and `flag` says which case you are in:
+Read `scored_changes` and `uncovered_lines_note` first. `scored_changes` counts the files
+the run scored whose content changed since, your own uncommitted edits included. Anything
+but `0`, `null` included, means run `commands.refresh` before anything else. `stale: true`
+says only that HEAD moved past the run's commit, which an amend does with no byte moved.
+The loop is done when `crapkit next-item` says `empty: true` with `scored_changes: 0`,
+`skipped_claimed` absent and `reasons.no_lane_over_target` 0. `uncovered_lines: null`
+means no artifact named lines for this file, and `flag` says which case you are in:
 
 - `untested`: write the first test at the public seam, then `crapkit coverage`. The lines appear. The exception is `remedy: split-lines`: another function shares the source lines, or a Python def's body starts on the line its signature ends, so no test moves the score. Put each definition on its own lines, and such a def's body on its own line after the signature, first.
-- `measured`: the artifact no longer matches the tree. Commit or revert the edits, then `crapkit coverage`.
+- `measured`: the file's bytes changed since a lane measured it. Rerun `crapkit coverage`; committing changes nothing.
 - `cc-only`: the scope sets `coverage_optional`, so only decompose clears it. Most languages land here, because only Python and JS/TS have coverage parsers.
-- `[]`: the artifact answered and nothing is dark.
+- `no-lane`: no lane measures this scope, so no test run can name lines. Declare a `[[lane]]` for it, or set `coverage_optional` when no test can reach it. `next-item` never hands one out; `brief` can.
+
+An `uncovered_lines` of `[]` means the artifact answered and nothing is dark. An `excluded`
+function also reads `[]`: its artifact was told to leave it out, so `crap` is `ccn` and
+only decompose moves it.
 
 ## Decompose: subtract first
 
@@ -101,5 +120,5 @@ it. The function's start line is the fallback handle.
 
 ## Routing
 
-- A command refused (exit 5, 6, 7, 8 or 9, a lane with no artifact, a ratchet conflict), or printed a line that reads like a refusal and is not: the `crapkit-recover` skill.
+- A command refused (exit 3 to 9, a lane with no artifact, a ratchet conflict), or printed a line that reads like a refusal and is not: the `crapkit-recover` skill.
 - An unattended or multi-phase run: `show-me-your-work`, with `verify`'s `run_id` in the evidence cell.

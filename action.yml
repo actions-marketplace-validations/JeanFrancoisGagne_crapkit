@@ -26,13 +26,24 @@ inputs:
     required: false
     default: "true"
   top:
-    description: worklist rows to render for the changed files.
+    description: >-
+      worklist rows to render for the changed files. An empty value renders 5;
+      a value that is not a whole number renders 5 and warns.
     required: false
     default: "5"
   python-version:
     description: the python actions/setup-python installs crapkit into.
     required: false
     default: "3.12"
+  working-directory:
+    description: >-
+      The directory that holds crapkit.toml, relative to the checkout. Every
+      step that runs crapkit or lists the changed files runs there. Set it when
+      crapkit.toml sits below the repository top, as a package of a monorepo
+      does (packages/api): at the top, coverage finds no crapkit.toml and
+      exits 3.
+    required: false
+    default: "."
 
 runs:
   using: composite
@@ -78,6 +89,15 @@ runs:
     # which holds no diff and so judges no changed function. The reason is
     # written to crapkit-base.reason: the comment quotes it in place of
     # "verify passed", and with gate "true" the exit step fails the check on it.
+    # A lane failure's reason is crapkit's first `FAILED:` line, not its first
+    # line: a lane that passed can warn before another lane fails, and the
+    # reason then named the lane that passed. A crapkit that died printing
+    # nothing gets its exit code quoted instead of an empty reason.
+    #
+    # The fork point's worktree holds the whole repository. `below` is the
+    # working directory's path under the repository top (`packages/api/`, or
+    # empty at the top), so the base run scores the same crapkit root in the
+    # fork point's tree and its store is read from there.
     - name: isolate this invocation's state
       id: state
       shell: bash
@@ -88,6 +108,7 @@ runs:
     - name: score the base commit
       if: ${{ github.event_name == 'pull_request' && inputs.delta == 'true' }}
       shell: bash
+      working-directory: ${{ inputs.working-directory }}
       env:
         CRAPKIT_STATE: ${{ steps.state.outputs.directory }}
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -95,6 +116,7 @@ runs:
         code=0
         base="$CRAPKIT_STATE/crapkit-base"
         log="$CRAPKIT_STATE/crapkit-base.log"
+        below="$(git rev-parse --show-prefix)"
         refuse() { echo "$1" > "$CRAPKIT_STATE/crapkit-base.reason"; echo "no base run: $1"; }
         fork="$(git merge-base "$BASE_SHA" HEAD)" || code=$?
         if [ "$code" != 0 ] && [ "$(git rev-parse --is-shallow-repository)" = true ]; then
@@ -107,18 +129,19 @@ runs:
           [ "$code" = 0 ] || refuse "git worktree add at the fork point $fork exited $code"
         fi
         if [ "$code" = 0 ]; then
-          crapkit coverage --repo "$base" --json > "$CRAPKIT_STATE/crapkit-base.json" 2> "$log" || code=$?
+          crapkit coverage --repo "$base/$below" --json > "$CRAPKIT_STATE/crapkit-base.json" 2> "$log" || code=$?
           cat "$log"
-          first="$(head -n 1 "$log")"
+          why="$(grep -m 1 -F ' FAILED: ' "$log" || head -n 1 "$log")"
+          [ -n "$why" ] || why="crapkit coverage exited $code and printed nothing"
           if [ "$code" = 3 ]; then
-            refuse "no usable crapkit.toml at the fork point $fork: $first"
+            refuse "no usable crapkit.toml at the fork point $fork: $why"
           elif [ "$code" != 0 ]; then
-            refuse "lane failed at the fork point $fork: $first"
+            refuse "lane failed at the fork point $fork: $why"
           fi
         fi
         if [ "$code" = 0 ]; then
           mkdir -p .crapkit
-          cp "$base/.crapkit/crap.sqlite" .crapkit/crap.sqlite || code=$?
+          cp "$base/$below.crapkit/crap.sqlite" .crapkit/crap.sqlite || code=$?
           [ "$code" = 0 ] || refuse "copying the base run's store exited $code"
         fi
         if [ "$code" = 0 ]; then
@@ -131,6 +154,7 @@ runs:
 
     - name: score the checkout
       shell: bash
+      working-directory: ${{ inputs.working-directory }}
       env:
         CRAPKIT_STATE: ${{ steps.state.outputs.directory }}
       run: |
@@ -157,6 +181,7 @@ runs:
     # is empty, which reports the tree's own health and judges no function.
     - name: the verdict
       shell: bash
+      working-directory: ${{ inputs.working-directory }}
       env:
         CRAPKIT_STATE: ${{ steps.state.outputs.directory }}
       run: |
@@ -182,6 +207,7 @@ runs:
 
     - name: the ranked worklist
       shell: bash
+      working-directory: ${{ inputs.working-directory }}
       env:
         CRAPKIT_STATE: ${{ steps.state.outputs.directory }}
       run: |
@@ -195,19 +221,40 @@ runs:
     # otherwise put its own commits in the pull request's table. base.sha is
     # empty on a push, and a shallow clone does not hold the commit it names;
     # either way the list is empty and the comment ranks the whole repository
-    # instead of a slice of it.
+    # instead of a slice of it. `--relative` keeps the files under the working
+    # directory and names them from there, the way the worklist names them: a
+    # top-relative packages/api/calc/grade.py matches no row it ranks. git's
+    # refusal goes to the log and to crapkit-changed.error, so a list the diff
+    # never produced does not read as "the pull request changed nothing" and the
+    # comment can say why it ranks everything. The count's line comes from the
+    # comment builder, which names the first three files by crapkit's one rule
+    # for such lists.
     - name: the changed files
       shell: bash
+      working-directory: ${{ inputs.working-directory }}
       env:
         CRAPKIT_STATE: ${{ steps.state.outputs.directory }}
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
       run: |
         changed="$CRAPKIT_STATE/crapkit-changed.txt"
+        failed="$CRAPKIT_STATE/crapkit-changed.error"
         : > "$changed"
-        if [ -n "$BASE_SHA" ]; then
-          git diff --name-only "$BASE_SHA...HEAD" -z > "$changed" || : > "$changed"
+        : > "$failed"
+        code=0
+        if [ -z "$BASE_SHA" ]; then
+          echo "no base commit on this event: the comment ranks the whole repository"
+        else
+          git diff --name-only "$BASE_SHA...HEAD" -z --relative > "$changed" 2> "$failed" || code=$?
         fi
-        echo "$(tr -cd '\0' < "$changed" | wc -c) changed file(s)"
+        if [ "$code" != 0 ]; then
+          : > "$changed"
+          [ -s "$failed" ] || echo "git diff exited $code" > "$failed"
+          echo "the base diff ${BASE_SHA:0:11}...HEAD failed, so the comment ranks the whole repository: $(head -n 1 "$failed")"
+        elif [ -n "$BASE_SHA" ]; then
+          cat "$failed" >&2
+          : > "$failed"
+          python "$GITHUB_ACTION_PATH/tools/action/comment.py" --changed-z "$changed" --changed-line
+        fi
 
     - name: build the comment
       shell: bash
@@ -224,15 +271,35 @@ runs:
           --base-reason "$CRAPKIT_STATE/crapkit-base.reason" \
           --worklist "$CRAPKIT_STATE/crapkit-worklist.json" \
           --changed-z "$CRAPKIT_STATE/crapkit-changed.txt" \
+          --changed-error "$CRAPKIT_STATE/crapkit-changed.error" \
           --top "$TOP" \
           --out "$CRAPKIT_STATE/crapkit-comment.md" \
           --json-out "$CRAPKIT_STATE/crapkit-comment.json"
         cat "$CRAPKIT_STATE/crapkit-comment.md"
 
-    # One comment, edited in place. The marker line the builder writes is what
-    # finds it, so a fifteen-push branch carries one comment and not fifteen.
-    # A push event has no pull request to carry one: the text is in the log
-    # above and nothing is posted.
+    # One comment, edited in place. The marker line the builder writes first is
+    # what finds it, so a fifteen-push branch carries one comment and not
+    # fifteen. A push event has no pull request to carry one: the text is in
+    # the log above and nothing is posted.
+    #
+    # The API does not require a comment's body, and a string test on null is
+    # an error in gh's jq, so one comment without a body failed the whole
+    # lookup and a second crapkit comment was posted. Only a string body is
+    # tested, and only its start: a reviewer quoting the comment carries the
+    # marker too, and the token cannot edit their comment.
+    #
+    # --paginate runs the filter once per page, so each page prints at most one
+    # id and the first all-digit line wins. On an error page gh prints GitHub's
+    # JSON on stdout and exits 1, so a line that is not an id is never taken
+    # for one. The whole answer is read before the first id is taken: `head -n
+    # 1` closed the pipe on a thread with two marked comments, and gh's SIGPIPE
+    # read as a failed lookup.
+    #
+    # A listing that fails before it finds the comment runs once more: posting
+    # fresh at once turned one transient 502 into a second crapkit comment. A
+    # second failure posts fresh and says so, because a pull request that keeps
+    # the previous push's verdict misleads more than a duplicate comment does.
+    # A listing that failed after it found the comment edits that one.
     #
     # A pull request from a fork carries a read-only token, so both writes come
     # back 403. That is the consumer's permissions, not a finding, and the
@@ -248,16 +315,27 @@ runs:
         HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
       run: |
         code=0
-        lookup=0
         if [ -z "$PR" ]; then
           echo "no pull request on this event: the comment above was not posted"
           exit 0
         fi
-        id="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
-                --jq 'map(select(.body | contains("<!-- crapkit-action -->"))) | .[0].id // empty' \
-              | head -n 1)" || lookup=$?
-        if [ "$lookup" != 0 ]; then
-          echo "looking the existing comment up exited $lookup: posting a fresh one"
+        for listing in first second; do
+          lookup=0
+          found="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+                     --jq 'map(select(.body | type == "string" and startswith("<!-- crapkit-action -->"))) | .[0].id // empty')" || lookup=$?
+          id=""
+          while IFS= read -r line; do
+            case "$line" in ''|*[!0-9]*) ;; *) id="$line"; break ;; esac
+          done <<< "$found"
+          if [ "$lookup" = 0 ] || [ -n "$id" ] || [ "$listing" = second ]; then
+            break
+          fi
+          echo "listing the comments exited $lookup before it found a crapkit comment: listing them once more"
+        done
+        if [ "$lookup" != 0 ] && [ -n "$id" ]; then
+          echo "looking the existing comment up exited $lookup after it found comment $id: editing that one"
+        elif [ "$lookup" != 0 ]; then
+          echo "listing the comments failed twice before it found a crapkit comment (gh exited $lookup): posting a fresh one"
         fi
         if [ -n "$id" ]; then
           gh api --silent --method PATCH "repos/$REPO/issues/comments/$id" \

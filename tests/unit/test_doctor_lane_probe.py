@@ -11,12 +11,14 @@ import os
 import sys
 from pathlib import Path
 
+import coverage
 import pytest
 
 from crapkit.cli import admin
 from crapkit.config import Config, Lane, Scope
 from crapkit.lane_command import LaunchSpec
 from crapkit.doctor import files_template_gaps
+from crapkit.scaffold import npm_package
 
 
 def _lane(name: str = "py", command: str = "python -m pytest --cov", parser: str = "coveragepy") -> Lane:
@@ -89,7 +91,7 @@ def test_a_healthy_lane_costs_one_interpreter_start_not_two(monkeypatch):
     def boom(spec, lane):
         raise AssertionError("the first-run note must not be asked once the report answered")
 
-    monkeypatch.setattr(admin, "_runner_report", lambda word, spec: (sys.executable, "8.3.3", "7.1.0"))
+    monkeypatch.setattr(admin, "_runner_report", lambda word, spec: (sys.executable, "8.3.3", "7.1.0", "7.16.0"))
     monkeypatch.setattr(admin, "_lane_first_run_note", boom)
 
     assert [f.level for f in admin._doctor_lane_probes(Path.cwd(), [_lane()])] == ["ok"]
@@ -97,19 +99,74 @@ def test_a_healthy_lane_costs_one_interpreter_start_not_two(monkeypatch):
 
 def test_a_healthy_lane_prints_the_interpreter_and_plugin_versions_it_resolves_to(monkeypatch):
     monkeypatch.setattr(admin, "_lane_first_run_note", lambda spec, lane: None)
-    monkeypatch.setattr(admin, "_runner_report", lambda word, spec: (sys.executable, "8.3.3", "7.1.0"))
+    monkeypatch.setattr(admin, "_runner_report", lambda word, spec: (sys.executable, "8.3.3", "7.1.0", "7.16.0"))
 
     findings = admin._doctor_lane_probes(Path.cwd(), [_lane()])
 
     assert [f.level for f in findings] == ["ok"]
     assert findings[0].text == (f"lane 'py': python -> {sys.executable} "
-                                "(pytest 8.3.3, pytest-cov 7.1.0)")
+                                "(pytest 8.3.3, pytest-cov 7.1.0, coverage 7.16.0)")
+
+
+# coverage.py writes each function's start_line from 7.13.1; 7.6.0 to 7.13.0
+# write regions without it, and older releases write no regions at all.
+_FLOOR_INSTALL = {False: '{python} -m pip install "coverage>=7.13.1"',
+                  True: 'uv pip install --python {python} "coverage>=7.13.1"'}
+
+
+@pytest.mark.parametrize("uv_made", [False, True], ids=["pip-venv", "uv-venv"])
+@pytest.mark.parametrize("version", ["7.4.4", "7.5.4", "6.5.0", "7.6.0", "7.10.6", "7.13.0"])
+def test_a_lane_whose_coverage_writes_no_function_regions_fails_naming_the_floor(monkeypatch,
+                                                                                version, uv_made):
+    """A repo that pins coverage 7.4 in its dev requirements passed doctor, and
+    then `crapkit coverage` refused the lane's report with exit 5 and "needs
+    coverage >= 7.6". The probe already starts that interpreter, so it asks
+    coverage's version on the same start and FAILs below the floor. The venv
+    kind is pinned: the install line differs in a venv uv made, and this test
+    failed from a contributor's uv-made venv while it pinned the pip form."""
+    from crapkit import launchers
+    monkeypatch.setattr(launchers, "_uv_made", lambda python: uv_made)
+    monkeypatch.setattr(admin, "_runner_report",
+                        lambda word, spec: (sys.executable, "8.3.3", "5.0.0", version))
+
+    findings = admin._doctor_lane_probes(Path.cwd(), [_lane()])
+
+    assert [f.level for f in findings] == ["ok", "FAIL"]
+    install = _FLOOR_INSTALL[uv_made].format(python=admin._shell_quote(sys.executable))
+    assert findings[1].text == (
+        f"lane 'py' runs coverage {version} ({sys.executable}), which writes no function "
+        "start lines, so `crapkit coverage` refuses its report with exit 5 (needs coverage >= "
+        f"7.13.1); install 7.13.1 or later there with `{install}` and raise any pin that holds it "
+        "lower")
+
+
+def test_the_upgrade_guide_names_the_exit_this_fail_moves():
+    """0.8.0's doctor printed `doctor: no problems found` and exited 0 on a lane
+    whose coverage predates 7.13.1. This FAIL makes it exit 1, so a CI step that
+    runs `crapkit doctor` on such a lane goes red on the upgrade. The guide's
+    section for that coverage names the line and the exit it moves."""
+    from crapkit.doctor import _COVERAGE_FLOOR
+
+    guide = (Path(__file__).resolve().parents[2] / "docs" / "upgrading.md").read_text(encoding="utf-8")
+    section = guide.split("### 0.8.1 on coverage 7.6 to 7.13.0\n", 1)[1].split("\n### ", 1)[0]
+    line = _COVERAGE_FLOOR.split(" ({executable})", 1)[0].format(name="py", version="7.10.0")
+
+    assert f"`FAIL {line} (" in section
+    assert "`doctor: no problems found`" in section and "exited 0" in section and "exits 1" in section
+
+
+@pytest.mark.parametrize("version", ["7.13.1", "7.16.0", "8.0.0b1", "unknown"])
+def test_coverage_at_or_past_the_floor_or_unreadable_adds_nothing(monkeypatch, version):
+    monkeypatch.setattr(admin, "_runner_report",
+                        lambda word, spec: (sys.executable, "8.3.3", "7.1.0", version))
+
+    assert [f.level for f in admin._doctor_lane_probes(Path.cwd(), [_lane()])] == ["ok"]
 
 
 def test_a_lane_running_another_python_than_this_doctor_warns(monkeypatch):
     monkeypatch.setattr(admin, "_lane_first_run_note", lambda spec, lane: None)
     monkeypatch.setattr(admin, "_runner_report",
-                        lambda word, spec: ("/srv/venv/bin/python", "8.3.3", "7.1.0"))
+                        lambda word, spec: ("/srv/venv/bin/python", "8.3.3", "7.1.0", "7.16.0"))
 
     findings = admin._doctor_lane_probes(Path.cwd(), [_lane()])
 
@@ -174,6 +231,7 @@ def test_the_real_probe_answers_for_this_interpreter():
     assert report is not None
     assert report[0].lower() == sys.executable.lower()
     assert report[1] == pytest.__version__
+    assert report[3] == coverage.__version__
 
 
 def test_a_timed_out_probe_cannot_keep_running(monkeypatch, tmp_path):
@@ -263,9 +321,9 @@ def test_a_lane_with_a_problem_of_its_own_is_not_probed_twice(monkeypatch, tmp_p
 # --- init's summary names the workspaces it could not route ----------------------
 
 def test_init_says_when_two_workspaces_name_a_runner_and_no_js_lane_was_written(capsys):
-    packages = {"": '{"private": true}',
-                "api": '{"devDependencies": {"jest": "1"}}',
-                "web": '{"devDependencies": {"vitest": "1"}}'}
+    packages = {"": npm_package({"private": True}),
+                "api": npm_package({"devDependencies": {"jest": "1"}}),
+                "web": npm_package({"devDependencies": {"vitest": "1"}})}
 
     admin._print_init_summary({"api": ("typescript",), "web": ("typescript",)}, (), packages)
 
@@ -280,8 +338,8 @@ def test_the_summary_is_silent_about_workspaces_once_a_js_lane_was_written(capsy
 
     js = LaneSpec("js", "npm run test -- --coverage", "coverage/coverage-final.json",
                   "istanbul", ("typescript",))
-    packages = {"api": '{"devDependencies": {"jest": "1"}}',
-                "web": '{"devDependencies": {"vitest": "1"}}'}
+    packages = {"api": npm_package({"devDependencies": {"jest": "1"}}),
+                "web": npm_package({"devDependencies": {"vitest": "1"}})}
 
     admin._print_init_summary({"api": ("typescript",)}, (js,), packages)
 

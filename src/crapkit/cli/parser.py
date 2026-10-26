@@ -8,15 +8,16 @@ import os
 import sys
 
 from .. import __version__
-from ..errors import ConfigError, CrapkitError
-from ..invocation import _self
+from ..errors import ConfigError, CrapkitError, GitError
+from ..invocation import _self, quoted_path, shell_arg
 
 # The claude-* namespace, named here rather than read off the parser, because the
 # guard has to answer before argparse sees the argv at all. A plugin's hooks.json
 # ships machine-wide and can name a subcommand an older installed CLI does not
-# have; argparse answers that with exit 2 and a usage dump, which on PostToolUse
-# lands in the model's context on every edit. Silence is the only safe answer,
-# and it is what makes every future plugin-ahead-of-CLI drift harmless.
+# have, or a flag it does not define; argparse answers either with exit 2 and a
+# usage dump, which on PostToolUse lands in the model's context on every edit.
+# Exit 0 is the only safe answer: silent for a subcommand, one line naming the
+# flag for a flag. It is what makes every future plugin-ahead-of-CLI drift harmless.
 _CLAUDE_SUBCOMMANDS = frozenset({"claude-hook"})
 
 
@@ -59,9 +60,13 @@ def _version_line() -> str:
     neither import is worth making. A disagreement, or a distribution this scan
     cannot see, goes to importlib.metadata and takes its answer.
     """
+    return f"crapkit {_version_number()}"
+
+
+def _version_number() -> str:
     if _published_version() == __version__:
-        return f"crapkit {__version__}"
-    return f"crapkit {_metadata_version()}"
+        return __version__
+    return _metadata_version()
 
 
 def _metadata_version() -> str:
@@ -104,9 +109,11 @@ def _is_crapkit_dist_info(name: str) -> bool:
 def _version_field(path: str) -> str | None:
     """METADATA's Version: header. Headers stop at the first blank line; the
     long description below it is free to contain anything."""
+    from ..repotext import lenient
+
     try:
-        with open(path, encoding="utf-8", errors="replace") as handle:
-            return _version_header(handle)
+        with open(path, "rb") as handle:
+            return _version_header(lenient(line) for line in handle)
     except OSError:
         return None
 
@@ -133,8 +140,132 @@ class _VersionAction(argparse.Action):
         super().__init__(option_strings, dest, nargs=0, **kwargs)
 
     def __call__(self, parser, namespace, values, option_string=None):
-        print(_version_line())
+        print(_version_line() + _build_words(sys.stdout))
         parser.exit()
+
+
+def _build_words(stream) -> str:
+    """` (commit <sha>, dirty)` for a person at a terminal running a crapkit
+    that knows the commit it was built from and is not a release, and nothing
+    for anyone else: a release's line stays `crapkit X.Y.Z`.
+
+    A pipe keeps the two words `crapkit X.Y.Z`: doctor's launcher probe and the
+    scripts that check an install read exactly those, and a third word read as
+    no version at all. `--version --json` carries the commit for a program."""
+    if not _on_a_terminal(stream):
+        return ""
+    commit, dirty, release = _build_identity()
+    if commit is None or release:
+        return ""
+    return f" (commit {commit}, {'dirty' if dirty else 'clean'})"
+
+
+# The file setup.py's build writes into the package; a test holds the two names equal.
+_BUILD_STAMP = "_build.json"
+_NO_BUILD = (None, None, False)
+
+
+def _build_identity() -> tuple[str | None, bool | None, bool]:
+    """The commit this crapkit was built from, whether its checkout held changes
+    the commit does not (staged or unstaged edits, or a file git neither tracks
+    nor ignores), and whether the build is a release. A source checkout or an
+    editable install answers from git now and is no release; an installed build
+    answers from the stamp its build wrote. (None, None, False) for a build made
+    with no checkout at hand and for a checkout git cannot read."""
+    package = _package_dir()
+    top = _checkout_of(package)
+    if top is None:
+        return _stamped_identity(package)
+    from .. import gitio
+
+    try:
+        return gitio.head_commit(top), bool(gitio.status_names(top)), False
+    except GitError:
+        return _NO_BUILD
+
+
+def _stamped_identity(package) -> tuple[str | None, bool | None, bool]:
+    """The commit, dirty flag and release flag setup.py wrote into the installed
+    package, or (None, None, False) when there is no stamp or it does not hold a
+    full sha and a boolean dirty flag. Read leniently: a byte that is not UTF-8
+    makes the stamp unreadable JSON, not a UnicodeDecodeError."""
+    import json
+
+    from ..repotext import lenient
+
+    try:
+        stamp = json.loads(lenient((package / _BUILD_STAMP).read_bytes()))
+    except (OSError, ValueError):
+        return _NO_BUILD
+    return _stamp_fields(stamp) if isinstance(stamp, dict) else _NO_BUILD
+
+
+def _stamp_fields(stamp: dict) -> tuple[str | None, bool | None, bool]:
+    import re
+
+    commit, dirty = stamp.get("commit"), stamp.get("dirty")
+    if isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit) \
+            and isinstance(dirty, bool):
+        return commit, dirty, stamp.get("release") is True
+    return _NO_BUILD
+
+
+def _package_dir():
+    """The directory this crapkit's package runs from."""
+    from pathlib import Path
+
+    return Path(__file__).resolve().parents[1]
+
+
+def _checkout_of(package):
+    """The checkout `package` was built from, when it sits at <checkout>/src/crapkit
+    beside the checkout's .git, as it does in a source checkout and an editable
+    install; else None.
+
+    A wheel installed into a virtual environment inside some other repository
+    has git above it too, but the repository is not the one crapkit was built
+    from, and its package directory is not that repository's src/crapkit."""
+    top = package.parent.parent
+    if package.parent.name == "src" and (top / ".git").exists():
+        return top
+    return None
+
+
+def _version_json_asked(argv: list[str] | None) -> bool:
+    """`crapkit --version --json`, in either order, with nothing else.
+
+    argparse runs --version the moment it reads it and exits, so a --json after
+    it was never read and the pair printed the text line."""
+    args = sys.argv[1:] if argv is None else argv
+    return set(args) == {"--version", "--json"}
+
+
+def _print_version_json() -> int:
+    """The version, the build's commit and dirty flag (null for a build made
+    with no checkout at hand), and the analysis version the ratchet stamp and
+    doctor carry."""
+    from ..analyze import ANALYSIS_VERSION
+    from ._shared import _print_json
+
+    commit, dirty, _release = _build_identity()
+    _print_json({"analysis_version": ANALYSIS_VERSION, "commit": commit, "dirty": dirty,
+                 "version": _version_number()})
+    return 0
+
+
+# The fix sentence is merge.UNREAD_ADVICE, spelled out here because the parser
+# loads on every command and merge is not worth that import; a test holds the two equal.
+_HOOK_PRECOMMIT = (
+    "Gate the staged functions of a commit at min-CCN <= their scope ceiling, read from the "
+    "staged blobs. A function with a mark in the working tree's marks file passes, whether or "
+    "not the mark is staged. Exit 6 on a staged function over its ceiling or a staged file no "
+    "reader could read. An UNREAD line names such a file "
+    "and the reader's reason: change what the reason names so a reader can parse the file, or "
+    "list it under [exclude] globs in crapkit.toml to leave it ungated. Outside a commit (git "
+    "sets GIT_INDEX_FILE for the hooks a commit runs) with nothing staged, as under `pre-commit "
+    "run --all-files`, it judges every tracked file instead. With no crapkit.toml at or above "
+    "the working directory, as at the git top of a monorepo, it gates in each crapkit root below "
+    "that owns a staged file.")
 
 
 def cmd_help(args) -> int:
@@ -170,24 +301,65 @@ def _help_topics(parser: argparse.ArgumentParser) -> dict:
 # working directory: without the flag the root is found by walking up from
 # there (ADR 0002), which is `cli._shared._command_root`'s business.
 # A path argument is rebased from the working directory only when the root came
-# from the walk (ADR 0002); under --repo it is root-relative as before.
-_WHERE = " (repo-relative; without --repo, read from the working directory)"
+# from the walk (ADR 0002); under --repo it is root-relative as before. Each
+# spelling named here reaches the scopes as git's path (cli._shared._repo_relative),
+# so a user who typed one of them learns it was read as the file they meant.
+_WHERE = (" (repo-relative or absolute; ./src/a.py, SRC/a.py where the disk ignores case,"
+          " and on Windows src\\a.py, /c/... and /mnt/c/... name src/a.py;"
+          " without --repo, read from the working directory)")
+# next-item --exclude compares a path fragment with git's path the way a file
+# argument is read (repopath.fragment); a function name keeps its case.
+_EXCLUDE_HELP = ("skip items whose path or function name contains this (repeatable); a path"
+                 " fragment reads as git spells it: ./pkg/legacy, PKG/Legacy where the disk"
+                 " ignores case, and pkg\\legacy on Windows all skip pkg/legacy")
+# A file a writer flag writes or a flag opens is typed like any path
+# (repopath.typed_path): Git Bash and WSL spellings name their drive.
+_TYPED = "; on Windows /c/... and /mnt/c/... name the drive"
 _REPO_FLAG = {"default": None,
-              "help": "crapkit root (default: the nearest crapkit.toml at or above cwd)"}
+              "help": "crapkit root (default: the nearest crapkit.toml at or above cwd); a "
+                      "leading ~ is your home directory"}
+
+
+def _color_kwargs(version: tuple, streams: tuple) -> dict:
+    """The `color` keyword for the root parser: off unless both `streams` are
+    terminals, from Python 3.14 on.
+
+    3.14's argparse colours help and usage, and FORCE_COLOR turns that on before
+    it asks whether stdout is a terminal, so `crapkit help` printed escape codes
+    into a pipe that an agent reads as text. It takes that one decision from
+    stdout, yet prints usage errors to stderr, so both streams are asked here.
+    On a terminal argparse keeps its own decision, NO_COLOR included. Every
+    subcommand parser inherits the keyword from the root; before 3.14 there is
+    no keyword to pass."""
+    if version < (3, 14) or all(_on_a_terminal(stream) for stream in streams):
+        return {}
+    return {"color": False}
+
+
+def _on_a_terminal(stream) -> bool:
+    """`stream` is a terminal; a missing stream (pythonw hands out None) is not."""
+    isatty = getattr(stream, "isatty", None)
+    return bool(isatty and isatty())
 
 
 def build_parser() -> argparse.ArgumentParser:
     """The whole CLI surface, assembled without parsing anything. README's
     Subcommands table is checked against this parser's own subcommand set."""
-    parser = argparse.ArgumentParser(prog="crapkit")
+    parser = argparse.ArgumentParser(
+        prog="crapkit", **_color_kwargs(sys.version_info, (sys.stdout, sys.stderr)))
     parser.add_argument("--version", action=_VersionAction, default=argparse.SUPPRESS,
-                        help="print the program name and its version")
+                        help="print the program name and its version; on a terminal, a crapkit "
+                             "built from a git checkout, other than a release, adds that commit "
+                             "and whether the checkout was dirty. --version --json prints one "
+                             "object: version, commit, dirty, analysis_version and schema")
     sub = parser.add_subparsers(dest="command", required=True)
 
     inv = sub.add_parser("inventory", help="build the per-function complexity inventory snapshot")
     inv.add_argument("--repo", **_REPO_FLAG)
-    inv.add_argument("--db", default=None, help="snapshot database path (default: <repo>/.crapkit/crap.sqlite)")
-    inv.add_argument("--export", default=None, help="also write a canonical TSV export, relative to the repo")
+    inv.add_argument("--db", default=None,
+                     help="snapshot database path (default: <repo>/.crapkit/crap.sqlite)" + _TYPED)
+    inv.add_argument("--export", default=None,
+                     help="also write a canonical TSV export, relative to the repo or absolute" + _TYPED)
     inv.add_argument("--json", action="store_true", help="print the run summary as JSON")
     inv.set_defaults(func=_Handler("scoring", "cmd_inventory"))
 
@@ -200,9 +372,11 @@ def build_parser() -> argparse.ArgumentParser:
     cov.add_argument("--reuse-unchanged", action="store_true",
                      help="reuse a lane whose stamp proves nothing it reads changed (the same "
                           "clean HEAD, or no change under its declared inputs); rerun the rest")
-    cov.add_argument("--export", default=None, help="write scored TSV export, relative to the repo")
+    cov.add_argument("--export", default=None,
+                     help="write scored TSV export, relative to the repo or absolute" + _TYPED)
     cov.add_argument("--sarif", default=None, metavar="PATH",
-                     help="write over-target findings as SARIF 2.1.0, relative to the repo")
+                     help="write over-target findings as SARIF 2.1.0, relative to the repo or "
+                          "absolute" + _TYPED)
     cov.add_argument("--github", action="store_true",
                      help="print findings as GitHub workflow-command annotations")
     cov.add_argument("--json", action="store_true", help="print the run summary as JSON")
@@ -212,8 +386,7 @@ def build_parser() -> argparse.ArgumentParser:
                                            "descending: what a refactor session takes next")
     nxt.add_argument("--repo", **_REPO_FLAG)
     nxt.add_argument("--top", type=int, default=1, help="return the next N items instead of one")
-    nxt.add_argument("--exclude", action="append", default=[],
-                     help="skip items whose path or function name contains this (repeatable)")
+    nxt.add_argument("--exclude", action="append", default=[], help=_EXCLUDE_HELP)
     nxt.add_argument("--scope", action="append", default=[], metavar="NAME",
                      help="restrict to this configured scope (repeatable); exact, not substring")
     nxt.add_argument("--claim", action="store_true",
@@ -228,7 +401,9 @@ def build_parser() -> argparse.ArgumentParser:
                           "or, with --all, every one")
     clm.add_argument("target", nargs="*", metavar="ARG",
                      help="release: PATH NAME, taking either the bare identifier or the "
-                          "long_name next-item printed; PATH" + _WHERE)
+                          "long_name next-item printed, and for a claim taken before "
+                          "analysis version 11 on a nested def, the name that version "
+                          "gives it; PATH" + _WHERE)
     clm.add_argument("--all", action="store_true", help="release: close every open claim")
     clm.add_argument("--repo", **_REPO_FLAG)
     clm.add_argument("--json", action="store_true", help="machine output")
@@ -242,7 +417,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "the keep-set, then VACUUM")
     runs_p.add_argument("--keep", type=int, default=5,
                         help="prune: newest trusted runs to keep (default 5). A floor, not "
-                             "a cap — the digest pair, passing verify baselines, runs an "
+                             "a cap - the digest pair, passing verify baselines, runs an "
                              "override names and the newest non-hook run are kept too")
     runs_p.add_argument("--repo", **_REPO_FLAG)
     runs_p.add_argument("--json", action="store_true", help="machine output")
@@ -278,7 +453,8 @@ def build_parser() -> argparse.ArgumentParser:
     brf.add_argument("--json", action="store_true", help="machine output (default: a short summary)")
     brf.set_defaults(func=_Handler("queue", "cmd_brief"))
 
-    rsc = sub.add_parser("rescore", help="fresh complexity for named files overlaid on the latest run's coverage")
+    rsc = sub.add_parser("rescore", help="fresh complexity for named files overlaid on the newest "
+                                         "trusted run's coverage, from any branch")
     rsc.add_argument("files", nargs="+", help="source files to re-analyze" + _WHERE)
     rsc.add_argument("--repo", **_REPO_FLAG)
     rsc.add_argument("--json", action="store_true", help="machine output (default: table)")
@@ -304,7 +480,7 @@ def build_parser() -> argparse.ArgumentParser:
     rep.add_argument("--out", default=".crapkit/report.html", metavar="PATH",
                      help="where to write the page: repo-relative, or an absolute path "
                           "you name (default: .crapkit/report.html); the path is "
-                          "printed on stdout")
+                          "printed on stdout" + _TYPED)
     rep.set_defaults(func=_Handler("reports", "cmd_report"))
 
     tsc = sub.add_parser("test-scoped", help="run the configured isolated test command for the files' scope")
@@ -317,14 +493,17 @@ def build_parser() -> argparse.ArgumentParser:
     # one baseline, named one way: two of these would leave the losing flag
     # silently ignored, and which one lost would be argument order
     picked = ver.add_mutually_exclusive_group()
-    picked.add_argument("--baseline", type=int, default=None, help="baseline run id (default: latest scored run)")
+    picked.add_argument("--baseline", type=int, default=None,
+                        help="baseline run id (default: the trusted run `crapkit runs` marks `baseline`)")
     picked.add_argument("--base", default=None, metavar="REF",
                         help="measure the diff from merge-base(REF, HEAD); the baseline run must "
                              "then sit at or behind that fork point")
     picked.add_argument("--baseline-tsv", default=None, metavar="PATH",
-                        help="read the baseline from a TSV written by --emit-baseline, not the store")
+                        help="read the baseline from a TSV written by --emit-baseline, not the "
+                             "store; relative to the repo or absolute" + _TYPED)
     ver.add_argument("--emit-baseline", default=None, metavar="PATH",
-                     help="also write the baseline run as a portable TSV, relative to the repo")
+                     help="also write the baseline run as a portable TSV, relative to the repo "
+                          "or absolute" + _TYPED)
     ver.add_argument("--reuse-artifacts", action="store_true", help="skip lane commands, parse existing artifacts")
     ver.add_argument("--reuse-unchanged", action="store_true",
                      help="reuse a lane whose stamp proves nothing it reads changed (the same "
@@ -334,13 +513,15 @@ def build_parser() -> argparse.ArgumentParser:
     ver.add_argument("--no-tighten", action="store_true",
                      help="pass the verdict without rewriting the ratchet; marks stay where they are")
     ver.add_argument("--sarif", default=None, metavar="PATH",
-                     help="write gate/ratchet findings as SARIF 2.1.0, relative to the repo")
+                     help="write gate/ratchet findings as SARIF 2.1.0, relative to the repo or "
+                          "absolute" + _TYPED)
     ver.add_argument("--github", action="store_true",
                      help="print findings as GitHub workflow-command annotations")
     ver.add_argument("--json", action="store_true", help="print the verdict as JSON")
     ver.set_defaults(func=_Handler("verifying", "cmd_verify"))
 
-    hook = sub.add_parser("hook-precommit", help="gate staged functions at min-CCN <= target; exit 6 on violation")
+    hook = sub.add_parser("hook-precommit", help="gate staged functions at min-CCN <= target; exit 6 on a function over it "
+                                "or a staged file no reader could read", description=_HOOK_PRECOMMIT)
     hook.add_argument("--base", metavar="REF",
                       help="compare the index with merge-base(REF, HEAD), for CI checkouts")
     hook.add_argument("--repo", **_REPO_FLAG)
@@ -349,27 +530,35 @@ def build_parser() -> argparse.ArgumentParser:
     # No --repo: the root comes from the edited file's own path, walked upward to
     # the first crapkit.toml and never past a .git entry. A session root passed in
     # would resolve a worktree edit to the mainline checkout's store.
-    chk = sub.add_parser("claude-hook", help="advisory ccn check for one Claude Code "
-                                             "PostToolUse edit read from stdin; silent "
-                                             "unless a changed function is over its ceiling")
+    chk = sub.add_parser("claude-hook", help="advisory ccn check for one PostToolUse edit "
+                                             "read from stdin (Claude Code, Copilot CLI, "
+                                             "Cursor, VS Code); silent unless the edit leaves "
+                                             "a function over its ceiling or a file it could "
+                                             "not judge, or the hook passes a flag this "
+                                             "crapkit does not know")
     chk.add_argument("--protocol", default="1", metavar="N",
                      help="hook payload protocol (default 1); anything else exits 0 silent")
     chk.set_defaults(func=_Handler("claude_hook", "cmd_claude_hook"))
 
     wl = sub.add_parser("worklist", help="ranked risk map: every admitted function, "
-                                         "finished and no-lane rows included, so it never empties")
+                                         "finished and no-lane rows included, so it never empties; "
+                                         "ends with the command to run next")
     wl.add_argument("--repo", **_REPO_FLAG)
     wl.add_argument("--top", type=int, default=None, help="cap the active list (default: config worklist_top)")
     wl.add_argument("--scope", action="append", default=[], metavar="NAME",
                     help="restrict to this configured scope (repeatable); exact, not substring")
     wl.add_argument("--batches", type=int, default=None, metavar="N",
                     help="split the active list into at most N batches with no shared "
-                         "files, co-changing files kept together: one per agent session")
-    wl.add_argument("--json", action="store_true", help="print as JSON")
+                         "files, co-changing files kept together and summed risk balanced "
+                         "across batches: one per agent session")
+    wl.add_argument("--json", action="store_true",
+                    help="print as JSON: the map alone, without the next-step lines the text ends with")
     wl.set_defaults(func=_Handler("queue", "cmd_worklist"))
 
     ini = sub.add_parser("init", help="sniff the repo and write a starter crapkit.toml")
-    ini.add_argument("--repo", **_REPO_FLAG)
+    ini.add_argument("--repo", default=None,
+                     help="directory to write crapkit.toml in (default: the current directory; "
+                          "init never walks up)")
     ini.set_defaults(func=_Handler("admin", "cmd_init"))
 
     doc = sub.add_parser("doctor", help="check that crapkit.toml still describes this repo")
@@ -382,22 +571,34 @@ def build_parser() -> argparse.ArgumentParser:
                      help="print suggested [crapkit] parallelism knobs for this machine from "
                           "cpu count and recorded lane durations; writes nothing")
     doc.add_argument("--plugin-root", nargs="?", const="", default=None, metavar="PATH",
-                     help="check an installed Claude Code plugin against this CLI instead of "
-                          "reading a repo: manifest version and hook protocol, one line per "
-                          "disagreement, silent when they agree. PATH is the plugin root or "
+                     help="check an installed crapkit plugin, Claude Code's or Codex's, "
+                          "against the crapkit on PATH instead of reading a repo: manifest "
+                          "version, hook protocol, an install whose files differ from its "
+                          "marketplace's copy at one version, and the Claude Code the hooks "
+                          "need. One line per disagreement, and each line names the command "
+                          "that closes it; exit 0 when they agree, after naming a root it "
+                          "found under PATH rather than the root PATH named (with no PATH, "
+                          "every root it checks). PATH is the plugin root or "
                           "any directory above it, ~/.claude included (the newest crapkit "
-                          "install under it wins); with no PATH, the newest crapkit install "
-                          "in Claude Code's plugin cache")
+                          "install under it wins); with no PATH, every install Claude Code "
+                          "recorded, one per scope and version (a local directory marketplace "
+                          "is checked in that directory, where Claude Code loads it), else the "
+                          "newest in Claude Code's plugin cache, else the newest in Codex's" + _TYPED)
     doc.set_defaults(func=_Handler("admin", "cmd_doctor"))
 
-    rat = sub.add_parser("ratchet", help="manage the committed marks file: seed new debt, prune gone code")
+    rat = sub.add_parser("ratchet", help="manage the marks file: seed new debt, prune gone code")
     rat.add_argument("action", choices=("seed", "prune", "merge", "move", "report"),
-                     help="seed: mark over-target functions from the latest run; "
+                     help="seed: mark over-target functions from the run verify would compare "
+                          "against; "
                           "prune: drop marks whose functions left the codebase "
                           "(a mark whose file git renamed follows it instead); "
-                          "merge: 3-way git merge driver (BASE OURS THEIRS); "
+                          "merge: 3-way git merge driver (BASE OURS THEIRS), which a "
+                          "clone running crapkit through uvx configures as "
+                          "`uvx crapkit ratchet merge %%O %%A %%B`; "
                           "move: re-path marks at their recorded values (OLD NEW); "
-                          "report: burn-down from the marks file's git history")
+                          "report: the burn-down: open marks are the file's rows, committed or "
+                          "not, or the rows its history last held when it is missing or blank, "
+                          "and ages and repayments come from its git history")
     # default=[] and not just nargs="*": argparse calls a ZERO_OR_MORE positional
     # with no default REQUIRED, so bare `crapkit ratchet` used to answer "the
     # following arguments are required: action, FILE" while report, seed and prune
@@ -416,15 +617,28 @@ def build_parser() -> argparse.ArgumentParser:
     rat.add_argument("--repo", **_REPO_FLAG)
     rat.set_defaults(func=_Handler("ratchet_cmds", "cmd_ratchet"))
 
-    wat = sub.add_parser("watch", help="rescore files as they change (polls tracked files from start)")
+    wat = sub.add_parser("watch", help="rescore scoped files whose content changes; lists them "
+                                       "again each poll, so a new file counts and a touch does not")
     wat.add_argument("--repo", **_REPO_FLAG)
     wat.add_argument("--interval", type=float, default=2.0, help="poll seconds (default 2)")
     wat.add_argument("--cycles", type=int, default=None,
                      help="stop after N polls (default: poll until ctrl-c)")
     wat.set_defaults(func=_Handler("admin", "cmd_watch"))
 
-    srv = sub.add_parser("mcp", help="stdio MCP server exposing the read-side tools (JSON-RPC, no deps)")
-    srv.add_argument("--repo", **_REPO_FLAG)
+    srv = sub.add_parser("mcp", help="stdio MCP server exposing the read-side tools (JSON-RPC, no deps)",
+                         description="Serves crapkit's twelve read-side tools over stdio to the agent that "
+                                     "starts it. Each agent starts it from its own config file and reads its "
+                                     "own key and fields, so a block written for another agent can start nothing "
+                                     "and report no error. The block for each agent is in "
+                                     "https://github.com/JeanFrancoisGagne/crapkit/blob/main/docs/harnesses.md")
+    srv.add_argument("--repo", default=None,
+                     help="exact crapkit root, served or refused as named (default: the "
+                          "nearest crapkit.toml at or above cwd, else the first workspace folder "
+                          "a client that declares roots names, else the folder a GitHub Copilot "
+                          "CLI session works in; a cwd inside the client's plugin directory is "
+                          "never walked up from); a leading ~ is your home directory, and a "
+                          "value holding a ${...} variable the client did not expand is "
+                          "ignored, with a warning on stderr")
     srv.set_defaults(func=_Handler("analyses", "cmd_mcp"))
 
     mut = sub.add_parser("mutate", help="diff-scoped mutation testing: flip operators on changed lines, run the suite per mutant")
@@ -441,7 +655,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     dup = sub.add_parser("duplication", help="near-duplicate functions by normalized line shingles")
     dup.add_argument("--repo", **_REPO_FLAG)
-    dup.add_argument("--min-lines", type=int, default=8, help="smallest function considered (default 8)")
+    dup.add_argument("--min-lines", type=int, default=8,
+                     help="fewest code lines of its own a function needs, blank and comment "
+                          "lines left out (default 8)")
     dup.add_argument("--similarity", type=float, default=0.8,
                      help="containment threshold, shared/smaller (default 0.8)")
     dup.add_argument("--top", type=int, default=50, help="cap the pair list (default 50)")
@@ -460,7 +676,7 @@ def build_parser() -> argparse.ArgumentParser:
     clean = sub.add_parser("clean", help="remove abandoned temporary mutation checkouts")
     clean.add_argument("--repo", **_REPO_FLAG)
     clean.add_argument("--dry-run", action="store_true", help="report eligible paths without removing them")
-    clean.add_argument("--json", action="store_true")
+    clean.add_argument("--json", action="store_true", help="machine output")
     clean.set_defaults(func=_Handler("maintenance", "cmd_clean"))
 
     hlp = sub.add_parser("help", help="print one subcommand's help, or the command list")
@@ -525,21 +741,61 @@ def _path_first_arg(argv: list[str] | None) -> str | None:
 def _refuse_path_argument(arg: str) -> int:
     """Same exit code argparse already gave this argv, with the route the dump
     left out. Nothing that used to work changes: every argv reaching here was a
-    usage error before."""
-    print(f"crapkit: {arg!r} is not a subcommand; the repo is a flag on one, "
-          f"e.g. `{_self()} inventory --repo {arg}` "
+    usage error before. The path goes back into the command as one shell word:
+    printed as it came, a space split it and Git Bash ate its backslashes."""
+    print(f"crapkit: {quoted_path(arg)} is not a subcommand; the repo is a flag on one, "
+          f"e.g. `{_self()} inventory --repo {shell_arg(arg)}` "
           f"(`{_self()} --help` lists the subcommands)", file=sys.stderr)
     return 2
 
 
-def main(argv: list[str] | None = None) -> int:
-    _reconfigure_streams()
+def _claude_command(argv: list[str] | None) -> bool:
+    """A `claude-*` subcommand this build defines: argv a program wrote, and a
+    program that can be newer than this build."""
+    args = sys.argv[1:] if argv is None else argv
+    return bool(args) and args[0] in _CLAUDE_SUBCOMMANDS
+
+
+def _claude_version_skew(command: str, unknown: list[str]) -> int:
+    """A claude-* argv holding arguments this build does not define.
+
+    A plugin's hooks.json can pass the hook a flag added after the installed
+    CLI was built. argparse answered that with exit 2 and its usage block, and
+    PostToolUse hands the model an exit 2's stderr on every edit. Exit 0, as
+    for an unknown subcommand, with one line for the person reading the hook
+    output. The edit is not judged: what the new flag asks for is unknown here."""
+    print(f"crapkit {command}: this crapkit does not know `{' '.join(unknown)}`; the hook "
+          "was written for a newer crapkit, so this edit went unchecked. Upgrade crapkit, "
+          "then run `crapkit doctor --plugin-root`", file=sys.stderr)
+    return 0
+
+
+def _parse(parser: argparse.ArgumentParser, argv: list[str] | None) -> argparse.Namespace | int:
+    """parse_args, except that a claude-* command reads the flags this build
+    knows, `--protocol` included, and answers anything left over in one line."""
+    if not _claude_command(argv):
+        return parser.parse_args(argv)
+    args, unknown = parser.parse_known_args(argv)
+    return _claude_version_skew(args.command, unknown) if unknown else args
+
+
+def _arguments(argv: list[str] | None) -> argparse.Namespace | int:
+    """The parsed argv, or the exit code of an argv answered before any handler runs."""
     if _unknown_claude_command(argv):
         return 0
+    if _version_json_asked(argv):
+        return _print_version_json()
     named_path = _path_first_arg(argv)
     if named_path is not None:
         return _refuse_path_argument(named_path)
-    args = build_parser().parse_args(argv)
+    return _parse(build_parser(), argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    _reconfigure_streams()
+    args = _arguments(argv)
+    if isinstance(args, int):
+        return args
     try:
         return args.func(args)
     except CrapkitError as exc:
@@ -552,7 +808,10 @@ def main(argv: list[str] | None = None) -> int:
 def _print_error_object(exc: CrapkitError) -> None:
     """The one object `--json` promised, when the command died before printing
     its own: a wrapper reads the sentence naming the fix off stdout instead of
-    "wrote no run summary". The stderr line and the exit code are unchanged."""
+    "wrote no run summary". The stderr line and the exit code are unchanged.
+    A refusal that names files adds them (`unread_files` for a name that is
+    not UTF-8)."""
     from ._shared import _print_json
 
-    _print_json({"error": {"exit": exc.exit_code, "kind": exc.kind, "message": str(exc)}})
+    _print_json({"error": {"exit": exc.exit_code, "kind": exc.kind, "message": str(exc),
+                           **exc.json_fields()}})

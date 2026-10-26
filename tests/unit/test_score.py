@@ -2,7 +2,7 @@
 import pytest
 
 from crapkit.coverage_istanbul import FnCoverage
-from crapkit.score import crap, score_rows
+from crapkit.score import crap, flagged_crap, score_rows
 from crapkit.snapshot import InventoryRow
 
 
@@ -11,11 +11,41 @@ def row(path="src/a.ts", name="f( )", start=1, end=13, ccn=7, scope="src"):
 
 
 def test_crap_formula_exact_values():
-    assert crap(5, 1.0) == 5
-    assert crap(5, 0.0) == 30
-    assert crap(1, 0.0) == 2
-    assert round(crap(6, 1.0), 6) == 6
-    assert crap(7, 1.0) == 7, "cc 7 at full coverage still exceeds a target of 6"
+    got = {case: crap(*case) for case in ((5, 1.0), (5, 0.0), (1, 0.0), (6, 1.0), (7, 1.0))}
+    # README.md#crapkit: ccn^2 * (1 - cov)^3 + ccn; ccn 7 at full coverage still scores 7
+    assert got == {(5, 1.0): 5, (5, 0.0): 30, (1, 0.0): 2, (6, 1.0): 6, (7, 1.0): 7}
+
+
+def test_crap_formula_cubes_the_uncovered_share():
+    """At cov 0 and 1 every power of (1 - cov) agrees, so only a partial
+    coverage tells the cube from a square or a fourth power."""
+    got = {case: crap(*case) for case in ((4, 0.5), (7, 0.75))}
+    # README.md#crapkit worked by hand: 16 * 0.5^3 + 4 = 6; 49 * 0.25^3 + 7 = 49/64 + 7
+    assert got == {(4, 0.5): 6.0, (7, 0.75): 7.765625}
+
+
+def test_crap_cubes_by_products_so_every_platform_prints_one_score():
+    """IEEE 754 rounds a product correctly everywhere and leaves pow() to each
+    libm. Through `** 3`, Windows UCRT and glibc parted in the last bit on
+    CRAP(2, 26/99), and CRAP(36, 53/120), exactly 261.57225, printed 261.5723
+    on both where the exact value rounds half to even to 261.5722."""
+    parted, tie = crap(2, 26 / 99), crap(36, 53 / 120)
+
+    assert parted.hex() == "0x1.cd460645bebedp+1"
+    assert tie.hex() == "0x1.05927ef9db22dp+8"
+    assert f"{tie:.4f}" == "261.5722"
+
+
+@pytest.mark.parametrize(("flag", "cov", "expected"), [
+    ("cc-only", 0.0, 8.0),
+    ("untested", 0.0, 72.0),
+    ("no-lane", 0.0, 72.0),
+    ("measured", 1.0, 8.0),
+])
+def test_a_cc_only_row_scores_its_ccn_and_every_other_flag_the_formula(flag, cov, expected):
+    """cc-only has no coverage number at all, so its CRAP is ccn. The override
+    grant reads this same rule, where it once wrote 72 for a cc-only ccn 8."""
+    assert flagged_crap(8, cov, flag) == expected
 
 
 def test_join_by_span_overlap_flags_measured():
@@ -23,14 +53,14 @@ def test_join_by_span_overlap_flags_measured():
     (scored,) = score_rows([row()], cov, lane_scopes={"src"})
     assert scored.flag == "measured"
     assert scored.cov == 0.75
-    assert scored.crap == crap(7, 0.75)
+    assert scored.crap == 7.765625  # 49 / 64 + 7, exact in binary
 
 
 def test_function_absent_from_artifact_scores_zero_untested():
     (scored,) = score_rows([row()], {"src/a.ts": []}, lane_scopes={"src"})
     assert scored.flag == "untested"
     assert scored.cov == 0.0
-    assert scored.crap == crap(7, 0.0)
+    assert scored.crap == 56.0  # 7^2 + 7
 
 
 def test_scope_with_no_lane_flags_no_lane_never_conflated():
@@ -154,3 +184,39 @@ def test_overlay_ignores_unmeasured_baseline_rows_with_the_same_name():
     (scored,) = overlay_stale_coverage([row(path="src/a.ts", name="f( )", start=1, end=6, ccn=5)],
                                        baseline, lane_scopes={"src"})
     assert scored.flag == "untested", "only measured baseline rows carry coverage forward"
+
+
+# --- a row no measurement stands behind -----------------------------------------
+
+@pytest.mark.parametrize("case, name, scope, baseline_flag, cov, flag, stand_in", [
+    ("joined", "f( )", "src", "measured", 0.5, "measured", False),
+    ("baseline-judged-untested", "f( )", "src", "untested", 0.0, "untested", False),
+    ("added-since-the-run", "g( )", "src", "measured", 0.0, "untested", True),
+    ("renamed-since-the-run", "f2( )", "src", "measured", 0.0, "untested", True),
+    ("no-lane-scope", "f( )", "ui", "measured", 0.0, "no-lane", True),
+    ("cc-only-scope", "f( )", "opt", "measured", 0.0, "cc-only", True),
+])
+def test_overlay_collects_every_row_whose_cov_nothing_measured(case, name, scope, baseline_flag,
+                                                               cov, flag, stand_in):
+    """A function the baseline holds no row for reads cov 0.0 and `untested`,
+    the values the preview has always given it. The collector is how a caller
+    learns that nothing measured that 0.0; a function the baseline judged
+    untested was measured at 0.0 and is not collected."""
+    from crapkit.score import ScoredRow, overlay_stale_coverage
+
+    baseline = [ScoredRow("src", "src/a.ts", "f( )", 1, 6, 5, 5, 5, 6, 1, 1,
+                          0.5 if baseline_flag == "measured" else 0.0, baseline_flag, 9.4, "add-tests")]
+    found: set = set()
+    (scored,) = overlay_stale_coverage([row(name=name, start=1, end=6, ccn=5, scope=scope)], baseline,
+                                       lane_scopes={"src", "opt"}, cc_only_scopes=frozenset({"opt"}),
+                                       unjoined=found)
+
+    assert (scored.cov, scored.flag) == (cov, flag), case
+    assert (scored in found) is stand_in, case
+
+
+def test_unjoined_flags_are_the_ones_no_artifact_can_speak_about():
+    from crapkit.score import unjoined
+
+    assert [f for f in ("measured", "untested", "no-lane", "cc-only") if unjoined(f)] == \
+        ["no-lane", "cc-only"]
